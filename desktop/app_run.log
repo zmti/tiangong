@@ -1,0 +1,15 @@
+
+[backend-err] INFO:     Started server process [438512]
+INFO:     Waiting for application startup.
+[backend-err] INFO:     Application startup complete.
+[backend-err] INFO:     Uvicorn running on http://127.0.0.1:8517 (Press CTRL+C to quit)
+[backend] INFO:     127.0.0.1:62569 - "GET /health HTTP/1.1" 200 OK
+[backend] INFO:     127.0.0.1:55245 - "GET /health HTTP/1.1" 200 OK
+[backend] INFO:     127.0.0.1:55245 - "GET /v1/tools HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55246 - "GET /v1/providers HTTP/1.1" 200 OK
+[backend] INFO:     127.0.0.1:55247 - "GET /v1/documents/stats HTTP/1.1" 200 OK
+[backend] INFO:     127.0.0.1:62150 - "GET /health HTTP/1.1" 200 OK
+[backend] INFO:     127.0.0.1:53352 - "POST /v1/chat/stream HTTP/1.1" 200 OK
+[backend] INFO:     127.0.0.1:51264 - "POST /v1/chat/stream HTTP/1.1" 200 OK
+[backend] exited 4294967295
+[419204:0812/182645.562:ERROR:network_service_instance_impl.cc(601)] Network service crashed, restarting service.

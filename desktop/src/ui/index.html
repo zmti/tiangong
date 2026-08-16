@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>智能体助手</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body data-theme="light">
+  <nav id="iconBar">
+    <div class="nav-group">
+      <button class="nav-btn active" data-view="chat" title="对话">💬</button>
+      <button class="nav-btn" data-view="todo" title="待办">📋</button>
+      <button class="nav-btn" data-view="kb" title="知识库">📚</button>
+      <button class="nav-btn" data-view="memory" title="记忆">🧠</button>
+      <button class="nav-btn" data-view="runs" title="运行记录">🕘</button>
+      <button class="nav-btn" data-view="telemetry" title="用量统计">📊</button>
+      <button class="nav-btn" data-view="schedule" title="定时任务">⏰</button>
+      <button class="nav-btn" data-view="prompts" title="提示词库">📝</button>
+      <button class="nav-btn" data-view="tools" title="工具">🛠</button>
+      <button class="nav-btn" data-view="settings" title="设置">⚙️</button>
+    </div>
+    <div class="nav-group">
+      <button class="nav-btn" id="themeBtn" title="切换主题">🌙</button>
+    </div>
+  </nav>
+
+  <aside id="sessionPanel">
+    <div class="panel-head">
+      <span class="panel-title">会话</span>
+      <div class="head-actions">
+        <button class="mini-btn" id="exportBtn" title="导出当前会话">⤓</button>
+        <button class="mini-btn" id="collapseBtn" title="收起/展开会话栏">⏴</button>
+        <button class="mini-btn" id="newSessionBtn" title="新建会话">＋</button>
+      </div>
+    </div>
+    <div class="session-search"><input id="sessionSearch" placeholder="搜索会话..."></div>
+    <div id="sessionList" class="session-list"></div>
+  </aside>
+
+  <button id="sessionReopen" title="展开会话栏">☰</button>
+
+  <main id="main">
+    <header class="main-head">
+      <span class="title" id="sessionLabel">新会话</span>
+      <div class="head-right">
+        <button class="mini-btn danger" id="clearSessionBtn" title="清空当前会话对话内容">清空会话</button>
+        <div class="ctx-meter" id="ctxMeter" title="当前会话上下文用量">
+          <div class="ctx-bar"><div class="ctx-fill" id="ctxFill"></div></div>
+          <span class="ctx-text" id="ctxText">-</span>
+        </div>
+        <div class="status">
+          <span class="status-dot" id="statusDot"></span>
+          <span id="statusText">连接中...</span>
+        </div>
+      </div>
+    </header>
+    <div id="messages"></div>
+    <div id="imgPreviewBar">
+      <span>已选图片:</span><img id="previewImg" title="点击预览">
+      <span class="preview-name" id="previewName"></span>
+      <button class="lb-btn" id="previewCancel" style="padding:4px 12px;background:transparent;border-color:var(--border);color:var(--muted)">取消</button>
+    </div>
+    <div id="attachBar" class="attach-bar">
+      <span class="attach-label">📎 附件</span>
+      <div class="attach-list" id="attachList"></div>
+      <button class="mini-btn" id="attachClearBtn" title="清空附件">清空</button>
+    </div>
+    <footer>
+      <div class="composer">
+        <div class="composer-top">
+          <div class="composer-selects">
+            <select id="providerSelect" title="切换模型"></select>
+            <select id="modeSelect" title="协作模式:单模型 / 一个做另一个测 / 多模型并行择优">
+              <option value="auto">自动</option>
+              <option value="single">单模型</option>
+              <option value="review">评审</option>
+              <option value="ensemble">多模型择优</option>
+            </select>
+          </div>
+          <div class="composer-tools">
+            <button id="attachBtn" class="tool-btn" title="添加本地文件附件">📎</button>
+            <button id="shotBtn" class="tool-btn" title="截屏识图">📸</button>
+            <button id="imageBtn" class="tool-btn" title="上传图片识别">🖼</button>
+          </div>
+        </div>
+        <div class="composer-body">
+          <textarea id="input" rows="1" placeholder="输入问题,Enter 发送,Shift+Enter 换行,输入 / 唤起提示词" autocomplete="off"></textarea>
+          <button id="sendBtn" title="发送">
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M12 19V5M12 5l-6 6M12 5l6 6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <button id="stopBtn" title="停止生成">⏹</button>
+        </div>
+        <div class="composer-hint">
+          <span><kbd>Enter</kbd> 发送 · <kbd>Shift</kbd>+<kbd>Enter</kbd> 换行 · <kbd>/</kbd> 唤起提示词</span>
+          <span class="ch-attach">支持 <kbd>Ctrl</kbd>+<kbd>V</kbd> 粘贴图片、拖拽文件</span>
+        </div>
+      </div>
+    </footer>
+
+    <button id="backToBottom" title="回到最新">↓</button>
+
+    <div id="welcome" class="welcome">
+      <div class="welcome-inner">
+        <div class="welcome-logo">🤖</div>
+        <h2>智能体助手</h2>
+        <p class="welcome-sub">多模型对话 · 知识库 · 工具调用 · 图片识别 · 定时任务</p>
+        <div class="welcome-chips">
+          <button class="welcome-chip" data-q="帮我介绍这个项目能做什么,并列出可用的功能">了解我能做什么</button>
+          <button class="welcome-chip" data-q="请解释一下什么是 RAG,以及它和微调的区别">什么是 RAG?</button>
+          <button class="welcome-chip" data-q="帮我写一段线程安全的 Python 缓存实现">写一段 Python 代码</button>
+          <button class="welcome-chip" data-q="把下面的内容整理成一份周报:">整理一份周报</button>
+        </div>
+        <p class="welcome-hint">输入框以 <code>/</code> 开头可唤起提示词库 · Enter 发送 · Shift+Enter 换行</p>
+        <p class="welcome-hint">关闭窗口后仍驻留托盘,可用 <code>Alt+Shift+Space</code> 随时唤出</p>
+      </div>
+    </div>
+  </main>
+
+  <div id="confirmBar" class="confirm-bar"></div>
+
+  <aside id="sidePanel">
+    <div class="side-content" id="todoPanel">
+      <div class="panel-head">
+        <span class="panel-title">📋 待办</span>
+        <div class="head-actions">
+          <button class="mini-btn" id="todoAddBtn">添加</button>
+          <button class="mini-btn close-panel" title="关闭">×</button>
+        </div>
+      </div>
+      <div class="todo-form">
+        <input id="todoInput" placeholder="新待办事项...">
+        <input id="todoDueInput" type="date" title="截止日期(可选)">
+        <input id="todoCatInput" placeholder="分类" style="max-width:64px">
+        <select id="todoFilter" title="过滤待办">
+          <option value="all">全部</option>
+          <option value="pending">未完成</option>
+        </select>
+        <button class="mini-btn" id="todoAddBtn">添加</button>
+      </div>
+      <div id="todoList" class="todo-list"></div>
+    </div>
+    <div class="side-content active" id="kbPanel">
+      <div class="panel-head">
+        <span class="panel-title">📚 知识库</span>
+        <div class="head-actions">
+          <button class="mini-btn" id="kbUploadBtn">上传</button>
+          <button class="mini-btn danger" id="kbClearBtn">清空</button>
+          <button class="mini-btn close-panel" title="关闭">×</button>
+        </div>
+      </div>
+      <div id="dropZone">
+        <div class="dz-main">📚 拖拽文件到这里上传</div>
+        <div class="dz-sub">支持 txt / md / pdf / docx / xlsx / pptx 等</div>
+      </div>
+      <div id="docStats" class="doc-stats"></div>
+      <div id="docList" class="doc-list"></div>
+    </div>
+    <div class="side-content" id="memoryPanel">
+      <div class="panel-head">
+        <span class="panel-title">🧠 长期记忆</span>
+        <div class="head-actions">
+          <button class="mini-btn" id="memoryRefreshBtn">刷新</button>
+          <button class="mini-btn danger" id="memoryClearBtn">清空</button>
+          <button class="mini-btn close-panel" title="关闭">×</button>
+        </div>
+      </div>
+      <div id="memoryStats" class="doc-stats"></div>
+      <div class="memory-tools">
+        <input id="memorySearch" placeholder="搜索记忆...">
+        <select id="memoryScope">
+          <option value="all">全部作用域</option>
+          <option value="global">全局</option>
+          <option value="session">会话级</option>
+        </select>
+      </div>
+      <div class="memory-form">
+        <textarea id="memoryInput" placeholder="写入一条新记忆..."></textarea>
+        <div class="memory-form-row">
+          <input id="memoryKwInput" placeholder="关键词(逗号分隔)" style="flex:1">
+          <button class="mini-btn" id="memoryAddBtn">保存</button>
+        </div>
+      </div>
+      <div id="memoryList" class="memory-list"></div>
+    </div>
+    <div class="side-content" id="runsPanel">
+      <div class="panel-head">
+        <span class="panel-title">🕘 运行记录</span>
+        <div class="head-actions">
+          <button class="mini-btn" id="runsRefreshBtn">刷新</button>
+          <button class="mini-btn close-panel" title="关闭">×</button>
+        </div>
+      </div>
+      <div id="runsList" class="runs-list"></div>
+    </div>
+    <div class="side-content" id="telemetryPanel">
+      <div class="panel-head">
+        <span class="panel-title">📊 用量统计</span>
+        <div class="head-actions">
+          <button class="mini-btn" id="telRefreshBtn">刷新</button>
+          <button class="mini-btn close-panel" title="关闭">×</button>
+        </div>
+      </div>
+      <div id="telStats" class="tel-stats"></div>
+      <div id="telRuns" class="tel-runs"></div>
+    </div>
+    <div class="side-content" id="schedulePanel">
+      <div class="panel-head">
+        <span class="panel-title">⏰ 定时任务</span>
+        <div class="head-actions">
+          <button class="mini-btn" id="schedRefreshBtn">刷新</button>
+          <button class="mini-btn close-panel" title="关闭">×</button>
+        </div>
+      </div>
+      <div class="sched-form">
+        <input id="schedNameInput" placeholder="任务名称">
+        <div class="sched-form-row">
+          <select id="schedFuncInput">
+            <option value="get_current_time">当前时间</option>
+            <option value="calculate">计算</option>
+            <option value="fetch_webpage">抓取网页</option>
+          </select>
+          <button class="mini-btn" id="schedAddBtn">创建</button>
+        </div>
+        <div class="sched-form-row">
+          <input id="schedCronInput" placeholder="Cron 表达式,如 0 9 * * *">
+          <span class="sched-or">或</span>
+          <input id="schedIntervalInput" type="number" min="60" placeholder="间隔秒" style="width:90px">
+        </div>
+      </div>
+      <div id="schedList" class="sched-list"></div>
+    </div>
+    <div class="side-content" id="promptsPanel">
+      <div class="panel-head">
+        <span class="panel-title">📝 提示词库</span>
+        <div class="head-actions">
+          <button class="mini-btn" id="promptAddBtn">新增</button>
+          <button class="mini-btn close-panel" title="关闭">×</button>
+        </div>
+      </div>
+      <div class="prompt-form">
+        <input id="promptTitleInput" placeholder="标题,如:代码审查">
+        <textarea id="promptTextInput" placeholder="提示词内容,输入框输入 / 可快捷唤起"></textarea>
+        <button class="mini-btn" id="promptSaveBtn">保存</button>
+      </div>
+      <div id="promptList" class="prompt-list"></div>
+    </div>
+    <div class="side-content" id="toolsPanel">
+      <div class="panel-head">
+        <span class="panel-title">🛠 可用工具</span>
+        <button class="mini-btn close-panel" title="关闭">×</button>
+      </div>
+      <div id="toolGrid" class="tool-grid"></div>
+    </div>
+    <div class="side-content" id="settingsPanel">
+      <div class="panel-head">
+        <span class="panel-title">⚙️ 设置</span>
+        <button class="mini-btn close-panel" title="关闭">×</button>
+      </div>
+      <div class="settings-body">
+        <div class="set-row"><span>深色主题</span><div class="toggle" id="themeToggle"><div class="toggle-knob"></div></div></div>
+        <div class="set-row"><span>评审模型(critic)</span><input class="set-input" id="criticModelInput" placeholder="如 qwen:qwen-plus" title="review/ensemble 模式的质量评审模型,provider:model"></div>
+        <div class="set-row"><span>多模型择优清单</span><input class="set-input" id="ensembleModelsInput" placeholder="如 deepseek:deepseek-chat,qwen:qwen-plus" title="ensemble 模式并行参与模型,逗号分隔 provider:model"></div>
+        <div class="set-row"><span>后端地址</span><span class="muted" id="backendUrlText">-</span></div>
+        <div class="set-row"><span>连接状态</span><span class="muted" id="backendStatusText">-</span></div>
+        <div class="set-row"><button class="lb-btn" id="restartBackendBtn">重启后端</button></div>
+        <p class="app-tip">💡 App 常驻系统托盘,关闭窗口仅最小化;全局快捷键 <code>Alt+Shift+Space</code> 可唤出/隐藏。</p>
+        <div class="about">
+          <b>智能体助手 v1.0</b>
+          <span class="muted">对话 · 知识库 · 工具 · 图片识别</span>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <input type="file" id="fileInput" multiple hidden>
+  <input type="file" id="imageInput" accept="image/*" hidden>
+  <input type="file" id="attachInput" multiple hidden>
+
+  <div id="lightbox">
+    <button class="lb-close" id="lbClose" title="关闭">×</button>
+    <img id="lbImg" alt="">
+    <div class="lb-bar">
+      <button class="lb-btn" id="lbDownload">下载</button>
+      <button class="lb-btn" id="lbCopy">复制图片</button>
+    </div>
+  </div>
+
+  <script src="js/common.js"></script>
+  <script src="js/attachments.js"></script>
+  <script src="js/session.js"></script>
+  <script src="js/kb.js"></script>
+  <script src="js/memory.js"></script>
+  <script src="js/runs.js"></script>
+  <script src="js/telemetry.js"></script>
+  <script src="js/schedule.js"></script>
+  <script src="js/prompts.js"></script>
+  <script src="js/todo.js"></script>
+  <script src="js/tools.js"></script>
+  <script src="js/settings.js"></script>
+  <script src="js/chat.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>

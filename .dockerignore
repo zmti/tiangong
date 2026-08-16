@@ -1,0 +1,19 @@
+# 构建上下文排除项: 避免把本地数据/依赖/构建产物打进镜像
+.venv/
+.venv_build/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+data/
+logs/
+dist/
+build/
+build_pyinstaller/
+desktop/
+node_modules/
+.git/
+.idea/
+.vscode/
+*.db
+*.jsonl

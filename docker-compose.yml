@@ -1,0 +1,37 @@
+services:
+  agent-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: agent-service:latest
+    container_name: agent-service
+    restart: unless-stopped
+    ports:
+      - "${AGENT_PORT:-8080}:8080"
+    environment:
+      # 生产环境用 env 覆盖 .env(secret 不要进镜像)
+      AGENT_LLM_PROVIDER: "${AGENT_LLM_PROVIDER:-deepseek}"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+      DEEPSEEK_BASE_URL: "${DEEPSEEK_BASE_URL:-https://api.deepseek.com}"
+      DEEPSEEK_MODEL: "${DEEPSEEK_MODEL:-deepseek-chat}"
+      # RAG 质量: 真实 Embedding + faiss ANN + RRF 重排
+      EMBEDDING_BACKEND: "${EMBEDDING_BACKEND:-local}"
+      EMBEDDING_API_BASE_URL: "${EMBEDDING_API_BASE_URL:-}"
+      EMBEDDING_API_KEY: "${EMBEDDING_API_KEY:-}"
+      EMBEDDING_API_MODEL: "${EMBEDDING_API_MODEL:-}"
+      VECTOR_INDEX_BACKEND: "${VECTOR_INDEX_BACKEND:-auto}"
+      RERANK_MODE: "${RERANK_MODE:-rrf}"
+      # 安全
+      AGENT_API_KEY: "${AGENT_API_KEY:-}"
+    volumes:
+      # 持久化: 会话/知识库/记忆/图片/traces 全部在 data/
+      - agent-data:/srv/agent-service/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=4)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  agent-data:

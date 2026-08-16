@@ -1,0 +1,10 @@
+{
+  "note": "黄金用例回归基线。cases 中为 true 的用例在 CI 中必须保持通过(退出码 0),否则视为回归。首次接入时请先跑真实 LLM 生成: python -m app.eval.runner --json result.json 然后复制其中每个用例的 ok 结果到此处。",
+  "cases": {
+    "time": true,
+    "calc": true,
+    "memory": true,
+    "web": true,
+    "browser": true
+  }
+}

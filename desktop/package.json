@@ -1,0 +1,43 @@
+{
+  "name": "agent-desktop",
+  "version": "1.0.0",
+  "description": "智能体桌面应用",
+  "main": "src/main.js",
+  "author": "agent-service",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder"
+  },
+  "devDependencies": {
+    "electron": "^28.3.3",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.agent.desktop",
+    "productName": "AgentDesktop",
+    "files": [
+      "src/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../backend/dist/agent-backend/**/*",
+        "to": "backend/agent-backend"
+      },
+      {
+        "from": "../backend/dist/.env",
+        "to": "backend/.env"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "zip",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    }
+  }
+}
