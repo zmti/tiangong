@@ -164,6 +164,67 @@ def test_extract_reasoning_separated():
     assert client._extract_reasoning(msg) == "thinking..."
 
 
+def test_cot_prompt_not_added_for_reasoning_model():
+    """推理模型不应追加 CoT 提示。"""
+    from app.core.llm import build_llm
+    client = build_llm("deepseek")
+    client.model = "deepseek-reasoner"
+    messages = [{"role": "user", "content": "hello"}]
+    result = client._maybe_wrap_with_thinking_prompt(messages)
+    assert len(result) == 1
+    assert "分步骤思考" not in result[0]["content"]
+
+
+def test_cot_prompt_not_added_when_disabled():
+    """agent_reasoning_enabled=False 时不追加 CoT 提示。"""
+    from app.config import settings
+    from app.core.llm import build_llm
+
+    old = settings.agent_reasoning_enabled
+    try:
+        settings.agent_reasoning_enabled = False
+        client = build_llm("deepseek")
+        client.model = "deepseek-chat"
+        messages = [{"role": "user", "content": "hello"}]
+        result = client._maybe_wrap_with_thinking_prompt(messages)
+        assert len(result) == 1
+        assert "分步骤思考" not in result[0]["content"]
+    finally:
+        settings.agent_reasoning_enabled = old
+
+
+def test_cot_prompt_added_for_non_reasoning_model():
+    """非推理模型应追加 CoT 提示。"""
+    from app.core.llm import build_llm
+    client = build_llm("deepseek")
+    client.model = "deepseek-chat"
+    messages = [{"role": "user", "content": "请计算 2+3"}]
+    result = client._maybe_wrap_with_thinking_prompt(messages)
+    assert len(result) == 1
+    assert "分步骤思考" in result[0]["content"]
+    assert "2+3" in result[0]["content"]
+
+
+def test_cot_prompt_not_duplicated():
+    """已有 CoT 提示时不重复追加。"""
+    from app.core.llm import build_llm
+    client = build_llm("deepseek")
+    client.model = "deepseek-chat"
+    messages = [{"role": "user", "content": "请逐步思考:\n2+3=?"}]
+    result = client._maybe_wrap_with_thinking_prompt(messages)
+    count = result[0]["content"].count("分步骤思考")
+    assert count == 1
+
+
+def test_cot_prompt_empty_messages_unchanged():
+    """空消息列表直接返回。"""
+    from app.core.llm import build_llm
+    client = build_llm("deepseek")
+    client.model = "deepseek-chat"
+    result = client._maybe_wrap_with_thinking_prompt([])
+    assert result == []
+
+
 # ---- 严格结构化输出 ----
 
 def test_chat_json_schema_validation_retry(monkeypatch):

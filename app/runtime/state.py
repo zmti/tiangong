@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 
 class AgentState:
@@ -53,6 +53,10 @@ class AgentState:
         # 节点内产生的 SSE 事件缓冲(引擎每步结束清空并返回给调用方)
         self.events: list[dict] = []
 
+        # 节点内实时事件回调:流式场景(graph.arun_stream)挂载后,emit 立即可见;
+        # 非流式恒为 None,buffer 语义不变。运行时可执行对象,不参与持久化。
+        self._on_event: Optional[Callable[[dict], None]] = None
+
         # 内部字段: 执行步数、工具失败计数
         self._step_index: int = 0
         self._failures: dict[str, int] = {}
@@ -62,8 +66,18 @@ class AgentState:
     # ---- 事件 ----
 
     def emit(self, event: dict) -> None:
-        """节点内产出 SSE 事件,引擎在节点结束时统一返回并清空。"""
+        """节点内产出 SSE 事件,引擎在节点结束时统一返回并清空。
+
+        流式场景(arun_stream 挂载 _on_event)下,事件还会立即转发给回调,
+        从而在节点(如 finalize 逐 token 生成)尚未结束时就能实时推送出去。
+        """
         self.events.append(event)
+        hook = self._on_event
+        if hook is not None:
+            try:
+                hook(event)
+            except Exception:  # noqa: BLE001
+                pass
 
     # ---- 序列化 ----
 
@@ -90,7 +104,7 @@ class AgentState:
         }
 
     def to_json(self) -> str:
-        return json.dumps(self.to_dict(), ensure_ascii=False, default=str)
+        return json.dumps(self.to_dict(), ensure_ascii=False)
 
     @classmethod
     def from_dict(cls, data: dict) -> "AgentState":

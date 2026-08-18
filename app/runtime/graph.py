@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 from typing import Any, Awaitable, Callable, Optional
 
 from app.runtime.state import AgentState
+
+logger = logging.getLogger(__name__)
 
 END = "__end__"
 
@@ -117,17 +120,23 @@ class Graph:
         name: str = "graph",
         checkpoint: Optional[Any] = None,
         max_iters: int = 200,
+        max_node_iters: int = 0,
         checkpoint_every_node: bool = True,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ):
         self.name = name
         self.checkpoint = checkpoint  # CheckpointManager 或 None
         self.max_iters = max_iters
+        self.max_node_iters = max_node_iters  # 绝对节点数上限(0=关闭),兜底防死循环
         self.checkpoint_every_node = checkpoint_every_node
+        self._cancel_check = cancel_check  # 可选: 取消检查回调 (返回 True 表示已取消)
 
         self._nodes: dict[str, Node] = {}
         self._edges: dict[str, str] = {}  # a -> b(静态边)
         self._conditional: dict[str, RouterFunc] = {}  # a -> fn(state) -> next
         self._entry: Optional[str] = None
+        # 流式运行时的实时事件转发器(arun_stream 挂载,节点内 emit 立即调用)
+        self._stream_hook: Optional[Callable[[dict], None]] = None
 
     # ---- 构建 ----
 
@@ -157,8 +166,8 @@ class Graph:
         if self.checkpoint is not None:
             try:
                 self.checkpoint.save(state)
-            except Exception:  # noqa: BLE001  # 落盘失败不影响主流程
-                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("checkpoint save failed for run %s: %s", state.run_id, exc)
 
     def interrupt(self, state: AgentState, value) -> None:
         """节点内主动暂停图执行(LangGraph interrupt 语义)。
@@ -192,6 +201,12 @@ class Graph:
         finished=True 表示本轮运行终止:可能是正常到达 END、
         节点异常失败,或节点主动 interrupt(暂停等待外部输入)。
         """
+        # 节点间 cancel 检查:防止长时间任务无法中断
+        if self._cancel_check and self._cancel_check():
+            state.status = "cancelled"
+            state.node = END
+            self._checkpoint(state)
+            return [], True
         node_name = state.node or self._entry
         if node_name in (None, END):
             return [], True
@@ -202,10 +217,15 @@ class Graph:
         state.status = "running"
         state.node = node_name
         state._step_index += 1
+        # 流式模式下让节点内 emit 实时转发,节点结束后恢复原状(支持嵌套/复用)
+        prev_hook = state._on_event
+        if self._stream_hook is not None:
+            state._on_event = self._stream_hook
         try:
             ret = await node(state, self)
         except GraphInterrupt:
             # 节点主动暂停:保留 node 指针指向当前节点,resume 时重入
+            state._on_event = prev_hook
             state.status = "interrupted"
             state.node = node_name
             self._checkpoint(state)
@@ -213,6 +233,7 @@ class Graph:
             state.events = []
             return events, True
         except Exception as e:  # noqa: BLE001  # 节点异常按失败终止,便于 checkpoint 观察
+            state._on_event = prev_hook
             state.status = "failed"
             state.error = str(e)[:500]
             state.node = END
@@ -220,6 +241,7 @@ class Graph:
             events = list(state.events)
             state.events = []
             return events, True
+        state._on_event = prev_hook
 
         nxt = await self._resolve_next(state, node_name, ret)
         # 动态扇出:节点返回 Send 列表时,先并行执行各分支再继续
@@ -279,7 +301,8 @@ class Graph:
             if node is None:
                 raise RuntimeError(f"图 {self.name} 中没有节点 {node_name}")
             await node(st, self)
-            st.events = []  # 事件由主节点收集,不直接回流
+            # 记录节点事件,合并回主状态时一并使用
+            st.events = list(st.events)  # 保留本节点产出(供 _apply_send 合并)
         st.status = "done"
         return st
 
@@ -288,6 +311,12 @@ class Graph:
         all_events: list[dict] = []
         guard = 0
         while True:
+            # arun 循环级 cancel 检查
+            if self._cancel_check and self._cancel_check():
+                state.status = "cancelled"
+                state.node = END
+                self._checkpoint(state)
+                return state, all_events
             events, finished = await self.astep(state)
             all_events.extend(events)
             if finished:
@@ -295,20 +324,76 @@ class Graph:
             if stop_at and state.node == stop_at:
                 return state, all_events
             guard += 1
-            if guard > self.max_iters:
+            if guard > self.max_iters or (self.max_node_iters and guard > self.max_node_iters):
                 state.status = "done"
                 state.node = END
+                state.error = f"图节点执行超过上限(max_iters={self.max_iters}, max_node_iters={self.max_node_iters})"
                 self._checkpoint(state)
                 return state, all_events
 
     async def arun_stream(self, state: AgentState):
-        """流式运行:逐节点产出事件。结束由调用方通过 finished 判断。"""
-        while True:
-            events, finished = await self.astep(state)
-            for e in events:
-                yield e
-            if finished:
-                return
+        """流式运行:事件实时逐条产出(不等节点结束),结束由调用方通过 finished 判断。
+
+        实现:节点在后台任务中顺序执行,并通过 state._on_event 把内部 emit 的每个事件
+        立即送入队列,本生成器逐条 yield——token/thinking/tool/plan 在生成过程中即可
+        送达调用方(如 SSE),不再等到整轮 finalize 结束才一股脑返回。
+        """
+        q: asyncio.Queue = asyncio.Queue()
+
+        def _forward(event: dict) -> None:
+            try:
+                q.put_nowait(event)
+            except Exception:  # noqa: BLE001
+                pass
+
+        async def _pump():
+            guard = 0
+            try:
+                while True:
+                    # 流式循环也需检查 cancel,与 arun 保持一致
+                    if self._cancel_check and self._cancel_check():
+                        state.status = "cancelled"
+                        state.node = END
+                        self._checkpoint(state)
+                        return
+                    _events, finished = await self.astep(state)
+                    if finished:
+                        return
+                    guard += 1
+                    if guard > self.max_iters or (self.max_node_iters and guard > self.max_node_iters):
+                        state.status = "done"
+                        state.node = END
+                        state.error = f"图节点执行超过上限(max_iters={self.max_iters}, max_node_iters={self.max_node_iters})"
+                        self._checkpoint(state)
+                        return
+            finally:
+                await q.put(None)  # 哨兵:通知消费方流入结束
+
+        pump_task = asyncio.create_task(_pump())
+        self._stream_hook = _forward
+        try:
+            while True:
+                evt = await q.get()
+                if evt is None:
+                    break
+                # yield 后检查 cancel,确保流式场景也能快速响应取消
+                if self._cancel_check and self._cancel_check():
+                    state.status = "cancelled"
+                    state.node = END
+                    self._checkpoint(state)
+                    break
+                yield evt
+        finally:
+            self._stream_hook = None
+            if not pump_task.done():
+                pump_task.cancel()
+            try:
+                await pump_task
+            except asyncio.CancelledError:
+                pass  # 消费方主动中断或泵被取消,属预期清理路径
+            except Exception:
+                # 后台泵的异常保持向外抛出,与旧实现的失败语义一致(调用方可感知)
+                raise
 
     async def aresume(self, state: AgentState, value=None, new_input: Optional[str] = None):
         """从中断处恢复运行(LangGraph Command(resume=...) 语义)。

@@ -135,6 +135,16 @@ async def heal_code_failure(
         rerun_cmd = _rerun_command(tool_name, arguments)
         if not rerun_cmd:
             break
+        # 安全门禁:重跑前重新分类命令,防止绕过破坏性检查
+        try:
+            from app.core.security import _classify_command
+            command = str(rerun_cmd.get("command", ""))
+            classification = _classify_command(command)
+            if classification == "blocked":
+                error_text = "重跑命令被安全门禁拦截(blocked),自愈中止"
+                break
+        except Exception:  # noqa: BLE001
+            pass  # 分类失败不阻塞自愈
         try:
             rerun = await run_terminal.run(json.dumps(rerun_cmd, ensure_ascii=False))
         except Exception as e:  # noqa: BLE001

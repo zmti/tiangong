@@ -6,6 +6,127 @@ window.App = {
   abortController: null,
   selectedImageFile: null,
   els: {},
+  _groupId: 0,
+  _currentGroup: null,
+  Group: {},
+};
+
+/* ---------- 请求分组:将一次对话的工具调用/思考/计划折叠为单个卡片 ---------- */
+App.Group.start = function () {
+  App._groupId++;
+  const gid = App._groupId;
+  const wrap = document.createElement('div');
+  wrap.className = 'req-group';
+  wrap.dataset.gid = gid;
+  // 执行摘要行(初始显示"执行中...")
+  const head = document.createElement('div');
+  head.className = 'req-group-head';
+  head.innerHTML = '<span class="rg-pulse">⏳</span><span class="rg-label">执行中…</span>';
+  const body = document.createElement('div');
+  body.className = 'req-group-body';
+  body.style.display = 'none';
+  wrap.appendChild(head);
+  wrap.appendChild(body);
+  App.els.messages.appendChild(wrap);
+  App.els.messages.scrollTop = App.els.messages.scrollHeight;
+  App._currentGroup = { gid, wrap, head, body, tools: [], thinking: null, plan: null, started: Date.now() };
+  return gid;
+};
+
+App.Group.addTool = function (name, args, result, success) {
+  if (!App._currentGroup) {
+    // 降级:无分组时创建独立消息
+    appendToolEvent(name, args, result);
+    return;
+  }
+  const g = App._currentGroup;
+  const ok = success !== true; // true param => failed; anything else => success
+  g.tools.push({ name, args, result, ok, time: Date.now() });
+  // 更新头部摘要
+  const icons = { read: '📖', write: '✏️', exec: '▶️', search: '🔍', browser: '🌐', edit: '🔧', system: '⚙️', tool: '🔨' };
+  const icon = Object.keys(icons).find(k => name.toLowerCase().includes(k)) || '🔨';
+  g.head.innerHTML = `<span class="rg-pulse">${icon}</span><span class="rg-label">${name} ${ok ? '✓' : '✗'}</span>`;
+  // 折叠显示:不展开详情直到结束
+  if (!g._detailVisible) {
+    const item = document.createElement('div');
+    item.className = 'rg-tool-item' + (ok ? '' : ' rg-tool-fail');
+    item.innerHTML = `<span class="rg-t-icon">${icon}</span><span class="rg-t-name">${escapeHtml(name)}</span><span class="rg-t-status">${ok ? '✓' : '✗'}</span>`;
+    item.title = `工具: ${name}\n参数: ${(typeof args === 'string' ? args : JSON.stringify(args) || '').slice(0, 120)}`;
+    g.body.appendChild(item);
+    g._detailVisible = true;
+    g.body.style.display = 'flex';
+  } else {
+    const item = document.createElement('div');
+    item.className = 'rg-tool-item' + (ok ? '' : ' rg-tool-fail');
+    item.innerHTML = `<span class="rg-t-icon">${icon}</span><span class="rg-t-name">${escapeHtml(name)}</span><span class="rg-t-status">${ok ? '✓' : '✗'}</span>`;
+    g.body.appendChild(item);
+  }
+};
+
+App.Group.setThinking = function (content) {
+  if (!App._currentGroup) { appendThinking(content); return; }
+  const text = stripThinkingTags(content);
+  if (!App._currentGroup.thinking) {
+    const el = document.createElement('div');
+    el.className = 'rg-thinking';
+    el.textContent = text.slice(0, 300);
+    el.title = text.slice(0, 2000);
+    App._currentGroup.body.appendChild(el);
+    App._currentGroup.thinking = el;
+    if (!App._currentGroup._detailVisible) {
+      App._currentGroup.body.style.display = 'flex';
+      App._currentGroup._detailVisible = true;
+    }
+  } else {
+    // 实时更新已有 thinking 元素
+    App._currentGroup.thinking.textContent = text.slice(0, 300);
+    App._currentGroup.thinking.title = text.slice(0, 2000);
+  }
+};
+
+App.Group.addPlanStep = function (step, total) {
+  if (!App._currentGroup) { appendPlan({ plan: { steps: [step] } }); return; }
+  const idx = App._currentGroup.planCount || 0;
+  App._currentGroup.planCount = idx + 1;
+  if (!App._currentGroup._detailVisible) {
+    App._currentGroup.body.style.display = 'flex';
+    App._currentGroup._detailVisible = true;
+  }
+};
+
+App.Group.finish = function (answer, isError) {
+  if (!App._currentGroup) return null;
+  const g = App._currentGroup;
+  const n = g.tools.length;
+  const okCount = g.tools.filter(t => t.ok).length;
+  const dur = Math.round((Date.now() - g.started) / 1000);
+  let headHtml;
+  if (isError) {
+    headHtml = `<span class="rg-pulse">❌</span><span class="rg-label">执行失败</span>`;
+  } else if (n === 0) {
+    headHtml = `<span class="rg-pulse">💬</span><span class="rg-label">直接回复</span>`;
+  } else {
+    headHtml = `<span class="rg-pulse">✅</span><span class="rg-label">${n} 个工具 · ${okCount}/${n} 成功 · ${dur}s</span>`;
+    const badge = document.createElement('span');
+    badge.className = 'rg-toggle';
+    badge.textContent = '▼';
+    badge.addEventListener('click', () => {
+      const open = g.body.style.display === 'block';
+      g.body.style.display = open ? 'none' : 'block';
+      badge.textContent = open ? '▼' : '▲';
+    });
+    g.head.appendChild(badge);
+  }
+  // 关闭按钮
+  const closeBtn = document.createElement('span');
+  closeBtn.className = 'rg-close';
+  closeBtn.textContent = '✕';
+  closeBtn.addEventListener('click', (e) => { e.stopPropagation(); g.wrap.remove(); });
+  g.head.innerHTML = headHtml;
+  g.head.appendChild(closeBtn);
+  g.wrap.classList.add('req-group-done');
+  App._currentGroup = null;
+  return n;
 };
 
 /* ---------- HTML 转义 ---------- */
@@ -450,6 +571,8 @@ function appendMessage(text, type = 'bot') {
     wrap.appendChild(body);
     App.els.messages.appendChild(wrap);
     App.els.messages.scrollTop = App.els.messages.scrollHeight;
+    // 确保欢迎页隐藏
+    document.body.classList.add('has-messages');
     return bubble;
   }
 
@@ -460,6 +583,8 @@ function appendMessage(text, type = 'bot') {
   }
   App.els.messages.appendChild(wrap);
   App.els.messages.scrollTop = App.els.messages.scrollHeight;
+  // 确保欢迎页隐藏
+  document.body.classList.add('has-messages');
   return wrap;
 }
 
@@ -544,6 +669,15 @@ function appendToolEvent(name, args, result) {
   return div;
 }
 
+/* 去除 <thinking> 标签包裹的内容，提取纯文本 */
+function stripThinkingTags(content) {
+  if (!content) return '';
+  return content
+    .replace(/<\/?thinking[^>]*>/gi, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 /* 思考过程:折叠卡片(点击标题展开/收起) */
 function appendThinking(content) {
   const div = document.createElement('div');
@@ -553,7 +687,8 @@ function appendThinking(content) {
   label.textContent = '💭 思考过程';
   const body = document.createElement('div');
   body.className = 'think-body';
-  body.textContent = String(content).slice(0, 800);
+  const text = stripThinkingTags(content).slice(0, 2000);
+  body.textContent = text;
   label.addEventListener('click', () => div.classList.toggle('open'));
   div.appendChild(label);
   div.appendChild(body);
@@ -810,9 +945,9 @@ async function openVersionPanel(path) {
           body: JSON.stringify({ path, version_id: ver.id }),
         });
         const d = await r.json();
-        if (r.ok) { App.appendMessage(`✅ 已恢复到版本 #${ver.id}`, 'bot'); await App.openVersionPanel(path); modal.remove(); }
-        else App.appendMessage(`恢复失败: ${d.detail || ''}`, 'error');
-      } catch (e) { App.appendMessage(`恢复失败: ${e.message}`, 'error'); }
+        if (r.ok) { toast(`已恢复到版本 #${ver.id}`, 'ok'); await App.openVersionPanel(path); modal.remove(); }
+        else toast(`恢复失败: ${d.detail || ''}`, 'err');
+      } catch (e) { toast(`恢复失败: ${e.message}`, 'err'); }
     });
     detailEl.querySelector('.ver-undo').addEventListener('click', async () => {
       try {
@@ -821,9 +956,9 @@ async function openVersionPanel(path) {
           body: JSON.stringify({ path }),
         });
         const d = await r.json();
-        if (r.ok) { App.appendMessage(`✅ 已撤销写入: ${d.action || 'restored'}`, 'bot'); await App.openVersionPanel(path); modal.remove(); }
-        else App.appendMessage(`撤销失败: ${d.detail || ''}`, 'error');
-      } catch (e) { App.appendMessage(`撤销失败: ${e.message}`, 'error'); }
+        if (r.ok) { toast(`已撤销写入: ${d.action || 'restored'}`, 'ok'); await App.openVersionPanel(path); modal.remove(); }
+        else toast(`撤销失败: ${d.detail || ''}`, 'err');
+      } catch (e) { toast(`撤销失败: ${e.message}`, 'err'); }
     });
   };
 
@@ -890,6 +1025,8 @@ function showTyping() {
 function removeTyping() {
   const t = document.getElementById('typing');
   if (t) t.remove();
+  const w = document.getElementById('welcome');
+  if (w) w.style.display = 'none';
 }
 
 /* ---------- 灯箱 ---------- */
@@ -924,9 +1061,9 @@ async function copyImage(src) {
     } else {
       await navigator.clipboard.writeText(src);
     }
-    appendMessage('📋 已复制图片', 'bot');
+    toast('📋 已复制图片', 'ok');
   } catch (e) {
-    appendMessage(`复制失败: ${e.message}`, 'error');
+    toast(`复制失败: ${e.message}`, 'err');
   }
 }
 
@@ -1032,12 +1169,18 @@ function confirmDialog(message, opts = {}) {
   });
 }
 
-/* ---------- API 封装 ---------- */
+/* ---------- API 封装(带超时保护) ---------- */
 async function api(path, opts = {}) {
   opts = opts || {};
   const headers = opts.headers || {};
   if (App.backendApiKey) headers['Authorization'] = 'Bearer ' + App.backendApiKey;
   opts.headers = headers;
+  // 默认 30s 超时,避免请求永久挂起
+  if (!opts.signal) {
+    const ctl = new AbortController();
+    opts.signal = ctl.signal;
+    setTimeout(() => ctl.abort(), 30000);
+  }
   return fetch(App.backendUrl + path, opts);
 }
 
@@ -1048,6 +1191,9 @@ async function api(path, opts = {}) {
 App.Confirmation = {
   shown: {},
   _container: null,
+  _interrupts: {}, // confirmation_id -> { run_id, session_id }
+  _batches: {},    // run_id -> [confirmation_id, ...] 同一轮 interrupt 的确认集合
+  _decisions: {},  // run_id -> { confirmation_id: { approved: bool } }
 
   _getContainer() {
     if (this._container) return this._container;
@@ -1087,6 +1233,12 @@ App.Confirmation = {
     act.className = 'confirm-tool';
     act.textContent = c.action || '';
     head.appendChild(act);
+    const close = document.createElement('span');
+    close.className = 'confirm-close';
+    close.textContent = '✕';
+    close.title = '忽略(按拒绝处理,不自动续跑)';
+    close.addEventListener('click', () => this.dismiss(c.id));
+    head.appendChild(close);
 
     const desc = document.createElement('div');
     desc.className = 'confirm-desc';
@@ -1113,7 +1265,8 @@ App.Confirmation = {
     this.shown[c.id] = card;
   },
 
-  async respond(id, approved) {
+  async respond(id, approved, opts = {}) {
+    let failed = '';
     try {
       const res = await App.api(`/v1/confirmations/${encodeURIComponent(id)}/respond`, {
         method: 'POST',
@@ -1121,19 +1274,166 @@ App.Confirmation = {
         body: JSON.stringify({ approved, result: '' }),
       });
       const data = await res.json();
-      if (data && data.status === 'error' && data.error) {
-        App.appendMessage(`确认处理失败: ${data.error}`, 'error');
-      }
+      if (data && data.status === 'error' && data.error) failed = data.error;
     } catch (e) {
-      App.appendMessage(`确认请求失败: ${e.message}`, 'error');
+      failed = e.message;
     }
+    if (failed) App.appendMessage(`确认处理失败: ${failed}`, 'error');
     const card = this.shown[id];
     if (card) {
       card.querySelector('.confirm-actions').innerHTML =
         `<span class="confirm-result">${approved ? '✅ 已批准' : '⛔ 已拒绝'}</span>`;
+      // 注意:不能在这里 delete this.shown[id],否则定时器里的 remove() 拿不到卡片,
+      // DOM 中的卡片会永远残留(render() 又因 shown 已删除而拒绝重绘)。
       setTimeout(() => this.remove(id), 1500);
     }
-    delete this.shown[id];
+    if (!opts.noResume) await this._maybeResume(id, approved);
+  },
+
+  /* 流式中断时即时展示所有待确认卡片(替代轮询等待) */
+  show(requests, runId) {
+    if (!requests || !requests.length) return;
+    const bar = this._getContainer();
+    if (!bar) return;
+    for (const req of requests) {
+      if (!req || !req.confirmation_id) continue;
+      // 构造一个兼容 render() 签名的临时对象
+      const c = {
+        id: req.confirmation_id,
+        action: req.tool || '',
+        description: req.reason || '',
+      };
+      this.render(c);
+      // 记录 run_id 以便批准后自动续跑
+      this._interrupts[req.confirmation_id] = { run_id: runId, session_id: App.sessionId || '' };
+      if (runId) {
+        if (!this._batches[runId]) this._batches[runId] = [];
+        if (!this._batches[runId].includes(req.confirmation_id)) {
+          this._batches[runId].push(req.confirmation_id);
+        }
+      }
+    }
+  },
+
+  /* 记录某次 interrupt 对应的确认集合,用于批准后自动续跑对话 */
+  trackInterrupt(doneEvt) {
+    const intr = (doneEvt && doneEvt.interrupt) || {};
+    const runId = doneEvt.run_id || intr.run_id || '';
+    const requests = intr.requests || [];
+    if (!requests.length) return;
+    const ids = [];
+    for (const r of requests) {
+      if (r && r.confirmation_id) {
+        this._interrupts[r.confirmation_id] = { run_id: runId, session_id: App.sessionId || '' };
+        ids.push(r.confirmation_id);
+      }
+    }
+    if (runId && ids.length) this._batches[runId] = ids;
+  },
+
+  /* 忽略:按拒绝写回并移除卡片,但不自动续跑,可在运行记录面板稍后继续 */
+  async dismiss(id) {
+    await this.respond(id, false, { noResume: true });
+    this._untrack(id);
+  },
+
+  _untrack(id) {
+    const info = this._interrupts[id];
+    if (!info) return;
+    delete this._interrupts[id];
+    const runId = info.run_id;
+    const rest = (this._batches[runId] || []).filter((cid) => cid !== id);
+    if (rest.length) this._batches[runId] = rest;
+    else delete this._batches[runId];
+    if (this._decisions[runId]) {
+      delete this._decisions[runId][id];
+      if (!Object.keys(this._decisions[runId]).length) delete this._decisions[runId];
+    }
+  },
+
+  async _maybeResume(id, approved) {
+    const info = this._interrupts[id];
+    if (!info || !info.run_id) return;
+    this._decisions[info.run_id] = this._decisions[info.run_id] || {};
+    this._decisions[info.run_id][id] = { approved };
+    const batch = this._batches[info.run_id] || [id];
+    const decided = Object.keys(this._decisions[info.run_id]);
+    // 同一轮 interrupt 若有多个确认卡片,等全部决定后再一次续跑
+    if (!batch.every((cid) => decided.indexOf(cid) >= 0)) return;
+    const resumeValue = {};
+    for (const cid of batch) {
+      resumeValue[cid] = this._decisions[info.run_id][cid];
+      delete this._interrupts[cid];
+    }
+    delete this._decisions[info.run_id];
+    delete this._batches[info.run_id];
+    await this._resumeRun(info.run_id, info.session_id, resumeValue);
+  },
+
+  async _resumeRun(runId, sessionId, resumeValue) {
+    App.showTyping();
+    App.Chat.setStreaming(true);
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 300000); // 5 分钟兜底
+    try {
+      const res = await App.api('/v1/chat/resume', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ run_id: runId, session_id: sessionId, resume_value: resumeValue, stream: true }),
+        signal: ctl.signal,
+      });
+      if (!res.ok || !res.body) {
+        const errText = await res.text().catch(() => '');
+        App.appendMessage(`续跑失败: ${res.status} ${errText}`, 'error');
+      } else {
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buf = '';
+        let answer = '';
+        let interrupted = false;
+        let interruptData = null;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += decoder.decode(value, { stream: true });
+          const parts = buf.split('\n\n');
+          buf = parts.pop();
+          for (const part of parts) {
+            const line = part.trim();
+            if (!line.startsWith('data: ')) continue;
+            try {
+              const evt = JSON.parse(line.slice(6));
+              if (evt.type === 'token') {
+                answer += evt.content || '';
+              } else if (evt.type === 'done') {
+                interrupted = evt.interrupted || false;
+                interruptData = evt.interrupt || null;
+              }
+            } catch (_) { /* 忽略解析错误 */ }
+          }
+        }
+        if (interrupted) {
+          App.appendMessage(`⏸ 运行续跑后再次暂停: ${(interruptData && (interruptData.message || interruptData.type)) || '等待确认'}`, 'bot');
+          // 嵌套确认:记录新的确认集合,后续批准/拒绝卡片可继续自动续跑
+          if (interruptData && App.Confirmation) {
+            App.Confirmation.trackInterrupt({ run_id: runId, interrupt: interruptData });
+          }
+        } else if (answer) {
+          const div = App.appendMessage(answer, 'bot');
+          div.innerHTML = App.renderMarkdown(answer);
+        }
+      }
+    } catch (e) {
+      if (e.name !== 'AbortError') {
+        App.appendMessage(`续跑失败: ${e.message}`, 'error');
+      } else {
+        App.appendMessage('续跑超时,请稍后在运行记录面板重试', 'error');
+      }
+    } finally {
+      clearTimeout(timer);
+      App.removeTyping();
+      App.Chat.setStreaming(false);
+    }
   },
 
   remove(id) {

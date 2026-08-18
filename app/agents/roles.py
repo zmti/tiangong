@@ -8,6 +8,8 @@
 
 AgentTeam 是角色的集合。用 roles.py 默认注册一批开箱即用的角色,
 也可在业务代码里 register_roles 覆盖。
+
+同时提供 BUILTIN_ROLES 字典供 dynamic_agents 等模块使用。
 """
 from __future__ import annotations
 
@@ -25,12 +27,14 @@ class AgentRole:
     tools: Optional[list[str]] = None  # 工具白名单;None = 全量
     model: str = ""  # "provider:model" 或 "provider" 或 ""(继承父模型)
     max_steps: int = 8
+    available_tools: Optional[list[str]] = None  # dynamic_agents 兼容字段
 
     def to_dict(self) -> dict:
         return {
             "name": self.name,
             "description": self.description,
             "tools": self.tools,
+            "available_tools": self.available_tools or self.tools,
             "model": self.model,
             "max_steps": self.max_steps,
         }
@@ -104,6 +108,7 @@ def default_roles() -> list[AgentRole]:
                 "以及不确定或缺失的信息。用简洁中文汇报。"
             ),
             tools=["fetch_webpage", "extract_text", "web_search", "rag_search", "memory_search"],
+            available_tools=["fetch_webpage", "extract_text", "web_search", "rag_search", "memory_search"],
             max_steps=10,
         ),
         AgentRole(
@@ -115,6 +120,8 @@ def default_roles() -> list[AgentRole]:
                 "遵循仓库现有风格与约定,不做无关重构。完成后汇报改动文件、测试结果与结论。"
             ),
             tools=None,  # 全量工具
+            available_tools=["run_code", "run_terminal", "read_file", "edit_file", "apply_patch",
+                             "check_syntax", "code_search", "code_context", "lsp_hover"],
             max_steps=15,
         ),
         AgentRole(
@@ -126,6 +133,7 @@ def default_roles() -> list[AgentRole]:
                 "只审查,不修改代码。输出:问题清单(按严重程度)、每个问题的位置与理由、修改建议。"
             ),
             tools=["read_document", "search_files", "list_directory", "code_context", "code_search", "git_diff", "git_log"],
+            available_tools=["read_document", "search_files", "list_directory", "code_context", "code_search", "git_diff", "git_log"],
             max_steps=10,
         ),
         AgentRole(
@@ -137,6 +145,8 @@ def default_roles() -> list[AgentRole]:
             ),
             tools=["query_sqlite", "list_sqlite_tables", "describe_table", "calculate",
                    "generate_chart", "generate_bar_chart", "generate_line_chart", "generate_pie_chart"],
+            available_tools=["query_sqlite", "list_sqlite_tables", "describe_table", "calculate",
+                             "generate_chart", "generate_bar_chart", "generate_line_chart", "generate_pie_chart"],
             max_steps=10,
         ),
         AgentRole(
@@ -147,6 +157,7 @@ def default_roles() -> list[AgentRole]:
                 "保持事实准确、条理清晰、语气一致。完成后输出成稿与要点说明。"
             ),
             tools=["read_document", "write_file", "list_directory", "search_files"],
+            available_tools=["read_document", "write_file", "list_directory", "search_files"],
             max_steps=6,
         ),
         AgentRole(
@@ -158,6 +169,19 @@ def default_roles() -> list[AgentRole]:
                 "输出风险清单:严重程度、风险说明、修复建议。"
             ),
             tools=["code_context", "code_search", "read_document", "search_files", "list_directory"],
+            available_tools=["code_context", "code_search", "read_document", "search_files", "list_directory"],
+            max_steps=10,
+        ),
+        AgentRole(
+            name="reviewer",
+            description="审核员:代码审查、质量评估、安全检查",
+            system_prompt=(
+                "你是一名专业审核员。擅长发现代码质量和安全问题,评估架构合理性,"
+                "检查合规性和最佳实践,给出具体的改进建议。"
+                "按严重程度分级问题,每个问题提供修复建议,区分必须修复和建议优化。"
+            ),
+            tools=["read_file", "run_code", "code_review", "check_syntax"],
+            available_tools=["read_file", "run_code", "code_review", "check_syntax"],
             max_steps=10,
         ),
     ]

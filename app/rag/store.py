@@ -1,4 +1,4 @@
-﻿"""向量存储:SQLite 持久化 + 可选 faiss 内存 ANN 索引。
+"""向量存储:SQLite 持久化 + 可选 faiss 内存 ANN 索引。
 
 SQLite 表 vectors 是权威存储(落盘不丢),faiss 索引仅作查询加速,
 启动时从 SQLite 重建。维度/索引后端变化时自动重建索引。
@@ -89,6 +89,7 @@ class VectorStore:
                         dim INTEGER NOT NULL,
                         vec BLOB NOT NULL,
                         meta TEXT NOT NULL,
+                        tenant_id TEXT NOT NULL DEFAULT 'default',
                         created_at REAL NOT NULL
                     )
                     """
@@ -101,6 +102,12 @@ class VectorStore:
                     )
                     """
                 )
+                # 迁移:补填 tenant_id 列
+                try:
+                    conn.execute("ALTER TABLE vectors ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'")
+                    conn.execute("CREATE INDEX IF NOT EXISTS idx_vectors_tenant ON vectors(tenant_id)")
+                except Exception:
+                    pass  # 列已存在
                 conn.commit()
             finally:
                 self._close(conn)
@@ -194,7 +201,7 @@ class VectorStore:
 
     # ---- 写操作 ----
 
-    def add(self, id: str, vector: list[float], metadata: Optional[dict] = None) -> None:
+    def add(self, id: str, vector: list[float], metadata: Optional[dict] = None, tenant_id: str = "default") -> None:
         if self.dim and len(vector) != self.dim:
             raise ValueError(f"向量维度 {len(vector)} 与存储维度 {self.dim} 不匹配")
         blob = self._serialize(vector)
@@ -203,8 +210,8 @@ class VectorStore:
             conn = self._connect()
             try:
                 conn.execute(
-                    "INSERT OR REPLACE INTO vectors (id, dim, vec, meta, created_at) VALUES (?,?,?,?,?)",
-                    (id, len(vector), blob, meta_json, time.time()),
+                    "INSERT OR REPLACE INTO vectors (id, dim, vec, meta, tenant_id, created_at) VALUES (?,?,?,?,?,?)",
+                    (id, len(vector), blob, meta_json, tenant_id, time.time()),
                 )
                 conn.commit()
             finally:
@@ -294,21 +301,22 @@ class VectorStore:
 
     # ---- 查询 ----
 
-    def search(self, query_vector: list[float], top_k: int = 5) -> list[dict]:
-        """返回相关向量:优先 faiss,回退 SQLite 线性扫描余弦。"""
+    def search(self, query_vector: list[float], top_k: int = 5, tenant_id: str = "default") -> list[dict]:
+        """返回相关向量:优先 faiss,回退 SQLite 线性扫描余弦。支持 tenant_id 过滤。"""
         q = np.asarray(query_vector, dtype=np.float32)
         if self._index is not None:
             try:
-                return self._faiss_search(q, top_k)
+                return self._faiss_search(q, top_k, tenant_id)
             except Exception:  # noqa: BLE001  # faiss 维度不匹配等异常回退线性
                 pass
-        return self._linear_search(q, top_k)
+        return self._linear_search(q, top_k, tenant_id)
 
-    def _faiss_search(self, q: np.ndarray, top_k: int) -> list[dict]:
+    def _faiss_search(self, q: np.ndarray, top_k: int, tenant_id: str = "default") -> list[dict]:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT id, dim, vec, meta FROM vectors WHERE dim=?", (int(q.shape[0]),)
+                "SELECT id, dim, vec, meta FROM vectors WHERE dim=? AND tenant_id=?",
+                (int(q.shape[0]), tenant_id),
             ).fetchall()
         finally:
             self._close(conn)
@@ -317,7 +325,7 @@ class VectorStore:
         index = self._index
         # faiss 索引维度与查询不一致时回退线性(切换 embedding 后可能发生)
         if index.d != q.shape[0]:
-            return self._linear_search(q, top_k)
+            return self._linear_search(q, top_k, tenant_id)
         qn = self._norm(q).reshape(1, -1).astype(np.float32)
         n = len(rows)
         k = min(top_k, n)
@@ -339,7 +347,7 @@ class VectorStore:
             results.append({"id": biz_id, "score": float(d), "metadata": meta})
         return results
 
-    def _linear_search(self, q: np.ndarray, top_k: int) -> list[dict]:
+    def _linear_search(self, q: np.ndarray, top_k: int, tenant_id: str = "default") -> list[dict]:
         qnorm = float(np.linalg.norm(q))
         if qnorm == 0:
             return []
@@ -347,7 +355,8 @@ class VectorStore:
         conn = self._connect()
         try:
             all_rows = conn.execute(
-                "SELECT id, dim, vec, meta FROM vectors WHERE dim=?", (int(q.shape[0]),)
+                "SELECT id, dim, vec, meta FROM vectors WHERE dim=? AND tenant_id=?",
+                (int(q.shape[0]), tenant_id),
             ).fetchall()
         finally:
             self._close(conn)

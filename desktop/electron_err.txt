@@ -1,0 +1,7 @@
+[hotkey] å…¨å±€å¿«æ·é”® Alt+Shift+Space æ³¨å†Œå¤±è´¥(å¯èƒ½è¢«å…¶ä»–ç¨‹åºå ç”¨)
+[22052:0818/215758.975:ERROR:cache_util_win.cc(20)] Unable to move the cache: ¾Ü¾ø·ÃÎÊ¡£ (0x5)
+[22052:0818/215758.977:ERROR:cache_util_win.cc(20)] Unable to move the cache: ¾Ü¾ø·ÃÎÊ¡£ (0x5)
+[22052:0818/215758.985:ERROR:disk_cache.cc(208)] Unable to create cache
+[22052:0818/215758.987:ERROR:gpu_disk_cache.cc(676)] Gpu Cache Creation failed: -2
+[22052:0818/215758.987:ERROR:disk_cache.cc(208)] Unable to create cache
+[22052:0818/215758.987:ERROR:gpu_disk_cache.cc(676)] Gpu Cache Creation failed: -2

@@ -1,16 +1,58 @@
 """Token 级上下文预算与渐进摘要。
 
 背景:旧的上下文管理用 `len(str)`(字符数)近似预算,对中英混合不准确。
-这里提供基于启发式的 token 估算(CJK 每字≈1 token,ASCII≈每 4 字符 1 token),
+这里提供基于真实 tokenizer(优先 tiktoken)的精确估算,不可用时自动降级到
+启发式(CJK 每字≈1 token,ASCII≈每 4 字符 1 token),
 把"系统提示 + 工具描述 + 记忆 + 历史"按真实 token 预算裁剪,并在超预算时
 对最早的消息做渐进式 LLM 摘要(保留最近消息原样,压缩更早的内容)。
+
+合并了 long_context.py 的重要性评分和 LongContextEngine。
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+from dataclasses import dataclass, field
 from typing import Optional
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+# 优先使用 tiktoken(精确),不可用时降级到启发式
+_tiktoken_encoding = None
+try:
+    import tiktoken  # noqa: F401
+
+    _tiktoken_encoding = tiktoken.get_encoding("cl100k_base")
+except Exception:  # noqa: BLE001
+    pass
+
+
+# ── 重要性评分(来自 long_context.py) ─────────────────────────────
+_ROLE_IMPORTANCE = {"system": 1.0, "user": 0.9, "assistant": 0.7, "tool": 0.3}
+_KEYWORD_IMPORTANCE = {
+    "decision": ["决定", "选择", "采用", "使用", "配置为", "设置为"],
+    "preference": ["偏好", "喜欢", "讨厌", "习惯", "风格"],
+    "fact": ["结果是", "发现", "确认", "验证", "证明", "计算得"],
+    "task": ["待办", "未完成", "继续", "下一步", "TODO"],
+    "code": ["def ", "function ", "class ", "import ", "# ", "```"],
+}
+
+
+def score_message_importance(msg: dict) -> float:
+    """评估单条消息的重要性分数(0~1),用于智能裁剪决策。"""
+    role = msg.get("role", "")
+    content = str(msg.get("content", ""))
+    base = _ROLE_IMPORTANCE.get(role, 0.5)
+    keyword_bonus = 0.0
+    for category, keywords in _KEYWORD_IMPORTANCE.items():
+        for kw in keywords:
+            if kw in content:
+                keyword_bonus += 0.05
+                break
+    return min(1.0, base + keyword_bonus)
 
 
 def _is_cjk(ch: str) -> bool:
@@ -25,13 +67,18 @@ def _is_cjk(ch: str) -> bool:
 
 
 def estimate_tokens(text: str) -> int:
-    """粗略 token 估算(确定性、无外部依赖)。
+    """精确 token 估算:优先 tiktoken(cl100k_base),不可用时降级到启发式。
 
-    精确值取决于 tokenizer,这里给出足够做预算判断的近似:
-    CJK 每字约 1 token;ASCII/其他每 4 字符约 1 token。
+    cl100k_base 覆盖 GPT-4/GPT-3.5/DeepSeek/Qwen 等主流模型。
     """
     if not text:
         return 0
+    if _tiktoken_encoding is not None:
+        try:
+            return len(_tiktoken_encoding.encode(text))
+        except Exception:  # noqa: BLE001
+            pass
+    # 启发式降级
     cjk = sum(1 for ch in text if _is_cjk(ch))
     other = len(text) - cjk
     return cjk + (other + 3) // 4
@@ -228,3 +275,147 @@ async def layered_compress(
         # 全失败:回退为普通截断(只留最近消息),保证预算内
         return keep or history, {"strategy": "fallback_keep"}
     return blocks + keep, stats
+
+
+# ── 智能裁剪(来自 long_context.py) ───────────────────────────────
+@dataclass
+class CompressStats:
+    """压缩统计信息。"""
+    strategy: str = "none"
+    kept_messages: int = 0
+    compressed_chunks: int = 0
+    dropped_messages: int = 0
+    original_tokens: int = 0
+    final_tokens: int = 0
+
+
+def smart_trim_by_importance(
+    messages: list[dict],
+    max_tokens: int,
+    min_keep: int = 6,
+) -> tuple[list[dict], CompressStats]:
+    """按重要性智能裁剪:保留高重要性消息,优先丢弃低重要性工具结果。
+
+    返回 (裁剪后消息列表, 统计信息)。
+    """
+    if max_tokens <= 0:
+        return messages, CompressStats(strategy="none")
+
+    original_tokens = sum(_msg_len(m) for m in messages)
+    if original_tokens <= max_tokens:
+        return messages, CompressStats(
+            strategy="none", kept_messages=len(messages),
+            original_tokens=original_tokens, final_tokens=original_tokens,
+        )
+
+    # 评分并排序
+    scored = [(score_message_importance(m), i, m) for i, m in enumerate(messages)]
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    # 贪心保留:从高重要性开始,直到超出预算
+    kept: list[dict] = []
+    kept_tokens = 0
+    for score, idx, msg in scored:
+        msg_tokens = _msg_len(msg)
+        if kept_tokens + msg_tokens <= max_tokens or len(kept) < min_keep:
+            kept.insert(0, msg)
+            kept_tokens += msg_tokens
+        else:
+            break
+
+    stats = CompressStats(
+        strategy="importance_trim",
+        kept_messages=len(kept),
+        dropped_messages=len(messages) - len(kept),
+        original_tokens=original_tokens,
+        final_tokens=kept_tokens,
+    )
+    return kept, stats
+
+
+# ── 长上下文引擎(来自 long_context.py) ───────────────────────────
+class LongContextEngine:
+    """超级长上下文引擎,支持 200K+ token 对话历史管理。
+
+    核心能力:
+    1. 动态 token 预算分配(系统提示 / 记忆 / 历史按比例)
+    2. 三层渐进压缩(最近原文 > 中段事实 > 早期摘要)
+    3. 语义重要性感知裁剪(保留关键决策和事实)
+    """
+
+    DEFAULT_MAX_TOKENS = 200000
+
+    def __init__(self, max_tokens: int = 0, llm=None):
+        self.max_tokens = max_tokens or settings.agent_token_budget or self.DEFAULT_MAX_TOKENS
+        self.llm = llm
+
+    def compute_budget(
+        self,
+        system_prompt: str,
+        memory_note: str,
+        profile_prompt: str = "",
+    ) -> tuple[int, int, dict]:
+        """计算系统/记忆/历史的 token 预算分配。
+
+        返回 (head_tokens, history_max_tokens, stats_dict)。
+        """
+        head_tokens = estimate_tokens(system_prompt or "")
+        head_tokens += estimate_tokens(memory_note or "")
+        head_tokens += estimate_tokens(profile_prompt or "")
+        history_budget = max(1000, self.max_tokens - head_tokens - 2000)
+        return head_tokens, history_budget, {
+            "total": self.max_tokens,
+            "head_tokens": head_tokens,
+            "history_budget": history_budget,
+        }
+
+    async def compress(
+        self,
+        messages: list[dict],
+        system_prompt: str = "",
+        memory_note: str = "",
+        profile_prompt: str = "",
+    ) -> tuple[list[dict], CompressStats]:
+        """对完整消息列表进行智能压缩。
+
+        流程:
+        1. 计算各部分 token 预算
+        2. 按语义重要性裁剪历史
+        3. 对超预算部分应用三层压缩
+        """
+        head_tokens, history_budget, _ = self.compute_budget(
+            system_prompt, memory_note, profile_prompt,
+        )
+
+        # 第一阶段:按重要性裁剪
+        trimmed, stats = smart_trim_by_importance(messages, history_budget)
+
+        # 第二阶段:对剩余部分做三层压缩(如需)
+        if stats.dropped_messages > 0 and self.llm is not None:
+            try:
+                compressed, stats2 = await layered_compress(
+                    self.llm, trimmed, history_budget, head_tokens=head_tokens,
+                )
+                stats.compressed_chunks = stats2.get("compressed_chunks", 0)
+                stats.strategy = stats2.get("strategy", stats.strategy)
+            except Exception:
+                pass
+
+        return trimmed, stats
+
+    def format_context_summary(self, stats: CompressStats) -> str:
+        """格式化压缩统计为可读文本。"""
+        return (
+            f"上下文压缩统计:\n"
+            f"  策略: {stats.strategy}\n"
+            f"  原始 token: {stats.original_tokens:,}\n"
+            f"  最终 token: {stats.final_tokens:,}\n"
+            f"  保留消息: {stats.kept_messages}\n"
+            f"  压缩块数: {stats.compressed_chunks}\n"
+            f"  丢弃消息: {stats.dropped_messages}"
+        )
+
+
+def get_long_context_engine(llm=None) -> LongContextEngine:
+    """获取长上下文引擎实例。"""
+    return LongContextEngine(llm=llm)

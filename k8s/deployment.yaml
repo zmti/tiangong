@@ -1,0 +1,275 @@
+# Agent Service Kubernetes Deployment
+#
+# 部署: kubectl apply -f k8s/
+# 删除: kubectl delete -f k8s/
+#
+# 需要:
+#   - Kubernetes 1.24+
+#   - 已配置 Secret (DEEPSEEK_API_KEY, AGENT_API_KEY, 等)
+#   - PV/PVC (或 NFS/Cloud Storage)
+
+---
+# ConfigMap: 环境变量配置
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agent-service-config
+  labels:
+    app: agent-service
+data:
+  AGENT_LLM_PROVIDER: "deepseek"
+  DEEPSEEK_BASE_URL: "https://api.deepseek.com"
+  EMBEDDING_BACKEND: "api"
+  VECTOR_INDEX_BACKEND: "auto"
+  RERANK_MODE: "rrf"
+  AGENT_REASONING_ENABLED: "true"
+  AGENT_PROMPT_CACHE: "true"
+  AGENT_CONFIRM_INTERRUPT: "true"
+  AGENT_API_KEY: ""  # 通过 Secret 注入
+
+---
+# Secret: 敏感信息(从外部注入)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: agent-service-secret
+  labels:
+    app: agent-service
+type: Opaque
+stringData:
+  DEEPSEEK_API_KEY: "your-deepseek-api-key"
+  AGENT_API_KEY: "your-agent-api-key"
+  OPENAI_COMPAT_API_KEY: ""
+  EMBEDDING_API_KEY: ""
+
+---
+# PersistentVolumeClaim: 数据持久化
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: agent-service-pvc
+  labels:
+    app: agent-service
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: standard
+
+---
+# Service: 内部访问
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-service
+  labels:
+    app: agent-service
+spec:
+  selector:
+    app: agent-service
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP
+  type: ClusterIP
+
+---
+# Deployment: 主应用
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-service
+  labels:
+    app: agent-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: agent-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: agent-service
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/v1/metrics/prometheus"
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: agent-service
+          image: agent-service:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: agent-service-config
+            - secretRef:
+                name: agent-service-secret
+          env:
+            - name: AGENT_HOST
+              value: "0.0.0.0"
+            - name: AGENT_PORT
+              value: "8080"
+            - name: AGENT_ENV_FILE
+              value: "/etc/agent-service/.env"
+          volumeMounts:
+            - name: data
+              mountPath: /srv/agent-service/data
+            - name: config
+              mountPath: /etc/agent-service
+              readOnly: true
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "2Gi"
+              cpu: "1000m"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: agent-service-pvc
+        - name: config
+          secret:
+            secretName: agent-service-secret
+            items:
+              - key: DEEPSEEK_API_KEY
+                path: .env
+              - key: AGENT_API_KEY
+                path: AGENT_API_KEY
+
+---
+# HorizontalPodAutoscaler: 自动扩缩容
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: agent-service-hpa
+  labels:
+    app: agent-service
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: agent-service
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Percent
+          value: 50
+          periodSeconds: 60
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+      selectPolicy: Max
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Percent
+          value: 10
+          periodSeconds: 120
+
+---
+# Ingress: 外部访问
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: agent-service
+  labels:
+    app: agent-service
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - agent.example.com
+      secretName: agent-tls-secret
+  rules:
+    - host: agent.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: agent-service
+                port:
+                  number: 8080
+
+---
+# NetworkPolicy: 安全策略
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: agent-service
+  labels:
+    app: agent-service
+spec:
+  podSelector:
+    matchLabels:
+      app: agent-service
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - port: 8080
+          protocol: TCP
+  egress:
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 443
+          protocol: TCP
+        - port: 80
+          protocol: TCP

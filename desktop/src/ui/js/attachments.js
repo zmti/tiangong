@@ -24,12 +24,12 @@ App.Attach.upload = async function (files) {
       const d = await res.json();
       if (res.ok) {
         App.Attach.currentIds.add(d.id);
-        App.appendMessage(`📎 已添加附件: ${d.name}`, 'bot');
+        App.toast(`已添加附件: ${d.name}`, 'ok');
       } else {
-        App.appendMessage(`❌ 附件「${file.name}」上传失败: ${d.detail || res.status}`, 'error');
+        App.toast(`附件「${file.name}」上传失败: ${d.detail || res.status}`, 'err');
       }
     } catch (e) {
-      App.appendMessage(`❌ 附件「${file.name}」上传失败: ${e.message}`, 'error');
+      App.toast(`附件「${file.name}」上传失败: ${e.message}`, 'err');
     }
   }
   App.Attach.render();

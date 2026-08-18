@@ -21,12 +21,16 @@ class MCPStdioClient:
         env: Optional[dict[str, str]] = None,
         timeout: float = 60.0,
         cwd: Optional[str] = None,
+        auto_reconnect: bool = True,
+        reconnect_interval: float = 5.0,
     ):
         self.command = command
         self.args = list(args or [])
         self.env_extra = dict(env or {})
         self.timeout = timeout
         self.cwd = cwd
+        self.auto_reconnect = auto_reconnect
+        self._reconnect_interval = reconnect_interval
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._reader = None
         self._writer = None
@@ -36,6 +40,7 @@ class MCPStdioClient:
         self._connected = False
         self._read_task: Optional[asyncio.Task] = None
         self._write_lock = asyncio.Lock()
+        self._reconnect_task: Optional[asyncio.Task] = None
 
     # ---- 生命周期 ----
 
@@ -72,11 +77,28 @@ class MCPStdioClient:
             await self.close()
             return {"status": "error", "error": f"initialize 失败: {e}"}
         self._connected = True
+        # 启动自动重连监控(仅当配置了 auto_reconnect)
+        if self.auto_reconnect:
+            self._reconnect_task = asyncio.create_task(self._reconnect_loop())
         return {"status": "connected", "server": {"name": self.command}}
 
     async def close(self) -> None:
+        # 停止自动重连:先禁用标志,再取消任务,防止竞态
+        self.auto_reconnect = False
+        if self._reconnect_task:
+            self._reconnect_task.cancel()
+            try:
+                await self._reconnect_task
+            except asyncio.CancelledError:
+                pass
+            self._reconnect_task = None
+        # 先取消读任务并等待其结束,再关闭进程
         if self._read_task:
             self._read_task.cancel()
+            try:
+                await self._read_task
+            except (asyncio.CancelledError, asyncio.InvalidStateError):
+                pass
             self._read_task = None
         proc = self._proc
         self._proc = None
@@ -97,6 +119,40 @@ class MCPStdioClient:
             if not fut.done():
                 fut.cancel()
         self._pending.clear()
+
+    async def _reconnect_loop(self) -> None:
+        """自动重连循环:进程退出后以指数退避尝试重新启动。"""
+        from app.config import settings as _settings
+        consecutive_failures = 0
+        max_delay = float(getattr(_settings, "mcp_reconnect_max_delay", 60.0))
+        max_failures = int(getattr(_settings, "mcp_reconnect_max_failures", 10))
+        while self.auto_reconnect:
+            try:
+                # 指数退避,但上限受配置限制
+                delay = min(
+                    self._reconnect_interval * (2 ** min(consecutive_failures, 6)),
+                    max_delay,
+                )
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                break
+            if self._proc is not None and self._proc.returncode is None:
+                consecutive_failures = 0  # 进程仍在运行,重置计数
+                continue
+            result = await self.connect()
+            if result.get("status") == "connected":
+                consecutive_failures = 0
+                self._tools_cache.clear()
+            else:
+                consecutive_failures += 1
+                import logging
+                logging.getLogger(__name__).warning(
+                    "MCP Stdio 重连失败 (%d/%d): %s",
+                    consecutive_failures, max_failures, result.get("error", "unknown"),
+                )
+                if consecutive_failures >= max_failures:
+                    # 连续失败达到阈值后停止重连,避免无意义重试
+                    break
 
     # ---- 与 HTTP 版一致的接口 ----
 

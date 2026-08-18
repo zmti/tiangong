@@ -8,9 +8,17 @@
     sendBtn: $('sendBtn'),
     stopBtn: $('stopBtn'),
     providerSelect: $('providerSelect'),
+    modelSelect: $('modelSelect'),
     modeSelect: $('modeSelect'),
     criticModelInput: $('criticModelInput'),
     ensembleModelsInput: $('ensembleModelsInput'),
+    // 可视化协作模式选择器
+    criticProviderSelect: $('criticProviderSelect'),
+    criticModelSelect: $('criticModelSelect'),
+    ensembleList: $('ensembleList'),
+    ensembleProvSelect: $('ensembleProvSelect'),
+    ensembleModelSelect: $('ensembleModelSelect'),
+    ensembleAddBtn: $('ensembleAddBtn'),
     imageBtn: $('imageBtn'),
     imageInput: $('imageInput'),
     shotBtn: $('shotBtn'),
@@ -447,27 +455,115 @@
         App.els.providerSelect.appendChild(opt);
       });
       if (data.default) App.els.providerSelect.value = data.default;
+      // Load models for default provider
+      if (data.default) {
+        await loadModels(data.default);
+      }
+      // Add change listener for provider selection
+      App.els.providerSelect.onchange = async (e) => {
+        await loadModels(e.target.value);
+      };
     } catch (_) { /* 忽略 */ }
   }
+  /* ---------- 加载模型列表 ---------- */
+  async function loadModels(providerId) {
+    if (!providerId) {
+      App.els.modelSelect.innerHTML = '<option value="">请先选择提供商</option>';
+      return;
+    }
+    try {
+      const res = await App.api('/v1/models?provider=' + encodeURIComponent(providerId));
+      if (!res.ok) {
+        App.els.modelSelect.innerHTML = '<option value="">加载失败</option>';
+        return;
+      }
+      const data = await res.json();
+      App.els.modelSelect.innerHTML = '';
+      if (!data.models || data.models.length === 0) {
+        const opt = document.createElement('option');
+        opt.value = data.default_model || '';
+        opt.textContent = data.default_model ? data.default_model + ' (默认)' : '无可用模型';
+        App.els.modelSelect.appendChild(opt);
+      } else {
+        data.models.forEach((m) => {
+          const opt = document.createElement('option');
+          opt.value = m.id;
+          opt.textContent = m.name + (m.speed ? ' [' + m.speed + ']' : '');
+          opt.title = (m.quality || '') + (m.speed ? ' | Speed: ' + m.speed : '');
+          if (m.id === data.default_model) opt.selected = true;
+          App.els.modelSelect.appendChild(opt);
+        });
+      }
+      App._modelsData = data;
+    } catch (_) {
+      App.els.modelSelect.innerHTML = '<option value="">加载失败</option>';
+    }
+  }
+
 
   /* ---------- 协作模式 / 评审 / 多模型清单(本地持久化) ---------- */
   function loadModePrefs() {
     try {
       App.els.modeSelect.value = localStorage.getItem('agent_mode') || 'auto';
-      App.els.criticModelInput.value = localStorage.getItem('agent_critic') || '';
-      App.els.ensembleModelsInput.value = localStorage.getItem('agent_ensemble') || '';
     } catch (_) { /* 忽略 */ }
   }
   function saveModePrefs() {
     try {
       localStorage.setItem('agent_mode', App.els.modeSelect.value);
-      localStorage.setItem('agent_critic', App.els.criticModelInput.value.trim());
-      localStorage.setItem('agent_ensemble', App.els.ensembleModelsInput.value.trim());
     } catch (_) { /* 忽略 */ }
   }
   App.els.modeSelect.addEventListener('change', saveModePrefs);
-  App.els.criticModelInput.addEventListener('change', saveModePrefs);
-  App.els.ensembleModelsInput.addEventListener('change', saveModePrefs);
+  // 可视化 critic 选择器
+  App.els.criticProviderSelect?.addEventListener('change', () => {
+    const pid = App.els.criticProviderSelect.value;
+    App.Settings.loadModels(pid, App.els.criticModelSelect);
+    App.Settings.saveCriticFromUI();
+  });
+  App.els.criticModelSelect?.addEventListener('change', () => App.Settings.saveCriticFromUI());
+  // 可视化 ensemble 列表
+  App.els.ensembleAddBtn?.addEventListener('click', () => {
+    const p = App.els.ensembleProvSelect?.value || '';
+    const m = App.els.ensembleModelSelect?.value || '';
+    if (!p || !m) { App.toast('请先选择提供商和模型', 'err'); return; }
+    // 最多 3 个
+    const currentCount = App.els.ensembleList?.querySelectorAll('.ensemble-item').length || 0;
+    if (currentCount >= 3) { App.toast('最多添加 3 个模型', 'err'); return; }
+    const item = document.createElement('div');
+    item.className = 'ensemble-item';
+    const provSel = document.createElement('select');
+    provSel.className = 'set-select set-select-sm ens-prov';
+    provSel.innerHTML = '<option value="">提供商</option>';
+    (App.els.ensembleProvSelect?.options || []).forEach((opt) => {
+      if (opt.value) { const o = opt.cloneNode(); provSel.appendChild(o); }
+    });
+    const modSel = document.createElement('select');
+    modSel.className = 'set-select set-select-sm ens-model';
+    modSel.innerHTML = '<option value="">选择模型</option>';
+    const countBadge = document.createElement('span');
+    countBadge.className = 'ens-count';
+    countBadge.textContent = `#${currentCount + 1}`;
+    const rmBtn = document.createElement('button');
+    rmBtn.className = 'ens-remove';
+    rmBtn.textContent = '×';
+    rmBtn.title = '移除此模型';
+    rmBtn.addEventListener('click', () => { item.remove(); App.Settings.saveEnsembleFromUI(); });
+    item.appendChild(provSel);
+    item.appendChild(modSel);
+    item.appendChild(countBadge);
+    item.appendChild(rmBtn);
+    App.els.ensembleList.appendChild(item);
+    provSel.value = p;
+    modSel.value = m;
+    provSel.addEventListener('change', () => {
+      const pid = provSel.value;
+      modSel.innerHTML = '<option value="">选择模型</option>';
+      if (pid) App.Settings.loadModels(pid, modSel);
+      App.Settings.saveEnsembleFromUI();
+    });
+    modSel.addEventListener('change', () => { App.Settings.saveEnsembleFromUI(); });
+    App.Settings.loadModels(p, modSel);
+    App.Settings.saveEnsembleFromUI();
+  });
 
   /* ---------- 后端地址解析 ---------- */
   async function resolveBackendUrl() {
@@ -561,6 +657,10 @@
     App.Prompts.render();
     loadProviders();
     loadModePrefs();
+    // 初始化协作模式可视化选择器
+    App.Settings.loadProviders();
+    App.Settings.restoreCritic();
+    App.Settings.restoreEnsemble();
     await App.Session.restoreLast(ids);
     if (App.CtxMeter) App.CtxMeter.refresh();
   }
@@ -601,6 +701,11 @@
       if (okNow && !App._dataLoaded) {
         App._dataLoaded = true;
         await loadAllData();
+      } else if (okNow && App._dataLoaded) {
+        // 后端恢复后刷新协作模式选择器
+        App.Settings.loadProviders();
+        App.Settings.restoreCritic();
+        App.Settings.restoreEnsemble();
       }
     }, 30000);
   }

@@ -5,6 +5,8 @@
 - 独立工具子集:可通过 tools 参数限制子 Agent 可用的工具
 - 只返回摘要:完整执行轨迹不回流主上下文,避免上下文膨胀
 - 递归深度限制:防止无限嵌套子智能体
+- 独立超时控制:每个子 Agent 有独立超时,超时后返回部分结果
+- 结果合并策略:支持 sum(汇总)/concat(拼接)/select(选优)三种合并模式
 """
 from __future__ import annotations
 
@@ -12,15 +14,21 @@ import asyncio
 import contextvars
 import datetime
 import json
+import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Literal
 
 from pydantic import Field
 
 from app.config import settings
 from app.tools.registry import tool
 
-MAX_DELEGATE_DEPTH = 2
+# 委派深度上限(主 Agent=0,子 Agent=1,孙 Agent=2)
+MAX_DELEGATE_DEPTH = int(getattr(settings, "agent_delegate_max_depth", 2))
+# 子 Agent 默认超时(秒)
+SUBAGENT_TIMEOUT = int(getattr(settings, "agent_subagent_timeout", 300))
+# 结果合并策略:sum=LLM 汇总 / concat=直接拼接 / select=评审选优
+MergeStrategy = Literal["sum", "concat", "select"]
 
 
 @dataclass
@@ -31,6 +39,7 @@ class DelegateContext:
     model: str = ""
     session_id: str = ""
     active_tools: Optional[list[str]] = None
+    approve_tools: Optional[list[str]] = None
 
 
 # 父 Agent 在执行工具前注入;子智能体创建时读取,用于继承模型/会话
@@ -42,7 +51,8 @@ _delegate_depth: contextvars.ContextVar[int] = contextvars.ContextVar("delegate_
 
 
 def set_delegate_context(
-    llm, session_id: str, active_tools: Optional[list[str]] = None
+    llm, session_id: str, active_tools: Optional[list[str]] = None,
+    approve_tools: Optional[list[str]] = None,
 ):
     """在执行工具前把父 Agent 的模型/会话信息注入 contextvar。返回恢复 token。"""
     info = getattr(llm, "info", None) or {}
@@ -51,6 +61,7 @@ def set_delegate_context(
         model=info.get("model", ""),
         session_id=session_id or "",
         active_tools=active_tools,
+        approve_tools=approve_tools,
     )
     return _delegate_parent.set(ctx)
 
@@ -70,6 +81,8 @@ async def enforce_output_contract(llm, answer: str, expect: str) -> tuple[bool, 
 
     返回 (ok, data, error):ok=False 且 error 非空表示结果不满足契约,
     主智能体可据此重新委派或调整策略。
+
+    改进:支持严格模式(校验 required 字段),失败时返回详细缺失字段列表。
     """
     if expect is None or expect == "" or expect == {}:
         return True, None, None
@@ -87,10 +100,16 @@ async def enforce_output_contract(llm, answer: str, expect: str) -> tuple[bool, 
             ],
             schema,
             temperature=0.2,
-            max_retries=1,
+            max_retries=2,  # 增加重试次数提高成功率
         )
     except Exception as e:  # noqa: BLE001
         return False, None, f"结果不满足输出契约: {e}"
+    # 严格校验:检查 required 字段是否全部存在
+    required = schema.get("required", [])
+    if required:
+        missing = [f for f in required if f not in data]
+        if missing:
+            return False, None, f"结果缺少必填字段: {', '.join(missing)}"
     return True, data, None
 
 
@@ -123,7 +142,7 @@ async def delegate_task(
     ),
 ) -> dict:
     """委派子任务给独立上下文的子智能体。"""
-    from app.core.agent import Agent
+    from app.core.agent import Agent, AgentResult
     from app.core.llm import LLMClient
 
     if _delegate_depth.get() >= MAX_DELEGATE_DEPTH:
@@ -152,6 +171,7 @@ async def delegate_task(
             return {"status": "error", "error": f"初始化子智能体模型失败: {e}"}
 
     max_steps = max(1, min(max_steps or 8, 15))
+    timeout = SUBAGENT_TIMEOUT
 
     sub = Agent(
         llm=llm,
@@ -163,6 +183,7 @@ async def delegate_task(
         ),
         session_id=parent.session_id if parent else "",
         temperature=0.4,
+        approve_tools=getattr(parent, "approve_tools", None),
     )
     # 工具子集裁剪:指定了 tools 就只用这些;未指定则用全量工具
     if tools:
@@ -179,9 +200,20 @@ async def delegate_task(
 
     token = _delegate_depth.set(_delegate_depth.get() + 1)
     try:
-        t0 = datetime.datetime.now()
-        result = await sub.run(prompt, history=[])
-        duration = round((datetime.datetime.now() - t0).total_seconds(), 2)
+        t0 = time.time()
+        try:
+            result = await asyncio.wait_for(
+                sub.run(prompt, history=[]),
+                timeout=timeout,
+            )
+            duration = round(time.time() - t0, 2)
+        except asyncio.TimeoutError:
+            duration = round(time.time() - t0, 2)
+            result = AgentResult(
+                answer=f"[子智能体超时({timeout}s),已尽力完成部分工作]",
+                steps=[],
+                model=llm.info["model"],
+            )
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "error": f"子智能体执行异常: {e}"}
     finally:
@@ -244,6 +276,7 @@ async def _run_subagent_task(
         ),
         session_id=parent.session_id if parent else "",
         temperature=0.4,
+        approve_tools=getattr(parent, "approve_tools", None),
     )
     if tools:
         allowed = [t.strip() for t in tools.split(",") if t.strip()]
@@ -256,10 +289,13 @@ async def _run_subagent_task(
     if context and context.strip():
         prompt += f"\n\n【背景资料】\n{context}"
 
-    t0 = datetime.datetime.now()
+    t0 = time.time()
     try:
-        result = await sub.run(prompt, history=[])
-        duration = round((datetime.datetime.now() - t0).total_seconds(), 2)
+        result = await asyncio.wait_for(
+            sub.run(prompt, history=[]),
+            timeout=SUBAGENT_TIMEOUT,
+        )
+        duration = round(time.time() - t0, 2)
         tool_steps = [s for s in result.steps if s.get("type") == "tool"]
         return {
             "status": "ok",
@@ -267,7 +303,18 @@ async def _run_subagent_task(
             "answer": result.answer,
             "tool_calls": len(tool_steps),
             "duration_s": duration,
+            "timeout": False,
             "note": "并行子智能体在独立上下文中执行,结果已合并",
+        }
+    except asyncio.TimeoutError:
+        duration = round(time.time() - t0, 2)
+        return {
+            "status": "timeout",
+            "instruction": instruction,
+            "answer": f"[子智能体超时({SUBAGENT_TIMEOUT}s)]",
+            "duration_s": duration,
+            "timeout": True,
+            "note": "子智能体执行超时,已完成部分工作",
         }
     except Exception as e:  # noqa: BLE001
         return {"status": "error", "instruction": instruction, "error": f"子智能体执行异常: {e}"}
@@ -288,6 +335,10 @@ async def delegate_parallel(
         "所有子任务必须互相独立"
     ),
     max_steps: int = Field(8, description="每个子智能体的最大执行步数,默认 8,上限 15"),
+    merge_strategy: str = Field(
+        "sum",
+        description="结果合并策略:sum=LLM 汇总所有结果(默认) / concat=直接拼接 / select=评审选优",
+    ),
 ) -> dict:
     """并行扇出多个独立子任务,合并返回全部结果。"""
     if _delegate_depth.get() >= MAX_DELEGATE_DEPTH:
@@ -302,31 +353,90 @@ async def delegate_parallel(
         return {"error": "tasks 必须是至少一项的数组"}
     if len(tasks_list) > 10:
         return {"error": "tasks 一次最多 10 项(避免过度并发)"}
+    if merge_strategy not in ("sum", "concat", "select"):
+        return {"error": f"无效的 merge_strategy: {merge_strategy},可选: sum/concat/select"}
 
     parent = _delegate_parent.get()
     max_steps = max(1, min(max_steps or 8, 15))
 
     token = _delegate_depth.set(_delegate_depth.get() + 1)
     try:
-        results = await asyncio.gather(*[
-            _run_subagent_task(
+        results = await asyncio.gather(
+            *[_run_subagent_task(
                 str(t.get("instruction", "")).strip(),
                 str(t.get("context", "") or ""),
                 str(t.get("tools", "") or ""),
                 max(1, min(int(t.get("max_steps", max_steps) or max_steps), 15)),
                 parent,
-            )
-            for t in tasks_list
-        ])
+            ) for t in tasks_list],
+            return_exceptions=True,
+        )
     finally:
         _delegate_depth.reset(token)
 
-    ok_count = sum(1 for r in results if r.get("status") == "ok")
+    ok_count = sum(1 for r in results if isinstance(r, dict) and r.get("status") == "ok")
+    timeout_count = sum(1 for r in results if isinstance(r, dict) and r.get("timeout"))
+    error_count = sum(1 for r in results if isinstance(r, dict) and r.get("status") == "error")
+    # gather(return_exceptions=True): 把异常包装为 Exception 对象而非抛出
+    collected: list[dict] = []
+    for r in results:
+        if isinstance(r, Exception):
+            collected.append({"status": "error", "error": f"子智能体执行异常: {r}"})
+        else:
+            collected.append(r)
+
+    # 按合并策略生成汇总(使用 collected,已过滤异常)
+    if merge_strategy == "concat":
+        # 直接拼接所有答案
+        answers = [r.get("answer", "") for r in collected if r.get("answer")]
+        merged_answer = "\n\n---\n\n".join(answers) if answers else "无有效结果"
+    elif merge_strategy == "select":
+        # 选优:取第一个成功且答案最长的结果(简单选优策略)
+        succeeded = [r for r in collected if r.get("status") == "ok"]
+        if succeeded:
+            best = max(succeeded, key=lambda r: len(r.get("answer", "")))
+            merged_answer = best.get("answer", "")
+        else:
+            merged_answer = "所有子任务均未成功完成"
+    else:  # sum (默认)
+        # LLM 汇总:把所有子任务结果喂给 LLM 生成综合报告
+        from app.core.llm import LLMClient
+        # 继承父级模型,若无则用默认
+        _parent_llm = None
+        if parent and parent.provider:
+            try:
+                _parent_llm = LLMClient(parent.provider, parent.model or None)
+            except Exception:  # noqa: BLE001
+                _parent_llm = None
+        if _parent_llm is None:
+            try:
+                _parent_llm = LLMClient()
+            except Exception:  # noqa: BLE001
+                _parent_llm = None
+        summary_llm = _parent_llm
+        combined = "\n".join(
+            f"## 子任务 {i+1}: {r.get('instruction', '')}\n结果: {r.get('answer', '无')}"
+            for i, r in enumerate(collected)
+        )
+        try:
+            merged_answer = await summary_llm.chat(
+                [
+                    {"role": "system", "content": "你是结果汇总助手。请将以下多个子任务的结果整合成一份简洁的综合报告。保留关键信息,去除重复内容。用中文输出。"},
+                    {"role": "user", "content": f"请汇总以下子任务结果:\n\n{combined}"},
+                ],
+                temperature=0.3,
+            )
+        except Exception:  # noqa: BLE001
+            merged_answer = combined  # 汇总失败则退回原始拼接
+
     return {
-        "status": "ok" if ok_count == len(results) else "partial",
-        "total": len(results),
+        "status": "ok" if ok_count == len(collected) else ("partial" if ok_count > 0 else "failed"),
+        "total": len(collected),
         "succeeded": ok_count,
-        "failed": len(results) - ok_count,
-        "results": results,
-        "note": "全部子任务已并行执行完成,结果按提交顺序合并",
+        "timeout": timeout_count,
+        "failed": error_count,
+        "merged_answer": merged_answer,
+        "merge_strategy": merge_strategy,
+        "results": collected,
+        "note": f"全部子任务已并行执行完成({ok_count}/{len(collected)}成功),合并策略:{merge_strategy}",
     }

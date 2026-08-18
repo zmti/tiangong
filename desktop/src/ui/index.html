@@ -70,7 +70,7 @@
       <div class="composer">
         <div class="composer-top">
           <div class="composer-selects">
-            <select id="providerSelect" title="切换模型"></select>
+            <select id="providerSelect" title="切换模型"></select>`n            <select id="modelSelect" title="选择模型"></select>
             <select id="modeSelect" title="协作模式:单模型 / 一个做另一个测 / 多模型并行择优">
               <option value="auto">自动</option>
               <option value="single">单模型</option>
@@ -259,8 +259,37 @@
       </div>
       <div class="settings-body">
         <div class="set-row"><span>深色主题</span><div class="toggle" id="themeToggle"><div class="toggle-knob"></div></div></div>
-        <div class="set-row"><span>评审模型(critic)</span><input class="set-input" id="criticModelInput" placeholder="如 qwen:qwen-plus" title="review/ensemble 模式的质量评审模型,provider:model"></div>
-        <div class="set-row"><span>多模型择优清单</span><input class="set-input" id="ensembleModelsInput" placeholder="如 deepseek:deepseek-chat,qwen:qwen-plus" title="ensemble 模式并行参与模型,逗号分隔 provider:model"></div>
+        <div class="set-section-title">🤖 协作模式设置</div>
+        <!-- 评审模型(critic) 可视化选择器 -->
+        <div class="set-row">
+          <span>评审模型</span>
+          <div style="display:flex;gap:6px;flex:1;align-items:center;">
+            <select id="criticProviderSelect" class="set-select set-select-sm" title="评审模型提供商" style="flex:0 0 110px;">
+              <option value="">提供商</option>
+            </select>
+            <select id="criticModelSelect" class="set-select set-select-sm" title="评审模型" style="flex:1;">
+              <option value="">选择模型</option>
+            </select>
+          </div>
+        </div>
+        <!-- 多模型择优清单 可视化 -->
+        <div class="set-row" style="flex-direction:column;align-items:stretch;">
+          <span style="margin-bottom:6px;">多模型择优清单</span>
+          <div id="ensembleList" style="display:flex;flex-direction:column;gap:5px;margin-bottom:6px;max-height:160px;overflow-y:auto;"></div>
+          <div style="display:flex;gap:6px;align-items:center;">
+            <select id="ensembleProvSelect" class="set-select set-select-sm" style="flex:0 0 110px;" title="选择提供商">
+              <option value="">提供商</option>
+            </select>
+            <select id="ensembleModelSelect" class="set-select set-select-sm" style="flex:1;" title="选择模型">
+              <option value="">选择模型</option>
+            </select>
+            <button id="ensembleAddBtn" class="lb-btn" style="padding:4px 12px;font-size:12px;" title="添加到清单">＋ 添加</button>
+          </div>
+          <span class="set-note" style="margin-top:4px;">多个模型并行执行同一任务，评审模型选出最佳回答。最多 3 个。</span>
+        </div>
+        <!-- 原有文本输入(隐藏,供 modeParams 兼容读取) -->
+        <input type="hidden" id="criticModelInput">
+        <input type="hidden" id="ensembleModelsInput">
         <div class="set-row"><span>后端地址</span><span class="muted" id="backendUrlText">-</span></div>
         <div class="set-row"><span>连接状态</span><span class="muted" id="backendStatusText">-</span></div>
         <div class="set-row"><button class="lb-btn" id="restartBackendBtn">重启后端</button></div>

@@ -911,23 +911,36 @@ class Agent:
         return self._schemas_cache
 
     async def _maybe_select_tools(self, user_input: str, steps: list[dict], step: int) -> Optional[dict]:
-        """对话前用 LLM 预选相关工具子集(工具路由)。返回 SSE 事件;未路由/失败返回 None。"""
+        """对话前用 LLM 预选相关工具子集(工具路由)。返回 SSE 事件;未路由/失败返回 None。
+
+        优先使用增强型路由(smart_router 三级缓存+置信度),失败返回 None。
+        """
         if not settings.agent_tool_router_enabled:
             return None
         if getattr(self.llm, "provider", "") == "mock":
             return None
-        from app.core.router import select_tools
 
+        max_tools = min(int(settings.agent_max_tools or 10), len(self.registry.list()))
+        min_confidence = 0.10
+
+        # 使用智能路由(关键词+embedding+LLM 三级缓存 + 置信度评分)
         try:
-            selected = await select_tools(self.llm, user_input, self.registry)
-        except Exception:  # noqa: BLE001  # 路由失败回退全量工具,不影响主循环
-            return None
-        if not selected:
-            return None
-        self._active_tools = selected
-        self._schemas_cache = None
-        steps.append({"step": step, "type": "tool_route", "tools": selected})
-        return {"type": "tool_route", "tools": selected}
+            from app.core.smart_router import select_tools_enhanced
+            selected, conf, reason = await select_tools_enhanced(
+                self.llm, user_input, self.registry,
+                max_tools=max_tools,
+                min_confidence=min_confidence,
+                user_tech_stack=getattr(self, "_tech_stack", []),
+            )
+            if selected and conf >= min_confidence:
+                self._active_tools = selected
+                self._schemas_cache = None
+                steps.append({"step": step, "type": "tool_route", "tools": selected, "reason": reason})
+                return {"type": "tool_route", "tools": selected, "reason": reason}
+        except Exception:
+            pass  # 智能路由失败,不回退旧版
+
+        return None
 
     async def _call_llm(self, messages: list[dict]) -> tuple[str, str, list[ToolCall]]:
         """调用 LLM。返回 (mode, content, tool_calls)。

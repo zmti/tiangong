@@ -107,6 +107,12 @@ docker run -d --name agent-service -p 8080:8080 \
 - **严格结构化输出**:`chat_json_schema` 绑 JSON Schema + 校验回灌重试(非法输出把错误回喂模型修正)
 - **工具系统**:`@tool` 装饰器注册、JSON Schema 参数校验、执行超时、启停控制
 - **长期记忆(LTM)**:SQLite 持久化 global/session 两级记忆,`memory_save/search/update/forget/list/stats` 六个工具;可开启自动沉淀(`AGENT_AUTO_MEMORY=true`)
+- **记忆精炼(MemoryConsolidator)**:`POST /v1/memory/consolidate` 触发相似记忆合并与用户画像提取,对标 Anthropic 工作记忆→长期记忆的提炼流;配置 `AGENT_CONSOLIDATE_ENABLED=true` 每次对话后自动运行
+- **用户画像(UserProfiler)**:`app/memory/profile.py` 持久化语言偏好/代码风格/擅长领域/技术栈等;每次对话前自动注入为系统提示;支持 `GET/PUT/DELETE /v1/user_profile/*` 管理;配置 `AGENT_USER_PROFILE_ENABLED=true`(默认)
+- **高级技能(SkillRegistry)**:`app/core/skills.py` 把多个工具链式组合成高级语义操作(如 `deploy_to_staging` = build→test→deploy);4个内置技能开箱即用;配置 `AGENT_SKILLS_ENABLED=true` 后技能描述注入系统提示
+- **会话成本预算(SessionCostBudget)**:`app/core/budget.py` 按会话追踪 token 和美元成本,请求级可设 `budget_usd`/`budget_tokens` 硬上限,超预算自动中止;API: `GET/POST /v1/budget/*`
+- **Embedding 缓存(EmbeddingCache)**:`app/rag/cache.py` 内存 dict + SQLite 文件两级缓存,避免相同文本重复调嵌入 API;TTL 默认24h;API: `GET /v1/embedding_cache/stats`
+- **A/B 评估对比**:`app/eval/ab.py` 同一数据集上并行跑两组配置,输出通过率/成本/统计显著性;API: `POST /v1/eval/ab/run`, `GET /v1/eval/ab/report`
 - **上下文智能裁剪与分层**:启发式 token 估算(中文≈1 token/字,ASCII≈4 字符/token),`agent_token_budget>0` 时按 token 级预算裁剪历史;超预算触发三层压缩(`layered_compress`):最近消息原文保留、中段消息由 LLM 抽结构化"关键事实"、最早消息合并为摘要——比单一摘要更贴近主流 agent 的上下文工程;字符预算(`context_char_budget`)继续作为默认兜底
 - **子任务独立上下文强制化**:`delegate_task`/`handoff_to_role` 创建的子智能体显式收紧上下文预算(`AGENT_SUBAGENT_CONTEXT_BUDGET`),只拿到指令+背景+工具结果,不回流父级历史
 - **computer-use 视觉驾驶**:`browser_drive` 工具循环"截图→多模态 LLM 决策→点击坐标/输入/滚动→再截图",像人类一样看着页面完成网页任务(配 `browser_screenshot` 等浏览器工具链)
@@ -114,9 +120,18 @@ docker run -d --name agent-service -p 8080:8080 \
 - **工具路由**:每轮对话前由 LLM 从 100+ 工具中预选相关子集再注入,避免全量注入导致调用精度下降(BFCL tiered approach);路由失败自动回退全量,系统工具(`memory_*`/`set_plan`/`update_plan`)常驻不裁剪
 - **子智能体**:`delegate_task` 工具把子任务委派给独立上下文的子 Agent(继承父模型/会话、可裁剪工具子集、深度限 2 层、只回传摘要);`delegate_parallel` 并行扇出多个互不依赖的子任务(map-reduce 式,一次最多 10 项,结果按序合并);角色化版本见 `handoff_to_role`;均支持 `expect` 输出契约,确保交回的结果可被主智能体可靠消费
 - **可观测性**:内置 trace(JSONL 落盘 + 内存缓冲),`/v1/traces`、`/v1/traces/runs`、`/v1/traces/stats` 查询 token 用量/耗时/成本/错误;可配置 OTLP 端点转发到 Langfuse/OpenTelemetry Collector/自建网关(`OTEL_EXPORTER_OTLP_ENDPOINT`),端点不可达自动禁用不影响本地
+- **性能剖析(Profiling)**:`/v1/profiling/tools` 工具耗时排行、`/v1/profiling/runs/{run_id}` 单次运行完整轨迹、`/v1/profiling/daily` 日汇总;自动记录每次 LLM 调用与工具执行的耗时/token/成本,帮助定位瓶颈
+- **跨会话失败记忆(Self-Improvement)**:`app/memory/failure_memory.py`,自动记录每个工具的失败模式并聚合;新会话启动时检索相关失败经验注入 system prompt,格式 `[失败经验] 工具 xxx 曾失败 N 次,原因:..., 建议: ...`;API: `GET /v1/failure-memory`、`GET /v1/failure-memory/tools/{name}`、`POST /v1/failure-memory/hints/{id}`
+- **任务完成 Webhook 回调**:`WEBHOOK_URLS` 配置一个或多个 HTTP 端点,对话完成/后台任务完成/确认流结束时异步推送事件;支持 HmacSHA256 签名(`WEBHOOK_SECRET`)和事件过滤(`WEBHOOK_EVENTS`);API: `GET /v1/webhook/status`
+- **文件锁(File Locking)**:`app/core/file_lock.py`,防止多 Agent/进程同时修改同一文件导致冲突;支持超时自动释放和持久化恢复;API: `GET /v1/file-locks`、`POST /v1/file-locks/cleanup`
 - **安全**:可选 `AGENT_API_KEY` Bearer 鉴权;`AGENT_TOOL_CONFIRM` 开启后危险工具(`run_terminal`/`run_code`)需请求 `approve_tools` 获批才执行,`AGENT_CONFIRM_INTERRUPT=true` 时改为非阻塞 interrupt 式确认(暂停→`/v1/chat/resume` 批准/拒绝后从原节点恢复);`AGENT_GUARDRAILS_ENABLED` 开启输入/输出 Guardrail(Prompt 注入、敏感路径越权、密钥泄漏、系统提示词泄露检测)
 - **黄金用例回归**:`python -m app.eval.runner` 跑真实 LLM 用例集,量化工具调用精度与任务完成率,支持路由开/关对比、`--json` 落盘与 `--baseline` 回归门禁;`--judge` 启用 LLM-as-Judge 多维质量打分(correctness/faithfulness/helpfulness)
 - **RAG 文档问答**:真实 Embedding(OpenAI 兼容 API)或零依赖哈希嵌入、faiss ANN 索引加速、向量+关键词 RRF 融合重排、回答附 chunk/doc_id 引用
+- **免费网络搜索回退**:`web_search` 工具在配置 `SEARCH_API_KEY` 时使用 SerpAPI/Bing 付费搜索;未配置时自动降级到 DuckDuckGo 免费 HTML 搜索,无需任何 API Key 即可使用
+- **结构化代码编辑(code_file)**:`read_file`/`edit_file`/`apply_patch`/`check_syntax`/`count_lines`/`find_functions`——补丁式精确替换(需原文匹配防误改)、unified diff 批量应用、语法检查(Python/JS/TS/Go/Rust 等)
+- **成本追踪(cost_tracker)**:`cost_summary`/`cost_report`/`cost_daily_trend`——按会话/模型/天聚合 token 用量与美元估算,输出人类可读报告
+- **MCP Server 模式**:`/mcp/call`(JSON-RPC)、`/mcp/tools`(列出工具)、`/mcp/chat`(对话简写)、`/mcp/cost`(成本查询);外部 MCP 客户端(Claude Code/Cursor 等)可直接调用本服务的 Agent 能力
+- **图片 OCR(image_ocr)**:`image_ocr`/`screenshot_ocr`——优先使用 Tesseract 本地 OCR,无 Tesseract 时自动回退 LLM 多模态能力
 - **安全代码执行**:沙箱隔离运行 Python 代码(参考 OpenHands 思路)
 - **会话记忆**:按 session_id 隔离,消息条数限制,过期清理
 - **流式输出**:SSE 实时返回推理/工具/回答事件
@@ -207,6 +222,20 @@ curl -X POST http://localhost:8080/v1/chat -H "Content-Type: application/json" \
 | `AGENT_DANGEROUS_TOOLS` | `run_terminal,run_code` | 危险工具清单(逗号分隔) |
 | `AGENT_CONFIRM_INTERRUPT` | `true` | 危险工具确认改为非阻塞 interrupt 式(暂停→resume 批准/拒绝) |
 | `AGENT_GUARDRAILS_ENABLED` | `true` | 输入/输出 Guardrail(注入/越权/密钥泄漏/提示词泄露检测) |
+| `AGENT_CONSOLIDATE_ENABLED` | `false` | 对话结束后自动触发记忆精炼(合并相似记忆+提炼画像) |
+| `AGENT_CONSOLIDATE_MIN_INTERVAL` | `3600` | 精炼最小间隔(秒),防止过于频繁 |
+| `AGENT_USER_PROFILE_ENABLED` | `true` | 启用用户画像注入系统提示 |
+| `AGENT_SKILLS_ENABLED` | `false` | 启用高级技能(可组合工具链)系统 |
+| `AGENT_EMBEDDING_CACHE_ENABLED` | `true` | 嵌入向量内存+磁盘缓存 |
+| `AGENT_EMBEDDING_CACHE_PERSISTENT` | `true` | 跨进程持久化嵌入缓存 |
+| `AGENT_EMBEDDING_CACHE_MAX_SIZE` | `10000` | 缓存最大条目数 |
+| `AGENT_EMBEDDING_CACHE_TTL` | `86400` | 缓存TTL(秒) |
+| `AGENT_COST_BUDGET_ENABLED` | `true` | 开启会话级 token/成本追踪 |
+| `WEBHOOK_URLS` | 空 | 任务/对话完成后异步推送 HTTP 回调的端点列表(逗号分隔);留空关闭 |
+| `WEBHOOK_SECRET` | 空 | Webhook HmacSHA256 签名密钥;留空不签名 |
+| `WEBHOOK_TIMEOUT` | `10` | Webhook 请求超时(秒) |
+| `WEBHOOK_RETRIES` | `2` | Webhook 失败重试次数 |
+| `WEBHOOK_EVENTS` | 空 | 过滤的事件类型(逗号分隔),留空=全部:`task_done,chat_done,confirmation_resolved` |
 
 ## 可观测性
 
@@ -379,3 +408,12 @@ def query_weather(city: str = Field(description="城市名"), days: int = Field(
 - OTLP 导出通道:`app/core/telemetry.py`(`OTEL_EXPORTER_OTLP_ENDPOINT`,端点不可达自动禁用)
 - eval 回归门禁:`app/eval/runner.py --baseline` + CI workflow
 - LLM-as-Judge 质量打分:`app/eval/runner.py --judge`(correctness/faithfulness/helpfulness)
+- **MCP Server 端点**:`/mcp/call`(JSON-RPC)、`/mcp/tools`(工具列表)、`/mcp/chat`(对话)、`/mcp/cost`(成本)
+- **成本追踪工具**:`cost_summary`/`cost_report`/`cost_daily_trend`(跨运行 token 用量与美元估算)
+- **免费搜索回退**:`web_search` 无 API Key 时自动走 DuckDuckGo HTML 搜索
+- **结构化代码编辑**:`read_file`/`edit_file`/`apply_patch`/`check_syntax`(补丁式精确替换+语法校验)
+- **图片 OCR**:`image_ocr`/`screenshot_ocr`(Tesseract 优先,LLM 多模态回退)
+- **性能剖析**:`/v1/profiling/tools`(工具耗时排行)、`/v1/profiling/runs/{id}`(单次运行轨迹)、`/v1/profiling/daily`(日汇总);数据落盘 `data/profiling.jsonl`
+- **跨会话失败记忆**:`app/memory/failure_memory.py`,自动记录工具失败模式并注入下次会话;API:`GET /v1/failure-memory`、`GET /v1/failure-memory/tools/{name}`、`POST /v1/failure-memory/hints/{id}`
+- **任务 Webhook 回调**:`WEBHOOK_URLS` 配置后,对话/后台任务完成异步推送 HTTP 通知;支持 HMAC 签名
+- **文件锁**:`app/core/file_lock.py`,防止多 Agent 并发修改同一文件;API:`GET /v1/file-locks`、`POST /v1/file-locks/cleanup`

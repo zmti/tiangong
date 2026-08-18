@@ -131,6 +131,54 @@ TOOL_CATEGORIES: dict[str, str] = {
     "delegate_task": "协作",
     "list_roles": "协作",
     "handoff_to_role": "协作",
+    # ---- 文件监听 ----
+    "file_watch": "文件",
+    "file_unwatch": "文件",
+    "file_list_watches": "文件",
+    # ---- 反馈 ----
+    "like_feedback": "协作",
+    "dislike_feedback": "协作",
+    # ---- LSP ----
+    "lsp_hover": "代码",
+    "lsp_references": "代码",
+    "lsp_definition": "代码",
+    # ---- 构建 ----
+    "detect_build_system": "代码",
+    "run_build": "代码",
+    "run_test": "代码",
+    # ---- Git PR ----
+    "git_create_branch": "代码库",
+    "git_push_and_create_pr": "代码库",
+    # ---- 代码审阅 ----
+    "code_review": "代码",
+    # ---- 调试辅助 ----
+    "analyze_traceback": "代码",
+    "find_potential_bugs": "代码",
+    # ---- 依赖管理 ----
+    "install_package": "代码",
+    "list_packages": "代码",
+    # ---- 项目管理 ----
+    "project_scaffold": "代码",
+    "project_analyze": "代码",
+    "project_testgen": "代码",
+    "project_docs": "代码",
+    "project_build": "代码",
+    # ---- AST 编辑 ----
+    "ast_edit": "代码",
+    # ---- 结构化代码编辑 ----
+    "read_file": "文件",
+    "edit_file": "代码",
+    "apply_patch": "代码",
+    "check_syntax": "代码",
+    "count_lines": "代码",
+    "find_functions": "代码",
+    # ---- 成本追踪 ----
+    "cost_summary": "成本",
+    "cost_report": "成本",
+    "cost_daily_trend": "成本",
+    # ---- OCR ----
+    "image_ocr": "视觉",
+    "screenshot_ocr": "视觉",
 }
 
 # 系统级工具:无论任务如何都常驻(规划与记忆基础设施),不参与路由裁剪
@@ -143,6 +191,14 @@ SYSTEM_TOOLS: tuple[str, ...] = (
     "memory_list",
     "memory_stats",
     "delegate_task",
+    "file_watch",
+    "file_unwatch",
+    "file_list_watches",
+    "cost_summary",
+    "cost_report",
+    # 经验学习基础设施(自动注入,不参与工具路由)
+    "_failure_memory_note",
+    "_success_memory_note",
 )
 
 

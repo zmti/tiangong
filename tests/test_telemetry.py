@@ -70,4 +70,5 @@ def test_runs_summary():
 
 def test_estimate_cost():
     assert estimate_cost("deepseek-chat", 1000, 500) > 0
-    assert estimate_cost("unknown-model", 1000, 500) == 0.0
+    # 未知模型使用默认兜底价格,返回正数而非 0
+    assert estimate_cost("unknown-model", 1000, 500) > 0

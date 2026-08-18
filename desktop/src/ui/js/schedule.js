@@ -162,7 +162,23 @@ App.Schedule.runNow = async function (taskId) {
     if (res.ok) {
       const result = typeof d.result === 'string' ? d.result : JSON.stringify(d.result || '');
       App.toast(`任务 ${taskId.slice(0, 8)} 已执行`, 'ok');
-      if (result && result !== '{}' && result !== '""') App.appendMessage(result.slice(0, 500), 'bot');
+      if (result && result !== '{}' && result !== '""') {
+        const div = App.appendMessage(result.slice(0, 500), 'bot');
+        if (div && div.classList) {
+          // 给手动触发的任务结果也加上操作按钮
+          const act = document.createElement('div');
+          act.className = 'msg-actions';
+          const copyBtn = document.createElement('button');
+          copyBtn.className = 'msg-action';
+          copyBtn.textContent = '复制';
+          copyBtn.addEventListener('click', () => {
+            const txt = div.textContent || '';
+            if (txt) navigator.clipboard.writeText(txt).catch(() => {});
+          });
+          act.appendChild(copyBtn);
+          div.appendChild(act);
+        }
+      }
     } else {
       App.toast(`执行失败: ${d.detail || d.error || res.status}`, 'err');
     }

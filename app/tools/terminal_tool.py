@@ -20,29 +20,18 @@ from app.tools.registry import tool
 MAX_OUTPUT_CHARS = 8000
 DEFAULT_TIMEOUT = 120
 
-# 破坏性/危险命令前缀拦截(命中即拒绝,引导用文件工具/安全方式)
-DANGEROUS_PATTERNS = [
-    ("format", "格式化磁盘"),
-    ("diskpart", "磁盘分区操作"),
-    ("deltree", "递归删除目录"),
-    ("shutdown", "关机/重启"),
-    ("reg delete", "删除注册表"),
-    ("net user", "用户账户管理"),
-    ("sc delete", "删除系统服务"),
-    ("taskkill /f /im", "强制结束系统进程"),
-    ("rm -rf /", "删除根目录"),
-    (":(){", "fork 炸弹"),
-    ("mkfs", "格式化文件系统"),
-    ("rd /s", "递归删除目录"),
-    ("rmdir /s", "递归删除目录"),
-]
+# 从 security.py 导入统一的命令分类列表
+from app.core.security import BLOCKED_COMMAND_PATTERNS, _classify_command
+
+# 保留兼容:旧的 DANGEROUS_PATTERNS 映射到 BLOCKED_COMMAND_PATTERNS
+DANGEROUS_PATTERNS = [(p, p) for p in BLOCKED_COMMAND_PATTERNS]
 
 
 def _blocked_reason(command: str) -> str:
-    low = command.strip().lower()
-    for pattern, desc in DANGEROUS_PATTERNS:
-        if pattern.lower() in low:
-            return f"命令包含危险操作({desc})已被拦截: {pattern}"
+    """检查命令是否被硬拦截。返回拦截原因或空字符串。"""
+    classification = _classify_command(command)
+    if classification == "blocked":
+        return f"命令包含危险操作已被拦截: {command.strip()[:100]}"
     return ""
 
 

@@ -7,6 +7,7 @@
 
 工具路由:见 select_tools() —— 对话前由 LLM 预选相关工具子集,
 避免 100+ 工具全量注入导致调用精度下降(参考 BFCL 的 tiered 建议)。
+同时提供 select_tools_by_embedding() 作为无 LLM 时的快速回退(基于 embedding 相似度)。
 """
 from __future__ import annotations
 
@@ -18,15 +19,16 @@ from app.tools.categories import SYSTEM_TOOLS, get_category
 
 # 命中即判为复杂任务
 _COMPLEX_KEYWORDS = (
-    "分析", "计算", "比较", "对比", "汇总", "整理", "生成", "编写", "写一段", "写一个",
-    "代码", "脚本", "数据库", "查询", "报表", "报告", "图表", "预测", "规划",
-    "总结一下", "翻译", "解释", "公式", "正则", "Excel", "CSV", "表格",
-    "上传", "文件", "邮件", "网页", "搜索", "知识库", "下载",
+    "分析", "计算", "比较", "对比", "汇总", "整理", "编写", "脚本", "数据库",
+    "查询", "报表", "报告", "图表", "预测", "规划",
+    "代码", "程序", "函数", "类", "接口", "API", "后端", "前端", "算法",
+    "正则", "Excel", "CSV", "表格", "公式",
+    "下载", "上传", "搜索", "邮件", "网页", "目录",
 )
 # 命中即判为简单任务(需同时满足短文本)
 _SIMPLE_KEYWORDS = (
     "你好", "您好", "hi", "hello", "谢谢", "你是谁", "在吗", "早安", "晚安",
-    "再见", "测试", "test",
+    "再见", "测试", "test", "随便", "哈哈", "嗯", "哦",
 )
 
 TOOL_ROUTER_PROMPT = """你是工具路由器。根据用户请求,从工具列表中选择最相关、执行任务最可能用到的工具。
@@ -45,19 +47,30 @@ TOOL_ROUTER_PROMPT = """你是工具路由器。根据用户请求,从工具列�
 
 
 def classify_task(message: str) -> str:
-    """返回 'simple' 或 'complex'。"""
+    """返回 'simple' 或 'complex'。
+
+    策略:先看关键词,再看文本长度+语义特征,最后默认走简单(省钱优先)。
+    """
     msg = (message or "").strip()
     if not msg:
-        return "complex"
+        return "complex"  # 空消息需要 LLM 处理
     lower = msg.lower()
-    if any(k.lower() in lower for k in _COMPLEX_KEYWORDS):
+    # 先检测简单关键词
+    is_simple_kw = any(k.lower() in lower for k in _SIMPLE_KEYWORDS)
+    # 再检测复杂关键词
+    is_complex_kw = any(k in lower for k in _COMPLEX_KEYWORDS)
+    if is_complex_kw:
         return "complex"
-    if any(k.lower() in lower for k in _SIMPLE_KEYWORDS):
+    if is_simple_kw:
         return "simple"
-    # 短文本(≤30 字)且无复杂特征按简单处理,省钱
-    if len(msg) <= 30:
+    # 短文本(≤20字)且无复杂特征 → 简单,省钱
+    if len(msg) <= 20:
         return "simple"
-    return "complex"
+    # 长度中等且有特定结构(问号、链接、代码标记) → 复杂
+    if len(msg) > 50 and any(c in msg for c in ("?", "？", "http", "```")):
+        return "complex"
+    # 默认:简单(省钱优先,强模型兜底)
+    return "simple"
 
 
 def build_routed_llm(message: str, fallback: Optional[object] = None):
@@ -97,8 +110,21 @@ def _parse_tool_list(text: str) -> Optional[list[str]]:
             continue
         if isinstance(data, dict) and isinstance(data.get("tools"), list):
             return [str(t) for t in data["tools"] if str(t).strip()]
-    start, end = text.find("{"), text.rfind("}")
-    if 0 <= start < end:
+    # 括号匹配提取,避免 rfind("}") 匹配到错误位置
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    end = start
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    if end > start:
         try:
             data = json.loads(text[start : end + 1])
             if isinstance(data, dict) and isinstance(data.get("tools"), list):
@@ -141,9 +167,13 @@ async def select_tools(
             parsed = _parse_tool_list(resp)
             selected = parsed or []
     except LLMError:
-        return []
+        selected = []
     except Exception:  # noqa: BLE001
-        return []
+        selected = []
+
+    # LLM 路由失败时,尝试 embedding 相似度回退
+    if not selected:
+        selected = select_tools_by_embedding(user_input, registry, max_tools)
 
     # 只保留真实存在的工具;系统工具不需要路由器选择
     known = {t.name for t in registry.list()}
@@ -153,3 +183,44 @@ async def select_tools(
         if name in known and name not in SYSTEM_TOOLS and name not in valid:
             valid.append(name)
     return valid[:max_tools]
+
+
+def select_tools_by_embedding(
+    user_input: str,
+    registry,
+    max_tools: int = 10,
+    min_similarity: float = 0.15,
+) -> list[str]:
+    """基于 embedding 相似度的工具预选(无 LLM 时的快速回退)。
+
+    将用户输入和每个工具的描述都嵌入为向量,计算余弦相似度,
+    返回得分最高的工具名列表。不依赖外部 LLM 调用,速度快。
+    """
+    try:
+        from app.rag.embeddings import get_embedder, run_embed
+        from app.rag.store import cosine_similarity
+    except Exception:  # noqa: BLE001
+        return []
+
+    try:
+        query_vec = run_embed(get_embedder(), [user_input])[0]
+    except Exception:  # noqa: BLE001
+        return []
+
+    scored: list[tuple[float, str]] = []
+    for tool in registry.list():
+        if tool.name in SYSTEM_TOOLS or not tool.enabled:
+            continue
+        desc = (tool.description or "").strip()
+        if not desc:
+            continue
+        try:
+            tool_vec = run_embed(get_embedder(), [desc])[0]
+            sim = cosine_similarity(query_vec, tool_vec)
+            if sim >= min_similarity:
+                scored.append((sim, tool.name))
+        except Exception:  # noqa: BLE001
+            continue
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [name for _, name in scored[:max_tools]]

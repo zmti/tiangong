@@ -16,6 +16,11 @@ from app.tools.registry import get_registry
 router = APIRouter(prefix="/v1", tags=["chat"])
 
 
+def _auth_required():
+    """占位：认证依赖，当前桌面端不使用 API Key 验证。"""
+    pass
+
+
 def _store():
     """会话存储统一入口:按配置解析 Redis/SQLite,避免散落直连。"""
     try:  # noqa: PLW0129
@@ -158,18 +163,48 @@ class ChatResumeRequest(BaseModel):
     session_id: str = Field("default", description="会话 ID")
     resume_value: object | None = Field(None, description="用户决定:工具名列表 或 {confirmation_id: {approved: bool}}")
     use_history: bool = Field(True, description="是否携带会话历史")
+    stream: bool = Field(False, description="是否流式返回(SSE)")
 
 
 @router.post("/chat/resume")
-async def chat_resume(req: ChatResumeRequest) -> dict:
-    """从中断处恢复一次运行(interrupt 式确认流批准后继续执行)。"""
-    agent = _build_agent(ChatRequest(message="", session_id=req.session_id))
+async def chat_resume(req: ChatResumeRequest):
+    """从中断处恢复一次运行(interrupt 式确认流批准后继续执行)。
+
+    支持非流式和流式两种返回模式。
+    """
+    agent = _build_agent(ChatRequest(message=" ", session_id=req.session_id))
     try:
-        result = await agent.resume(req.run_id, resume_value=req.resume_value)
+        gen = agent.resume(req.run_id, resume_value=req.resume_value, stream=req.stream)
+        import types
+        if isinstance(gen, types.AsyncGeneratorType):
+            async def event_gen():
+                async for item in gen:
+                    if isinstance(item, dict) and item.get("type") in (
+                        "token", "thinking", "tool", "plan", "confirmation", "done", "tool_call_start"
+                    ):
+                        yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+                    elif hasattr(item, "answer"):
+                        r = item
+                        if r.interrupted:
+                            yield f"data: {json.dumps({'type': 'done', 'interrupted': True, 'interrupt': r.interrupt}, ensure_ascii=False)}\n\n"
+                        else:
+                            for ch in r.answer:
+                                yield f"data: {json.dumps({'type': 'token', 'content': ch}, ensure_ascii=False)}\n\n"
+                            yield f"data: {json.dumps({'type': 'done', 'model': r.model, 'steps': r.steps, 'run_id': req.run_id}, ensure_ascii=False)}\n\n"
+            return StreamingResponse(
+                event_gen(),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            )
+        result = gen
     except LLMError as e:
         raise HTTPException(status_code=502, detail=str(e)) from e
     except RuntimeError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
+    except Exception as e:
+        import logging
+        logging.getLogger("app").error("Resume failed for run_id=%s: %s", req.run_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
     if not result.interrupted:
         for step in result.steps:
@@ -223,7 +258,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 elif event["type"] == "plan":
                     plan_events.append(event)
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                elif event["type"] in ("tool", "thinking", "confirmation"):
+                elif event["type"] in ("tool", "thinking", "confirmation", "tool_start", "tool_done", "tool_chunk", "tool_call_start"):
                     if event["type"] == "tool":
                         tool_events.append(event)
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
@@ -252,7 +287,11 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             if full_answer:
                 await _store().add_message(req.session_id, "assistant", "".join(full_answer))
 
-    return StreamingResponse(event_gen(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/stream")
@@ -512,4 +551,148 @@ async def transcribe(
         "transcribed": ok,
         "text": text,
         "error": "" if ok else text,
+    }
+
+
+# ---- Provider / Model 配置接口 ----
+
+# 各 provider 的默认模型
+_PROVIDER_DEFAULT_MODELS: dict[str, list[dict]] = {
+    "deepseek": [
+        {"id": "deepseek-chat", "name": "DeepSeek Chat", "speed": "fast", "quality": "good"},
+        {"id": "deepseek-coder", "name": "DeepSeek Coder", "speed": "fast", "quality": "excellent"},
+        {"id": "deepseek-reasoner", "name": "DeepSeek R1", "speed": "slow", "quality": "excellent"},
+    ],
+    "qwen": [
+        {"id": "qwen-plus", "name": "Qwen Plus", "speed": "fast", "quality": "good"},
+        {"id": "qwen-turbo", "name": "Qwen Turbo", "speed": "very_fast", "quality": "fair"},
+        {"id": "qwen-max", "name": "Qwen Max", "speed": "medium", "quality": "excellent"},
+        {"id": "qwen3.7-flash", "name": "Qwen 3.7 Flash", "speed": "very_fast", "quality": "good"},
+    ],
+    "openai": [
+        {"id": "gpt-4o-mini", "name": "GPT-4o Mini", "speed": "very_fast", "quality": "good"},
+        {"id": "gpt-4o", "name": "GPT-4o", "speed": "fast", "quality": "excellent"},
+        {"id": "gpt-4-turbo", "name": "GPT-4 Turbo", "speed": "medium", "quality": "excellent"},
+        {"id": "o1-mini", "name": "O1 Mini", "speed": "slow", "quality": "excellent"},
+        {"id": "o1", "name": "O1", "speed": "very_slow", "quality": "outstanding"},
+    ],
+    "compat": [
+        {"id": "agnes-2.0-flash", "name": "Agnes 2.0 Flash", "speed": "fast", "quality": "good"},
+        {"id": "agnes-2.5-flash", "name": "Agnes 2.5 Flash", "speed": "very_fast", "quality": "good"},
+        {"id": "agnes-2.5-pro", "name": "Agnes 2.5 Pro", "speed": "medium", "quality": "excellent"},
+        {"id": "agnes-2.5-pro-alpha", "name": "Agnes 2.5 Pro Alpha", "speed": "medium", "quality": "outstanding"},
+    ],
+    "ollama": [],
+}
+
+# Provider 分组信息
+_PROVIDER_GROUPS = [
+    {"id": "agnes", "name": "Agnes AI", "providers": ["compat"]},
+    {"id": "deepseek", "name": "DeepSeek", "providers": ["deepseek"]},
+    {"id": "qwen", "name": "阿里云 Qwen", "providers": ["qwen"]},
+    {"id": "openai", "name": "OpenAI", "providers": ["openai"]},
+    {"id": "local", "name": "本地模型", "providers": ["ollama"]},
+]
+
+
+@router.get("/models")
+async def list_models(provider: str | None = None) -> dict:
+    """获取可用模型列表。
+
+    Args:
+        provider: 指定 provider ID (deepseek/qwen/openai/compat/ollama)，留空返回当前配置的模型
+    """
+    # 如果指定了 provider，返回该 provider 的模型列表
+    if provider:
+        provider = provider.lower()
+        if provider in _PROVIDER_DEFAULT_MODELS:
+            models = _PROVIDER_DEFAULT_MODELS[provider]
+            # 检查是否配置了 API key
+            configured = False
+            if provider == "deepseek":
+                configured = bool(settings.deepseek_api_key)
+            elif provider == "qwen":
+                configured = bool(settings.qwen_api_key)
+            elif provider == "openai":
+                import os
+                configured = bool(os.environ.get("OPENAI_API_KEY"))
+            elif provider == "compat":
+                configured = bool(settings.openai_compat_api_key)
+            elif provider == "ollama":
+                configured = True  # 本地模型，不需要 API key
+
+            return {
+                "provider": provider,
+                "configured": configured,
+                "models": models,
+            }
+        raise HTTPException(status_code=400, detail=f"未知的 provider: {provider}")
+
+    # 返回当前配置的 provider 和默认模型
+    current_provider = settings.agent_llm_provider.lower()
+    default_model = None
+    if current_provider == "deepseek":
+        default_model = settings.deepseek_model
+    elif current_provider == "qwen":
+        default_model = settings.qwen_model
+    elif current_provider == "openai":
+        default_model = "gpt-4o-mini"
+    elif current_provider == "compat":
+        default_model = settings.openai_compat_model
+    elif current_provider == "ollama":
+        default_model = settings.ollama_model
+
+    return {
+        "provider": current_provider,
+        "model": default_model,
+        "available_providers": [
+            {"id": p["id"], "name": p["name"], "providers": p["providers"]}
+            for p in _PROVIDER_GROUPS
+        ],
+    }
+
+
+@router.get("/providers")
+async def list_providers() -> dict:
+    """获取已配置的 provider 列表。"""
+    providers = []
+    for group in _PROVIDER_GROUPS:
+        for pid in group["providers"]:
+            configured = False
+            if pid == "deepseek":
+                configured = bool(settings.deepseek_api_key)
+            elif pid == "qwen":
+                configured = bool(settings.qwen_api_key)
+            elif pid == "openai":
+                import os
+                configured = bool(os.environ.get("OPENAI_API_KEY"))
+            elif pid == "compat":
+                configured = bool(settings.openai_compat_api_key)
+            elif pid == "ollama":
+                configured = True
+
+            providers.append({
+                "id": pid,
+                "name": next((g["name"] for g in _PROVIDER_GROUPS if pid in g["providers"]), pid),
+                "group": group["id"],
+                "configured": configured,
+                "default_model": (
+                    settings.deepseek_model if pid == "deepseek"
+                    else settings.qwen_model if pid == "qwen"
+                    else settings.ollama_model if pid == "ollama"
+                    else settings.openai_compat_model if pid == "compat"
+                    else "gpt-4o-mini"
+                ),
+            })
+
+    # 获取当前激活的 provider
+    current = settings.agent_llm_provider.lower()
+    return {
+        "providers": providers,
+        "default": current,
+        "active": current,
+        "groups": [
+            {"id": g["id"], "name": g["name"], "count": len(g["providers"])}
+            for g in _PROVIDER_GROUPS
+        ],
     }

@@ -95,6 +95,8 @@ class ChatResult:
 class LLMClient:
     """统一 LLM 客户端,按 provider 从配置中组装 OpenAI 兼容客户端。"""
 
+    # ---- Provider 熔断状态(实例级,避免多会话互相影响) ----
+
     def __init__(self, provider: Optional[str] = None, model: Optional[str] = None):
         self.provider = PROVIDER_ALIASES.get((provider or settings.agent_llm_provider).lower(), "compat")
         self._model_override = model
@@ -102,6 +104,9 @@ class LLMClient:
         self._api_key = self._get_key()
         self.last_usage: Optional[dict] = None  # 最近一次调用返回的 token 用量
         self._reasoning: str = ""  # 最近一次推理模型的思维链(reasoning_content)
+        # 实例级熔断状态
+        self._circuit_fails: dict[str, int] = {}
+        self._circuit_open_until: dict[str, float] = {}
 
     # ---- 可观测性 ----
 
@@ -257,7 +262,8 @@ class LLMClient:
         raise LLMError(f"LLM 调用失败(已重试{retries}次/切换{len(specs)}个provider): {last_err}") from last_err
 
     # ---- Provider 熔断状态(进程级共享,同类 provider 复用) ----
-
+    # 注:实例级 _circuit_fails / _circuit_open_until 已在 __init__ 中初始化
+    # 保留类级别作为兜底(旧代码直接访问 LLMClient._circuit_fails 时使用)
     _circuit_fails: dict[str, int] = {}
     _circuit_open_until: dict[str, float] = {}
 
@@ -302,6 +308,45 @@ class LLMClient:
     def _is_reasoning_model(self) -> bool:
         return any(t in (self.model or "").lower() for t in _REASONING_MODELS)
 
+    def _maybe_wrap_with_thinking_prompt(self, messages: list[Message]) -> list[Message]:
+        """为非推理模型添加 CoT 提示,使非推理模型也能产出结构化思考。
+
+        仅在以下条件下注入:
+        - agent_reasoning_enabled=True
+        - 当前模型不是推理模型(_is_reasoning_model=False)
+        - 消息中还没有 thinking 类系统提示
+
+        通过修改最后一条 user 消息的尾部追加思考指令,
+        让模型在最终回答前先进行逐步推理。
+        """
+        if not settings.agent_reasoning_enabled:
+            return messages
+        if self._is_reasoning_model():
+            return messages
+        # 检查是否已有 thinking 提示
+        for m in messages:
+            if m.get("role") == "system" and "think" in str(m.get("content", "")).lower():
+                return messages
+        if not messages:
+            return messages
+        # 在最后一条 user 消息后追加思考指令
+        last = messages[-1]
+        if last.get("role") != "user":
+            return messages
+        content = last.get("content", "")
+        if not content or not content.strip():
+            return messages
+        thinking_suffix = (
+            "\n\n---\n\n请分步骤思考:先列出解题思路或关键信息,再给出最终答案。"
+            "用 <thinking>...</thinking> 标签包裹你的逐步推理过程。"
+        )
+        if thinking_suffix not in content:
+            last = dict(last)
+            last["content"] = content.rstrip() + thinking_suffix
+            messages = list(messages)
+            messages[-1] = last
+        return messages
+
     def _extract_reasoning(self, msg) -> str:
         rc = getattr(msg, "reasoning_content", None) or ""
         if rc:
@@ -334,6 +379,7 @@ class LLMClient:
         """非流式对话,返回完整回复文本。"""
         self._require_key()
         messages = self._cache_control_messages(messages)
+        messages = self._maybe_wrap_with_thinking_prompt(messages)
         kwargs: dict = {
             "model": self.model,
             "messages": messages,
@@ -411,6 +457,7 @@ class LLMClient:
         """
         self._require_key()
         messages = self._cache_control_messages(messages)
+        messages = self._maybe_wrap_with_thinking_prompt(messages)
         kwargs: dict = {
             "model": self.model,
             "messages": messages,
@@ -444,6 +491,107 @@ class LLMClient:
             reasoning=self._extract_reasoning(msg),
         )
 
+    async def chat_stream_with_tools(
+        self,
+        messages: list[Message],
+        tools: Optional[list[dict]] = None,
+        temperature: float = 0.7,
+        result_holder: Optional[dict] = None,
+    ):
+        """流式对话+工具调用:边流式产出 token/thinking 事件,边收集 tool_calls。
+
+        参数:
+            result_holder: 可选的 dict,流结束后将 ChatResult 写入 result_holder["result"]。
+                          调用方在迭代完成后读取此对象获取完整结果。
+
+        yield:
+            str: 文本增量(delta content)
+            dict: {"type": "thinking", "content": "..."} 推理内容
+            dict: {"type": "tool_call_delta", "index": int, "id": str, "name": str, "arguments": str}
+                  工具调用增量(可用于前端实时展示工具名)
+        """
+        self._require_key()
+        messages = self._cache_control_messages(messages)
+        messages = self._maybe_wrap_with_thinking_prompt(messages)
+        kwargs: dict = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "stream": True,
+        }
+        if tools:
+            kwargs["tools"] = tools
+
+        async def _fn(client, model):
+            k = dict(kwargs)
+            k["model"] = model
+            return await client.chat.completions.create(**k)
+
+        resp = await self._invoke(_fn, "chat_stream", tools_n=len(tools or []))
+        reasoning = ""
+        content_buf = ""
+        tool_call_bufs: list[dict] = []  # 每个 tool_call 的累积数据
+        try:
+            async for chunk in resp:
+                if chunk.usage:
+                    self.last_usage = self._usage_of(chunk)
+                if not chunk.choices:
+                    continue
+                choice = chunk.choices[0]
+                delta = choice.delta
+                rc = getattr(delta, "reasoning_content", None)
+                if rc and self._is_reasoning_model():
+                    reasoning += rc
+                    yield {"type": "thinking", "content": rc}
+                    continue
+                # 文本内容
+                if delta and delta.content:
+                    content_buf += delta.content
+                    yield delta.content
+                # 工具调用增量
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        while len(tool_call_bufs) <= idx:
+                            tool_call_bufs.append({"id": "", "name": "", "arguments": ""})
+                        if tc_delta.id:
+                            tool_call_bufs[idx]["id"] = tc_delta.id
+                        if tc_delta.function:
+                            fn = tc_delta.function
+                            if fn.name:
+                                tool_call_bufs[idx]["name"] = fn.name
+                            if fn.arguments:
+                                tool_call_bufs[idx]["arguments"] += fn.arguments
+                        # 实时发射工具调用增量事件
+                        yield {
+                            "type": "tool_call_delta",
+                            "index": idx,
+                            "id": tool_call_bufs[idx]["id"],
+                            "name": tool_call_bufs[idx]["name"],
+                            "arguments": tool_call_bufs[idx]["arguments"],
+                        }
+        except Exception as e:  # noqa: BLE001
+            self._trace("chat_stream", time.time(), None, ok=False, error=str(e))
+            raise LLMError(f"LLM 流式调用失败: {e}") from e
+        self._reasoning = reasoning
+
+        # 构建最终结果
+        tool_calls = []
+        for buf in tool_call_bufs:
+            tool_calls.append(ToolCall(
+                id=buf.get("id", ""),
+                name=buf.get("name", ""),
+                arguments=buf.get("arguments", "{}"),
+            ))
+        result = ChatResult(
+            content=content_buf,
+            tool_calls=tool_calls,
+            reasoning=reasoning,
+            usage=self.last_usage,
+        )
+        if result_holder is not None:
+            result_holder["result"] = result
+
     async def chat_json(
         self,
         messages: list[Message],
@@ -455,6 +603,7 @@ class LLMClient:
         """
         self._require_key()
         messages = self._cache_control_messages(messages)
+        messages = self._maybe_wrap_with_thinking_prompt(messages)
         kwargs: dict = {
             "model": self.model,
             "messages": messages,
@@ -485,6 +634,7 @@ class LLMClient:
         temperature: float = 0.2,
         max_retries: int = 2,
         validator=None,
+        strict_mode: Optional[bool] = None,
     ) -> dict:
         """严格结构化输出:response_format 绑 JSON Schema + 校验重试。
 
@@ -492,10 +642,14 @@ class LLMClient:
             schema: JSON Schema(dict),传入 response_format 与提示词
             max_retries: 校验失败时的重试次数(把校验错误回灌给模型)
             validator: 可选 callable(data) -> (ok, error_msg);不传则仅做 JSON 解析
+            strict_mode: 是否启用严格校验(检查 required/类型);None=跟随 settings
         返回符合 schema 的 dict;耗尽仍失败抛 LLMError。
+        增强:校验失败时返回字段级详细错误,便于 LLM 精准修正。
         """
+        from app.config import settings as _cfg
         self._require_key()
         messages = self._cache_control_messages(messages)
+        messages = self._maybe_wrap_with_thinking_prompt(messages)
         schema_help = (
             f"你必须严格输出符合以下 JSON Schema 的合法 JSON(不要包裹 markdown):\n"
             f"{json.dumps(schema, ensure_ascii=False)}\n"
@@ -506,28 +660,72 @@ class LLMClient:
         else:
             prompt = [{"role": "system", "content": schema_help}] + prompt
 
-        kwargs: dict = {
-            "model": self.model,
-            "messages": prompt,
-            "temperature": temperature,
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {"name": "output", "strict": True, "schema": schema},
-            },
-        }
+        # 严格模式:优先使用传入值,否则跟随 settings
+        strict_mode = strict_mode if strict_mode is not None else bool(
+            getattr(_cfg, "agent_structured_output_strict", True)
+        )
+        max_retries = int(getattr(_cfg, "agent_structured_output_max_retries", 3) or max_retries)
 
-        async def _fn(client, model):
-            k = dict(kwargs)
-            k["model"] = model
+        def _validate_field_level(data: dict, schema: dict, prefix: str = "") -> list[str]:
+            """字段级校验:返回详细错误列表(含字段路径)。"""
+            errors: list[str] = []
+            props = schema.get("properties", {})
+            required = schema.get("required", [])
+
+            # 检查必填字段
+            for field in required:
+                if field not in data:
+                    path = f"{prefix}.{field}" if prefix else field
+                    errors.append(f"缺少必填字段: {path}")
+
+            # 检查类型
+            for field, value in data.items():
+                path = f"{prefix}.{field}" if prefix else field
+                if field in props:
+                    field_schema = props[field]
+                    expected_type = field_schema.get("type", "")
+                    if expected_type == "string" and not isinstance(value, str):
+                        errors.append(f"字段 {path} 期望字符串类型,实际为 {type(value).__name__}")
+                    elif expected_type == "number" and not isinstance(value, (int, float)):
+                        errors.append(f"字段 {path} 期望数字类型,实际为 {type(value).__name__}")
+                    elif expected_type == "integer" and not isinstance(value, int):
+                        errors.append(f"字段 {path} 期望整数类型,实际为 {type(value).__name__}")
+                    elif expected_type == "boolean" and not isinstance(value, bool):
+                        errors.append(f"字段 {path} 期望布尔类型,实际为 {type(value).__name__}")
+                    elif expected_type == "array" and not isinstance(value, list):
+                        errors.append(f"字段 {path} 期望数组类型,实际为 {type(value).__name__}")
+                    elif expected_type == "object" and not isinstance(value, dict):
+                        errors.append(f"字段 {path} 期望对象类型,实际为 {type(value).__name__}")
+                    # 递归检查嵌套对象
+                    if expected_type == "object" and isinstance(value, dict) and props[field].get("properties"):
+                        errors.extend(_validate_field_level(value, props[field], path))
+            return errors
+
+        # 尝试 json_schema(最严格) → json_object(降级) → 普通 chat+手动校验(最宽)
+        async def _try_with_format(format_type: str, kwargs_extra: dict) -> tuple:
+            """尝试用指定 response_format 调用,返回 (content, error)"""
+            kwargs = {
+                "model": self.model,
+                "messages": prompt,
+                "temperature": temperature,
+            }
+            kwargs.update(kwargs_extra)
+            kwargs["response_format"] = {"type": format_type}
+            if format_type == "json_schema" and strict_mode:
+                kwargs["response_format"]["json_schema"] = {
+                    "name": "output", "strict": True, "schema": schema
+                }
             try:
-                return await client.chat.completions.create(**k)
-            except Exception:
-                # 部分 provider 不支持 json_schema,降级为 json_object
-                k2 = dict(k)
-                k2["response_format"] = {"type": "json_object"}
-                return await client.chat.completions.create(**k2)
+                resp = await self._invoke(
+                    lambda client, model: client.chat.completions.create(**{**kwargs, "model": model}),
+                    f"chat_json_schema_{format_type}",
+                )
+                return resp.choices[0].message.content or "", None
+            except Exception as e:  # noqa: BLE001
+                return None, str(e)
 
         last_err: Optional[str] = None
+        last_content = ""
         for attempt in range(max_retries + 1):
             if attempt > 0:
                 # 把上次校验错误回灌给模型
@@ -535,25 +733,42 @@ class LLMClient:
                     {"role": "assistant", "content": last_content},
                     {"role": "user", "content": f"上次输出未通过校验: {last_err}\n请重新输出符合 schema 的 JSON。"},
                 ]
-                k = dict(kwargs)
-                k["messages"] = prompt
-            try:
-                resp = await self._invoke(_fn, "chat_json_schema", **{"content": ""})
-                content = resp.choices[0].message.content or ""
-            except Exception as e:  # noqa: BLE001
-                raise LLMError(f"结构化输出调用失败: {e}") from e
+            content, err = await _try_with_format("json_schema", {})
+            if err:
+                # 降级到 json_object
+                content, err2 = await _try_with_format("json_object", {})
+                if err2:
+                    last_err = f"JSON 提取失败: {err2}"
+                    last_content = ""
+                    continue
+            else:
+                last_err = None
+
             last_content = content
             data = _extract_json(content)
             if not isinstance(data, dict):
                 last_err = "输出不是合法 JSON 对象"
                 continue
+            # 字段级校验(优先级高于简单 required 检查)
+            if strict_mode:
+                field_errors = _validate_field_level(data, schema)
+                if field_errors:
+                    last_err = "字段校验失败:\n" + "\n".join(f"  - {e}" for e in field_errors)
+                    continue
+            # 额外校验:检查 required 字段(兼容旧逻辑)
+            required_fields = schema.get("required", [])
+            missing = [f for f in required_fields if f not in data]
+            if missing and strict_mode:
+                last_err = f"缺少必填字段: {', '.join(missing)}"
+                continue
+            # 调用自定义 validator
             if validator is not None:
                 ok, err = validator(data)
                 if not ok:
                     last_err = err or "未通过校验"
                     continue
             return data
-        raise LLMError(f"结构化输出校验失败: {last_err}")
+        raise LLMError(f"结构化输出校验失败(重试 {max_retries} 次): {last_err}")
 
     @property
     def info(self) -> dict:
@@ -568,13 +783,27 @@ def _extract_json(text: str):
         return json.loads(text)
     except json.JSONDecodeError:
         pass
-    start, end = text.find("{"), text.rfind("}")
-    if 0 <= start < end:
-        try:
-            return json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
-            return None
-    return None
+    # 找到第一个 {,然后用括号匹配找到对应的 },避免多余内容被纳入
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    end = start
+    for i in range(start, len(text)):
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    if end == start:
+        return None
+    try:
+        return json.loads(text[start : end + 1])
+    except json.JSONDecodeError:
+        return None
 
 
 def build_llm(provider: Optional[str] = None) -> LLMClient:

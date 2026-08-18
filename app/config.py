@@ -81,6 +81,11 @@ class Settings(BaseSettings):
     asr_api_key: str = ""
     asr_model: str = ""  # 如 whisper-1 / paraformer-realtime-v2
     asr_timeout: int = 120
+    # 文字转语音(TTS):OpenAI 兼容 /audio/speech 端点;留空=不启用
+    tts_base_url: str = ""
+    tts_api_key: str = ""
+    tts_model: str = "tts-1"
+    tts_voice: str = "alloy"
 
     # ---- 后台任务(长期自主运行) ----
     # 开启后可通过 /v1/tasks 创建后台持续运行的 Agent 任务(独立于请求),
@@ -94,6 +99,8 @@ class Settings(BaseSettings):
     agent_task_retries: int = 1
     # 重试基础等待(秒),按指数退避
     agent_task_retry_delay: float = 5.0
+    # 单后台任务 token 预算上限(0=不限制);防止单个任务消耗过多 LLM 配额
+    agent_task_max_tokens: int = 0
 
     # ---- 上下文配额硬控制 ----
     # 请求级 max_output_tokens 上限;0 = 不限制。达到上限后停止生成并以截断提示结束。
@@ -134,6 +141,8 @@ class Settings(BaseSettings):
     # ---- 原生工具调用(function calling)----
     # 开启时走 LLM 原生 tool_calls(参数结构化、支持并行),失败自动降级为 JSON 文本解析
     agent_native_tools: bool = True
+    # 单次 LLM 调用允许的最大工具数量(0 = 不限制)
+    agent_max_tools: int = 0
 
     # ---- LLM 调用可靠性(重试 + 故障转移) ----
     # LLM 调用失败(网络/限流/5xx 等瞬态错误)自动重试次数;0 = 不重试
@@ -163,11 +172,47 @@ class Settings(BaseSettings):
     # 透出为 thinking 事件而不是混入正文;关闭时忽略该字段
     agent_reasoning_enabled: bool = True
 
+    # ---- 代码语义理解 ----
+    # AST/符号解析:开启后 code_symbols 使用增强规则(多行签名/嵌套括号识别)
+    agent_ast_symbols: bool = True
+    # 自动 LSP 集成(定义跳转/悬停/引用查询);需额外安装语言服务器
+    agent_lsp_enabled: bool = False
+    # LSP 服务器配置(JSON 字符串),格式 {"python":{"command":"pylsp"},"typescript":{"command":"typescript-language-server","args":["--stdio"]}}
+    agent_lsp_servers: str = ""
+    # 自动构建感知:代码修改后自动检测并运行构建/安装命令
+    agent_auto_build: bool = False
+
+    # ---- 长期记忆衰退 ----
+    # 开启后,超过 TTL 且低活跃度的记忆会被自动清理
+    agent_memory_decay_enabled: bool = True
+    # 记忆 TTL(小时),超过后开始衰减
+    ltm_ttl_hours: float = 720.0
+    # 每过一个 TTL 周期衰减系数
+    ltm_decay_rate: float = 0.95
+    # 低于此分数视为过期
+    ltm_min_score: float = 0.1
+
+    # ---- Git PR 工作流 ----
+    # Git 平台(github/gitlab);留空=github
+    agent_git_host: str = "github"
+    # Git API Token(GITHUB_TOKEN 或 GITLAB_TOKEN 环境变量也可)
+    agent_git_token: str = ""
+    # GitLab 实例 URL(仅 gitlab 平台时需要)
+    agent_gitlab_url: str = ""
+
     # ---- 长期记忆 ----
     # 对话前自动检索相关长期记忆并注入上下文;记忆由 memory_save 等工具写入
     agent_memory_enabled: bool = True
     # 每轮对话结束后自动抽取事实存入长期记忆(多一次 LLM 调用,默认关闭)
     agent_auto_memory: bool = False
+    # 记忆精炼开关:定期合并相似记忆+提炼用户画像(需 LLM 可用)
+    agent_consolidate_enabled: bool = False
+    # 精炼最小间隔(秒),防止过于频繁调用 LLM
+    agent_consolidate_min_interval: int = 3600
+    # 用户画像开关:根据历史消息自动提取偏好并注入系统提示
+    agent_user_profile_enabled: bool = True
+    # 技能开关:把高级组合操作作为可用工具暴露给模型
+    agent_skills_enabled: bool = False
 
     # ---- 会话摘要压缩 ----
     # 历史超过预算时,不再粗暴截断,而是用 LLM 把较早对话压成摘要再注入
@@ -242,8 +287,14 @@ class Settings(BaseSettings):
     # 开启后,每次运行在每个图节点边界把完整状态(消息/计划/步骤/路由)落盘
     # data/checkpoints.db,支持断点续跑 / 后台任务 / 运行记录查询
     agent_checkpoint_enabled: bool = True
+    # checkpoint 每条消息最大字符数(防大消息撑爆 SQLite);0=不截断
+    checkpoint_message_char_cap: int = 8000
     # 运行最大图节点数(兜底防死循环;llm 轮数上限仍由 agent_max_steps 控制)
     agent_graph_max_iters: int = 300
+    # 单个工具执行超时(秒);0=不限制
+    agent_tool_timeout: int = 0
+    # checkpoint 保留天数(0=不清理);超过天数的已完成/已取消 checkpoint 自动清理
+    checkpoint_ttl_days: int = 7
 
     # ---- 模型路由(简单/复杂任务分流) ----
     agent_routing_enabled: bool = False
@@ -274,9 +325,15 @@ class Settings(BaseSettings):
     # 非空时所有 API 路由需携带 Authorization: Bearer <key>
     agent_api_key: str = ""
     # 开启后,危险工具(run_terminal/run_code 等)需请求 approve_tools 字段确认后才执行
-    agent_tool_confirm: bool = False
+    agent_tool_confirm: bool = True
     # 危险工具清单(逗号分隔)
     agent_dangerous_tools: str = "run_terminal,run_code"
+
+    # ---- 多租户 ----
+    # 启用多租户:每个 API Key 归属一个租户,支持独立的用量统计和数据隔离
+    default_tenant_enabled: bool = False
+    # 多租户模式下,未匹配任何 Key 时是否回退到单 Key 模式(向后兼容)
+    tenant_fallback_to_single_key: bool = True
 
     # ---- 服务 ----
     agent_host: str = "0.0.0.0"
@@ -284,9 +341,60 @@ class Settings(BaseSettings):
 
     data_dir: str = "data"
 
+    # ---- RAG 检索质量阈值 ----
+    # 向量相关性最低分数阈值;低于此值的 chunk 不注入答案上下文(0.0=不过滤)
+    rag_min_relevance: float = 0.3
+    # RAG 返回结果最大字符数(防止低相关片段撑爆上下文)
+    rag_max_context_chars: int = 4000
+    # RAG 结果是否附带引用溯源(每段附 doc_id + chunk_index + 来源页码)
+    rag_return_refs: bool = True
+
+    # ---- 图片多模态模式 ----
+    # 图片处理模式: data_url=内联 base64(兼容所有模型) / server_url=生成服务端可访问 URL(默认)
+    # 开启 server_url 后,上传的图片会保存到临时目录并返回 http://... URL 给模型,
+    # 避免大图片撑爆上下文;要求服务端配置 PUBLIC_BASE_URL 或可通过请求推断
+    multimodal_image_mode: str = "server_url"
+    # 图片 URL 服务器地址(公开可访问),留空则自动从请求推断
+    multimodal_public_base_url: str = ""
+    # 图片附件最大字节数(超过则拒绝)
+    multimodal_max_image_bytes: int = 10 * 1024 * 1024
+
+    # ---- 上下文重要性感知裁剪 ----
+    # 开启后,超预算时按重要性优先级裁剪:
+    #   P0: system_prompt(固定前缀) > P1: 最近 N 条消息原文 >
+    #   P2: 用户偏好/事实记忆 > P3: 工具中间结果/调试信息
+    context_preserve_priority: bool = True
+
+    # ---- 长期记忆沉淀过滤 ----
+    # 开启后,自动沉淀的记忆经过质量过滤(过滤短记忆、客套话、纯工具输出)
+    memory_auto_filter_enabled: bool = True
+    # 最短有效记忆长度(字),低于此值跳过沉淀
+    memory_min_length: int = 15
+    # 过滤关键词(匹配任意一个则跳过沉淀)
+    memory_skip_keywords: str = "好的,明白,收到,没问题,谢谢,感谢,明白了,了解,知道了,嗯,哦,哈,呵呵"
+
+    # ---- Guardrail 语义级检测 ----
+    # 开启后,除关键词匹配外,额外调用 LLM 做语义级 Prompt 注入/提示词泄露检测
+    # (性能敏感场景建议关闭,会增加约 1 次 LLM 调用)
+    guardrail_semantic_enabled: bool = False
+
     # ---- 文件写权限 ----
     # write_file 工具允许写入的根目录白名单(逗号分隔,可用相对路径);空则仅允许数据目录
     allowed_write_dirs: str = ""
+
+    # ---- Embedding 缓存 ----
+    # 开启后对嵌入结果做内存+磁盘两级缓存,避免重复调用 API
+    agent_embedding_cache_enabled: bool = True
+    # 持久化缓存跨进程重启有效(内存缓存 + SQLite 文件)
+    agent_embedding_cache_persistent: bool = True
+    # 缓存最大条目数
+    agent_embedding_cache_max_size: int = 10000
+    # 缓存 TTL(秒),默认 24 小时
+    agent_embedding_cache_ttl: int = 86400
+
+    # ---- 会话成本预算 ----
+    # 开启后 Agent 会在每次 LLM 调用后记录 token/成本到 budget.db
+    agent_cost_budget_enabled: bool = True
 
     # ---- 代码沙箱 ----
     # run_code 沙箱使用的 Python 解释器路径(打包后 sys.executable 是应用 exe,不可用作解释器);
@@ -299,6 +407,36 @@ class Settings(BaseSettings):
     # run_terminal 默认工作目录;空则用当前工作目录
     terminal_cwd: str = ""
 
+    # ---- 工具流式输出 ----
+    # 开启后,工具执行过程中会按块推送 tool_chunk 事件,让 LLM 实时感知进度
+    agent_tool_streaming_enabled: bool = True
+    # 工具 chunk 单次最大字节数(超过则拆分),默认 1024
+    agent_tool_streaming_chunk_size: int = 1024
+
+    # ---- 结构化输出严格模式 ----
+    # 开启后,chat_json_schema 在所有 provider 上强制执行 schema 校验 + 重试回灌
+    agent_structured_output_strict: bool = True
+    # 结构化输出校验失败时的最大重试次数
+    agent_structured_output_max_retries: int = 3
+
+    # ---- 多智能体消息协议 ----
+    # 开启后,handoff 和 delegation 使用结构化 AgentMessage 而非纯文本
+    agent_typed_messages_enabled: bool = True
+    # 子 Agent 之间最大并发委派数
+    agent_max_concurrent_delegates: int = 5
+    # 子智能体最大委派深度(0=主 Agent,1=直接子 Agent,2=孙 Agent)
+    agent_delegate_max_depth: int = 2
+    # 子智能体执行超时(秒)
+    agent_subagent_timeout: int = 300
+
+    # ---- 会话长期存储与自动清理 ----
+    # 会话超过此字符数时自动归档(压缩为摘要 JSON + 删除活跃记录)
+    session_archive_chars: int = 50000
+    # 会话超过此天数未更新时自动清理(归档 + 删除)
+    session_retention_days: int = 90
+    # 后台自动清理循环间隔(秒);0 = 关闭后台任务,仅手动触发
+    session_cleanup_interval_seconds: int = 3600
+
     # ---- 安全门禁 ----
     # 工具执行前的强制人工确认(高风险操作必须用户批准,模型无法绕过)
     agent_confirm_enabled: bool = True
@@ -307,12 +445,47 @@ class Settings(BaseSettings):
     # 确认流采用 interrupt 式(对齐 LangGraph interrupt 语义):
     # 遇到需确认的工具时,图暂停并落盘,请求立即返回控制权(run_id + 待确认项);
     # 用户批准后通过 resume(run_id, resume_value) 从原节点恢复执行,不再占用请求阻塞轮询。
-    agent_confirm_interrupt: bool = False
+    agent_confirm_interrupt: bool = True
 
     # ---- Guardrail 护栏(输入/输出并行校验 + Prompt 注入防护) ----
     # 开启后,进入主循环前对用户消息做注入/越权检测,返回前对答案做敏感信息检测。
     # 拦截时返回固定安全文案;违规记录在 steps(type=guardrail)。
     agent_guardrails_enabled: bool = True
+    # 禁止输出的词汇列表(逗号分隔),用于敏感词过滤
+    guardrail_blocked_terms: str = ""
+
+    # ---- Webhook 回调 ----
+    # WEBHOOK_URLS 在 .env 中配置(逗号分隔多个 URL);此处保留默认空值
+    # 由 app.core.webhook._load_config() 从环境变量直接读取
+    webhook_urls: str = ""
+    webhook_secret: str = ""
+    webhook_timeout: float = 10.0
+
+    # ---- RAG 多路召回(M5) ----
+    # 开启后启用 BM25 + 查询扩展 + RRF 融合;关闭则回退旧向量+关键词混合
+    rag_multi_path_enabled: bool = True
+    # 是否通过 LLM 生成查询扩展(消耗额外 token,关闭时用本地策略)
+    rag_query_expand_llm: bool = False
+    # BM25 召回权重(与向量分独立,RRF 融合时各有排名)
+    rag_bm25_enabled: bool = True
+    # 多路召回最小相关度阈值
+    rag_multi_min_relevance: float = 0.0
+
+    # ---- 长时自主循环 ----
+    # 最大并发长时任务数
+    agent_max_concurrent_long_running: int = 3
+    # 长时任务默认最大执行时长(分钟)
+    agent_long_running_default_minutes: int = 120
+    # 周期 checkpoint 间隔(分钟)
+    agent_long_running_checkpoint_interval: int = 10
+    webhook_retries: int = 2
+    webhook_events: str = ""  # 逗号分隔事件类型,留空=全部
+
+    # ---- MCP 连接管理 ----
+    # MCP 自动重连最大退避间隔(秒),防止无限增长
+    mcp_reconnect_max_delay: float = 60.0
+    # MCP 连续失败停止重连的阈值
+    mcp_reconnect_max_failures: int = 10
 
     # 计算实际数据目录:优先使用可写的工作目录(开发=项目根,打包=exe 旁),
     # 避免 PyInstaller 临时解包目录(_MEIPASS)导致数据丢失

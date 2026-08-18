@@ -146,9 +146,15 @@ class APIEmbeddings:
             with open(self._dim_cache_path(), "r", encoding="utf-8") as f:
                 data = json.load(f)
             if data.get("model") == self._model and isinstance(data.get("dim"), int):
+                # 同时更新进程级缓存
+                _set_cached_dim(self._model, data["dim"])
                 return data["dim"]
         except Exception:  # noqa: BLE001
             pass
+        # 检查进程级缓存
+        cached = _get_cached_dim(self._model)
+        if cached > 0:
+            return cached
         return 0
 
     def _save_dim(self, dim: int) -> None:
@@ -158,6 +164,8 @@ class APIEmbeddings:
                 json.dump({"model": self._model, "dim": dim}, f)
         except Exception:  # noqa: BLE001
             pass
+        # 同步进程级缓存
+        _set_cached_dim(self._model, dim)
 
     def embed(self, text: str) -> list[float]:
         return self.embed_many([text])[0]
@@ -197,27 +205,60 @@ class APIEmbeddings:
 
 
 def run_embed(embedder: Embedder, texts: list[str]) -> list[list[float]]:
-    """在任意上下文(同步/异步/线程)安全调用嵌入器。
+    """在任意上下文(同步/异步/线程)安全调用嵌入器,带缓存。
 
     APIEmbeddings.embed_many 内部使用 asyncio.run,若在已运行的
     事件循环中直接调用会抛 RuntimeError。此处检测到运行中的循环时,
     改在独立工作线程中执行,从而兼容 agent 的 async 调用链。
+    命中缓存直接返回,未命中则计算并写入缓存。
     """
-    try:
-        asyncio.get_running_loop()
-        running = True
-    except RuntimeError:
-        running = False
-    if running:
-        import concurrent.futures
+    # 一级缓存:内存 dict (只在本地进程有效)
+    from app.rag.cache import get_embedding_cache
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-            return ex.submit(embedder.embed_many, texts).result(timeout=180)
-    return embedder.embed_many(texts)
+    cache = get_embedding_cache()
+    imported_hashes = [hash(t) for t in texts]
+    all_cached: list[Optional[list[float]]] = [None] * len(texts)
+    miss_indices: list[int] = []
+    for i, t in enumerate(texts):
+        cached = cache.get(t)
+        if cached is not None:
+            all_cached[i] = cached
+        else:
+            miss_indices.append(i)
+    if not miss_indices:
+        return [v for v in all_cached if v is not None]
+
+    # 计算 miss 部分
+    miss_texts = [texts[i] for i in miss_indices]
+
+    def _compute() -> list[list[float]]:
+        try:
+            asyncio.get_running_loop()
+            running = True
+        except RuntimeError:
+            running = False
+        if running:
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                return ex.submit(embedder.embed_many, miss_texts).result(timeout=180)
+        return embedder.embed_many(miss_texts)
+
+    miss_vectors = _compute()
+    # 回填缓存
+    for i, v in zip(miss_indices, miss_vectors):
+        cache.set(texts[i], v)
+    # 合并结果
+    result = list(all_cached)
+    for idx, v in zip(miss_indices, miss_vectors):
+        result[idx] = v
+    return result
 
 
 _embedder = None
 _embedder_lock = threading.Lock()
+# 进程级维度缓存:避免每次检索都读写磁盘
+_dim_cache: dict[str, int] = {}
 
 
 def get_embedder() -> Embedder:
@@ -235,3 +276,13 @@ def get_embedder() -> Embedder:
         else:
             _embedder = HashEmbedding()
         return _embedder
+
+
+def _get_cached_dim(model_key: str) -> int:
+    """获取已缓存的嵌入维度,未命中返回 0。"""
+    return _dim_cache.get(model_key, 0)
+
+
+def _set_cached_dim(model_key: str, dim: int) -> None:
+    """进程级维度缓存,避免每次读写磁盘。"""
+    _dim_cache[model_key] = dim

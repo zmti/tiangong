@@ -1,12 +1,12 @@
-# -*- mode: python ; coding: utf-8 -*-
+﻿# -*- mode: python ; coding: utf-8 -*-
 import os
 
 from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
 
-conda_dlls = r"C:\Users\nhkj-luxianfang\miniconda3\DLLs"
-conda_bin = r"C:\Users\nhkj-luxianfang\miniconda3\Library\bin"
+# Use venv's Python, not system/miniconda
+venv_site = r'E:\dev\agent-service\.venv\Lib\site-packages'
 
 def _collect_dir(src):
     out = []
@@ -22,9 +22,9 @@ app_datas, app_binaries, app_hiddenimports = collect_all('app')
 uvicorn_datas, uvicorn_binaries, uvicorn_hiddenimports = collect_all('uvicorn')
 
 a = Analysis(
-    [r'E:\dev\mj_asset\agent-service\desktop\backend\launcher.py'],
-    pathex=[conda_dlls, conda_bin, r'E:\dev\mj_asset\agent-service'],
-    binaries=_collect_dir(conda_dlls) + _collect_dir(conda_bin) + app_binaries + uvicorn_binaries,
+    [r'E:\dev\agent-service\desktop\backend\launcher.py'],
+    pathex=[r'E:\dev\agent-service', venv_site],
+    binaries=app_binaries + uvicorn_binaries,
     datas=app_datas + uvicorn_datas,
     hiddenimports=[
         'uvicorn',
@@ -58,8 +58,6 @@ a = Analysis(
     noarchive=False,
 )
 
-# Analysis 完成后过滤掉 PIL 用不到的大体积插件扩展
-# (avif/webp/heif 等, 避免单文件 exe 内部压缩解压失败)
 _PIL_SKIP = ('avif', 'heif', 'dds', 'gifstream')
 filtered = []
 for tup in a.binaries:

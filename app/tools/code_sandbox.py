@@ -192,79 +192,588 @@ def run_in_docker(code: str, timeout: int = DEFAULT_TIMEOUT) -> SandboxResult:
         )
 
 
-def run_in_subprocess(code: str, timeout: int = DEFAULT_TIMEOUT) -> SandboxResult:
-    """在本地 subprocess 中执行(弱隔离,演示用)。"""
-    python = _resolve_python()
-    if not python:
-        return SandboxResult(
-            success=False,
-            output="[沙箱] 未找到可用的 Python 解释器,请配置 SANDBOX_PYTHON 指向 python.exe",
-            returncode=-1,
-            mode="subprocess",
-            duration=0,
-        )
+def run_in_subprocess(code: str, timeout: int = DEFAULT_TIMEOUT, language: str = "python") -> SandboxResult:
+    """在本地 subprocess 中执行代码(弱隔离,支持多语言)。"""
+    lang = language.lower().strip()
+    lang_map = {
+        # Python
+        "py": "python", "python": "python",
+        # JavaScript / TypeScript
+        "js": "javascript", "javascript": "javascript",
+        "ts": "typescript", "typescript": "typescript",
+        # 编译型语言
+        "go": "go", "rust": "rust", "java": "java",
+        "c": "c", "cpp": "cpp", "c++": "cpp",
+        "swift": "swift",
+        "kotlin": "kotlin",
+        "csharp": "csharp", "c#": "csharp", "cs": "csharp",
+        "zig": "zig",
+        "v": "v", "vlang": "v",
+        "haskell": "haskell", "hs": "haskell",
+        # 脚本型语言 (通用解释器)
+        "ruby": "ruby", "rb": "ruby",
+        "php": "php",
+        "perl": "perl", "pl": "perl",
+        "lua": "lua",
+        "dart": "dart",
+        "julia": "julia", "jl": "julia",
+        "r": "r", "rscript": "r",
+        "octave": "octave", "matlab": "octave",
+        "powershell": "powerhell", "ps1": "powerhell", "ps": "powerhell",
+        # Shell
+        "sh": "shell", "bash": "shell", "zsh": "shell", "fish": "shell",
+    }
+    lang = lang_map.get(lang, lang)
+
     workdir = tempfile.mkdtemp(prefix="agent_sandbox_")
     try:
-        # 写代码到临时文件(绝对路径)
-        script = os.path.join(workdir, "main.py")
-        with open(script, "w", encoding="utf-8") as f:
-            f.write(textwrap.dedent(code))
-
-        start = time.time()
-        try:
-            r = subprocess.run(
-                [python, "-u", script],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                # cwd 用当前工作目录(与 write_file 的相对路径基准一致),脚本本身用绝对路径定位
-                cwd=os.getcwd(),
-                env={
-                    **os.environ,
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                    "PYTHONPATH": "",  # 禁止导入业务代码
-                },
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-            )
-            output = r.stdout
-            if r.stderr.strip():
-                output += "\n[stderr]\n" + r.stderr
-            output = output[:6000]
+        if lang == "python":
+            return _run_python(code, timeout, workdir)
+        elif lang in ("javascript", "typescript"):
+            return _run_node(code, timeout, workdir, lang)
+        elif lang == "go":
+            return _run_go(code, timeout, workdir)
+        elif lang == "rust":
+            return _run_rust(code, timeout, workdir)
+        elif lang == "java":
+            return _run_java(code, timeout, workdir)
+        elif lang in ("c", "cpp"):
+            return _run_c(code, timeout, workdir, lang)
+        elif lang == "swift":
+            return _run_swift(code, timeout, workdir)
+        elif lang == "kotlin":
+            return _run_kotlin(code, timeout, workdir)
+        elif lang == "csharp":
+            return _run_csharp(code, timeout, workdir)
+        elif lang == "zig":
+            return _run_zig(code, timeout, workdir)
+        elif lang == "v":
+            return _run_v(code, timeout, workdir)
+        elif lang == "haskell":
+            return _run_haskell(code, timeout, workdir)
+        elif lang == "ruby":
+            return _run_ruby(code, timeout, workdir)
+        elif lang == "php":
+            return _run_php(code, timeout, workdir)
+        elif lang == "perl":
+            return _run_perl(code, timeout, workdir)
+        elif lang == "lua":
+            return _run_lua(code, timeout, workdir)
+        elif lang == "dart":
+            return _run_dart(code, timeout, workdir)
+        elif lang == "julia":
+            return _run_julia(code, timeout, workdir)
+        elif lang == "r":
+            return _run_r(code, timeout, workdir)
+        elif lang == "octave":
+            return _run_octave(code, timeout, workdir)
+        elif lang == "powerhell":
+            return _run_powerhell(code, timeout, workdir)
+        elif lang in ("shell", "bash", "zsh", "fish"):
+            return _run_shell(code, timeout, workdir)
+        else:
             return SandboxResult(
-                success=r.returncode == 0,
-                output=output or "(无输出)",
-                returncode=r.returncode,
-                mode="subprocess",
-                duration=time.time() - start,
-            )
-        except subprocess.TimeoutExpired:
-            return SandboxResult(
-                success=False,
-                output=f"[沙箱] 执行超时({timeout}s),已终止进程",
-                returncode=-1,
-                mode="subprocess",
-                duration=time.time() - start,
-            )
-        except Exception as e:  # noqa: BLE001
-            return SandboxResult(
-                success=False,
-                output=f"[沙箱] 执行异常: {e}",
-                returncode=-1,
-                mode="subprocess",
-                duration=time.time() - start,
+                success=False, output=f"[沙箱] 不支持的语言: {lang}。支持的: python, js/ts, go, rust, java, c/c++, swift, kotlin, c#, zig, v, haskell, ruby, php, perl, lua, dart, julia, r, octave, powershell, shell/bash", returncode=-1, mode="subprocess", duration=0
             )
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-def run_code_sandboxed(code: str, timeout: int = DEFAULT_TIMEOUT, use_docker: Optional[bool] = None) -> SandboxResult:
+# ---- 各语言执行器 ----
+
+def _run_python(code: str, timeout: int, workdir: str) -> SandboxResult:
+    python = _resolve_python()
+    if not python:
+        return SandboxResult(False, "[沙箱] 未找到可用的 Python 解释器", -1, "subprocess", 0)
+    script = os.path.join(workdir, "main.py")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write(textwrap.dedent(code))
+    start = time.time()
+    try:
+        r = subprocess.run(
+            [python, "-u", script], capture_output=True, text=True, timeout=timeout,
+            cwd=workdir,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": ""},
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        out = r.stdout
+        if r.stderr.strip():
+            out += "\n[stderr]\n" + r.stderr
+        return SandboxResult(r.returncode == 0, out[:6000] or "(无输出)", r.returncode, "subprocess", time.time() - start)
+    except subprocess.TimeoutExpired:
+        _kill_tree(r) if 'r' in locals() else None
+        return SandboxResult(False, f"[沙箱] 执行超时({timeout}s)", -1, "subprocess", time.time() - start)
+    except Exception as e:
+        return SandboxResult(False, f"[沙箱] 执行异常: {e}", -1, "subprocess", time.time() - start)
+
+
+def _run_node(code: str, timeout: int, workdir: str, lang: str) -> SandboxResult:
+    cmd = shutil.which("node")
+    if not cmd:
+        # 尝试 Deno
+        cmd = shutil.which("deno")
+        if cmd:
+            ext = ".ts" if lang == "typescript" else ".js"
+            script = os.path.join(workdir, "main" + ext)
+            with open(script, "w", encoding="utf-8") as f:
+                f.write(textwrap.dedent(code))
+            start = time.time()
+            try:
+                r = subprocess.run([cmd, "run", "--allow-all", script],
+                                   capture_output=True, text=True, timeout=timeout,
+                                   cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                out = r.stdout
+                if r.stderr.strip():
+                    out += "\n[stderr]\n" + r.stderr
+                return SandboxResult(r.returncode == 0, out[:6000] or "(无输出)", r.returncode, "subprocess", time.time() - start)
+            except subprocess.TimeoutExpired:
+                return SandboxResult(False, f"[沙箱] 执行超时({timeout}s)", -1, "subprocess", time.time() - start)
+            except Exception as e:
+                return SandboxResult(False, f"[沙箱] 执行异常: {e}", -1, "subprocess", time.time() - start)
+        return SandboxResult(False, "[沙箱] 未找到 Node.js 或 Deno,请先安装 Node.js", -1, "subprocess", 0)
+
+    ext = ".ts" if lang == "typescript" else ".js"
+    script = os.path.join(workdir, "main" + ext)
+    with open(script, "w", encoding="utf-8") as f:
+        f.write(textwrap.dedent(code))
+    start = time.time()
+    try:
+        r = subprocess.run([cmd, script], capture_output=True, text=True, timeout=timeout,
+                           cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        out = r.stdout
+        if r.stderr.strip():
+            out += "\n[stderr]\n" + r.stderr
+        return SandboxResult(r.returncode == 0, out[:6000] or "(无输出)", r.returncode, "subprocess", time.time() - start)
+    except subprocess.TimeoutExpired:
+        return SandboxResult(False, f"[沙箱] 执行超时({timeout}s)", -1, "subprocess", time.time() - start)
+    except Exception as e:
+        return SandboxResult(False, f"[沙箱] 执行异常: {e}", -1, "subprocess", time.time() - start)
+
+
+def _run_go(code: str, timeout: int, workdir: str) -> SandboxResult:
+    go = shutil.which("go")
+    if not go:
+        return SandboxResult(False, "[沙箱] 未找到 Go 编译器,请先安装 Go", -1, "subprocess", 0)
+    main_go = os.path.join(workdir, "main.go")
+    with open(main_go, "w", encoding="utf-8") as f:
+        f.write(textwrap.dedent(code))
+    # 初始化 go module
+    subprocess.run([go, "mod", "init", "sandbox"], capture_output=True, cwd=workdir,
+                   creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+    start = time.time()
+    try:
+        r = subprocess.run([go, "run", "."], capture_output=True, text=True, timeout=timeout,
+                           cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        out = r.stdout
+        if r.stderr.strip():
+            out += "\n[stderr]\n" + r.stderr
+        return SandboxResult(r.returncode == 0, out[:6000] or "(无输出)", r.returncode, "subprocess", time.time() - start)
+    except subprocess.TimeoutExpired:
+        return SandboxResult(False, f"[沙箱] 执行超时({timeout}s)", -1, "subprocess", time.time() - start)
+    except Exception as e:
+        return SandboxResult(False, f"[沙箱] 执行异常: {e}", -1, "subprocess", time.time() - start)
+
+
+def _run_rust(code: str, timeout: int, workdir: str) -> SandboxResult:
+    rustc = shutil.which("rustc")
+    if not rustc:
+        return SandboxResult(False, "[沙箱] 未找到 Rust 编译器(rustc),请先安装 Rust", -1, "subprocess", 0)
+    src = os.path.join(workdir, "main.rs")
+    exe = os.path.join(workdir, "main" + (".exe" if sys.platform == "win32" else ""))
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(textwrap.dedent(code))
+    start = time.time()
+    try:
+        subprocess.run([rustc, src, "-o", exe], capture_output=True, timeout=60,
+                       creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        r = subprocess.run([exe], capture_output=True, text=True, timeout=timeout,
+                           cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        out = r.stdout
+        if r.stderr.strip():
+            out += "\n[stderr]\n" + r.stderr
+        return SandboxResult(r.returncode == 0, out[:6000] or "(无输出)", r.returncode, "subprocess", time.time() - start)
+    except subprocess.TimeoutExpired:
+        return SandboxResult(False, f"[沙箱] 执行超时({timeout}s)", -1, "subprocess", time.time() - start)
+    except Exception as e:
+        return SandboxResult(False, f"[沙箱] 编译/执行异常: {e}", -1, "subprocess", time.time() - start)
+
+
+def _run_java(code: str, timeout: int, workdir: str) -> SandboxResult:
+    javac = shutil.which("javac")
+    java = shutil.which("java")
+    if not javac or not java:
+        return SandboxResult(False, "[沙箱] 未找到 Java 编译器(javac),请先安装 JDK", -1, "subprocess", 0)
+    # 从代码中提取类名
+    import re
+    m = re.search(r'(?:public\s+)?class\s+(\w+)', code)
+    class_name = m.group(1) if m else "Main"
+    src = os.path.join(workdir, class_name + ".java")
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(textwrap.dedent(code))
+    start = time.time()
+    try:
+        subprocess.run([javac, src], capture_output=True, timeout=60,
+                       creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        r = subprocess.run([java, class_name], capture_output=True, text=True, timeout=timeout,
+                           cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        out = r.stdout
+        if r.stderr.strip():
+            out += "\n[stderr]\n" + r.stderr
+        return SandboxResult(r.returncode == 0, out[:6000] or "(无输出)", r.returncode, "subprocess", time.time() - start)
+    except subprocess.TimeoutExpired:
+        return SandboxResult(False, f"[沙箱] 执行超时({timeout}s)", -1, "subprocess", time.time() - start)
+    except Exception as e:
+        return SandboxResult(False, f"[沙箱] 编译/执行异常: {e}", -1, "subprocess", time.time() - start)
+
+
+def _run_c(code: str, timeout: int, workdir: str, lang: str) -> SandboxResult:
+    compiler = shutil.which("gcc" if lang == "c" else "g++")
+    if not compiler:
+        # 尝试 clang
+        compiler = shutil.which("clang")
+    if not compiler:
+        compiler = shutil.which("cl")  # MSVC
+    if not compiler:
+        return SandboxResult(False, f"[沙箱] 未找到 {lang.upper()} 编译器(gcc/clang/cl),请先安装", -1, "subprocess", 0)
+    ext = ".c" if lang == "c" else ".cpp"
+    src = os.path.join(workdir, "main" + ext)
+    exe_ext = ".exe" if sys.platform == "win32" else ""
+    exe = os.path.join(workdir, "main" + exe_ext)
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(textwrap.dedent(code))
+    compile_cmd = [compiler, src, "-o", exe]
+    if lang == "cpp":
+        compile_cmd.append("-std=c++17")
+    start = time.time()
+    try:
+        subprocess.run(compile_cmd, capture_output=True, timeout=60,
+                       creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        r = subprocess.run([exe], capture_output=True, text=True, timeout=timeout,
+                           cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        out = r.stdout
+        if r.stderr.strip():
+            out += "\n[stderr]\n" + r.stderr
+        return SandboxResult(r.returncode == 0, out[:6000] or "(无输出)", r.returncode, "subprocess", time.time() - start)
+    except subprocess.TimeoutExpired:
+        return SandboxResult(False, f"[沙箱] 执行超时({timeout}s)", -1, "subprocess", time.time() - start)
+    except Exception as e:
+        return SandboxResult(False, f"[沙箱] 编译/执行异常: {e}", -1, "subprocess", time.time() - start)
+
+
+def _run_shell(code: str, timeout: int, workdir: str) -> SandboxResult:
+    if sys.platform == "win32":
+        cmd = ["cmd.exe", "/c"]
+    else:
+        cmd = ["/bin/sh", "-c"]
+    start = time.time()
+    try:
+        r = subprocess.run(cmd + [textwrap.dedent(code)], capture_output=True, text=True, timeout=timeout,
+                           cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        out = r.stdout
+        if r.stderr.strip():
+            out += "\n[stderr]\n" + r.stderr
+        return SandboxResult(r.returncode == 0, out[:6000] or "(无输出)", r.returncode, "subprocess", time.time() - start)
+    except subprocess.TimeoutExpired:
+        return SandboxResult(False, f"[沙箱] 执行超时({timeout}s)", -1, "subprocess", time.time() - start)
+    except Exception as e:
+        return SandboxResult(False, f"[沙箱] 执行异常: {e}", -1, "subprocess", time.time() - start)
+
+
+def _run_generic_interpreter(code: str, interpreter: str, ext: str, timeout: int, workdir: str, extra_args: list = None) -> SandboxResult:
+    """通用解释器运行器:适用于 Ruby/PHP/Perl/Lua/Dart/Julia/PowerShell 等。"""
+    cmd = shutil.which(interpreter)
+    if not cmd:
+        return SandboxResult(False, f"[沙箱] 未找到 {interpreter},请先安装", -1, "subprocess", 0)
+    script = os.path.join(workdir, "main" + ext)
+    with open(script, "w", encoding="utf-8") as f:
+        f.write(textwrap.dedent(code))
+    start = time.time()
+    run_cmd = [cmd] + (extra_args or []) + [script]
+    try:
+        r = subprocess.run(run_cmd, capture_output=True, text=True, timeout=timeout,
+                           cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        out = r.stdout
+        if r.stderr.strip():
+            out += "\n[stderr]\n" + r.stderr
+        return SandboxResult(r.returncode == 0, out[:6000] or "(无输出)", r.returncode, "subprocess", time.time() - start)
+    except subprocess.TimeoutExpired:
+        return SandboxResult(False, f"[沙箱] 执行超时({timeout}s)", -1, "subprocess", time.time() - start)
+    except Exception as e:
+        return SandboxResult(False, f"[沙箱] 执行异常: {e}", -1, "subprocess", time.time() - start)
+
+
+def _run_swift(code: str, timeout: int, workdir: str) -> SandboxResult:
+    swift = shutil.which("swift")
+    if not swift:
+        # macOS 上 swiftc 可能独立
+        swift = shutil.which("swiftc")
+    if not swift:
+        return SandboxResult(False, "[沙箱] 未找到 Swift 编译器,请先安装 Swift", -1, "subprocess", 0)
+    src = os.path.join(workdir, "main.swift")
+    exe = os.path.join(workdir, "main" + (".exe" if sys.platform == "win32" else ""))
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(textwrap.dedent(code))
+    start = time.time()
+    try:
+        subprocess.run([swift, src, "-o", exe], capture_output=True, timeout=120,
+                       creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        r = subprocess.run([exe], capture_output=True, text=True, timeout=timeout,
+                           cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        out = r.stdout
+        if r.stderr.strip():
+            out += "\n[stderr]\n" + r.stderr
+        return SandboxResult(r.returncode == 0, out[:6000] or "(无输出)", r.returncode, "subprocess", time.time() - start)
+    except subprocess.TimeoutExpired:
+        return SandboxResult(False, f"[沙箱] 执行超时({timeout}s)", -1, "subprocess", time.time() - start)
+    except Exception as e:
+        return SandboxResult(False, f"[沙箱] 编译/执行异常: {e}", -1, "subprocess", time.time() - start)
+
+
+def _run_kotlin(code: str, timeout: int, workdir: str) -> SandboxResult:
+    kotlinc = shutil.which("kotlinc")
+    if not kotlinc:
+        return SandboxResult(False, "[沙箱] 未找到 Kotlin 编译器(kotlinc),请先安装 Kotlin", -1, "subprocess", 0)
+    src = os.path.join(workdir, "Main.kt")
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(textwrap.dedent(code))
+    start = time.time()
+    try:
+        # 编译到临时目录
+        out_dir = os.path.join(workdir, "kout")
+        os.makedirs(out_dir, exist_ok=True)
+        subprocess.run([kotlinc, src, "-d", out_dir], capture_output=True, timeout=120,
+                       creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        java = shutil.which("java")
+        if not java:
+            return SandboxResult(False, "[沙箱] 未找到 java,请先安装 JDK", -1, "subprocess", time.time() - start)
+        r = subprocess.run([java, "-cp", out_dir, "Main"], capture_output=True, text=True, timeout=timeout,
+                           cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        out = r.stdout
+        if r.stderr.strip():
+            out += "\n[stderr]\n" + r.stderr
+        return SandboxResult(r.returncode == 0, out[:6000] or "(无输出)", r.returncode, "subprocess", time.time() - start)
+    except subprocess.TimeoutExpired:
+        return SandboxResult(False, f"[沙箱] 执行超时({timeout}s)", -1, "subprocess", time.time() - start)
+    except Exception as e:
+        return SandboxResult(False, f"[沙箱] 编译/执行异常: {e}", -1, "subprocess", time.time() - start)
+
+
+def _run_csharp(code: str, timeout: int, workdir: str) -> SandboxResult:
+    """C# 执行:优先 dotnet-script,降级到 csc/roslyn。"""
+    # 方案1: dotnet-script
+    ds = shutil.which("dotnet-script")
+    if ds:
+        script = os.path.join(workdir, "main.csx")
+        with open(script, "w", encoding="utf-8") as f:
+            f.write(textwrap.dedent(code))
+        start = time.time()
+        try:
+            r = subprocess.run([ds, script], capture_output=True, text=True, timeout=timeout,
+                               cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+            out = r.stdout
+            if r.stderr.strip():
+                out += "\n[stderr]\n" + r.stderr
+            return SandboxResult(r.returncode == 0, out[:6000] or "(无输出)", r.returncode, "subprocess", time.time() - start)
+        except subprocess.TimeoutExpired:
+            return SandboxResult(False, f"[沙箱] 执行超时({timeout}s)", -1, "subprocess", time.time() - start)
+        except Exception as e:
+            return SandboxResult(False, f"[沙箱] 执行异常: {e}", -1, "subprocess", time.time() - start)
+
+    # 方案2: dotnet fsi (F# interactive, 也可跑 C# 脚本)
+    fsi = shutil.which("dotnet")
+    if fsi:
+        script = os.path.join(workdir, "main.fsx")
+        with open(script, "w", encoding="utf-8") as f:
+            f.write(textwrap.dedent(code))
+        start = time.time()
+        try:
+            r = subprocess.run([fsi, script], capture_output=True, text=True, timeout=timeout,
+                               cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+            out = r.stdout
+            if r.stderr.strip():
+                out += "\n[stderr]\n" + r.stderr
+            return SandboxResult(r.returncode == 0, out[:6000] or "(无输出)", r.returncode, "subprocess", time.time() - start)
+        except subprocess.TimeoutExpired:
+            return SandboxResult(False, f"[沙箱] 执行超时({timeout}s)", -1, "subprocess", time.time() - start)
+        except Exception as e:
+            return SandboxResult(False, f"[沙箱] 执行异常: {e}", -1, "subprocess", time.time() - start)
+
+    return SandboxResult(False, "[沙箱] 未找到 dotnet-script 或 dotnet,请安装 .NET SDK", -1, "subprocess", 0)
+
+
+def _run_dart(code: str, timeout: int, workdir: str) -> SandboxResult:
+    dart = shutil.which("dart")
+    if not dart:
+        return SandboxResult(False, "[沙箱] 未找到 Dart 运行时,请先安装 Flutter/Dart SDK", -1, "subprocess", 0)
+    script = os.path.join(workdir, "main.dart")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write(textwrap.dedent(code))
+    start = time.time()
+    try:
+        r = subprocess.run([dart, script], capture_output=True, text=True, timeout=timeout,
+                           cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        out = r.stdout
+        if r.stderr.strip():
+            out += "\n[stderr]\n" + r.stderr
+        return SandboxResult(r.returncode == 0, out[:6000] or "(无输出)", r.returncode, "subprocess", time.time() - start)
+    except subprocess.TimeoutExpired:
+        return SandboxResult(False, f"[沙箱] 执行超时({timeout}s)", -1, "subprocess", time.time() - start)
+    except Exception as e:
+        return SandboxResult(False, f"[沙箱] 执行异常: {e}", -1, "subprocess", time.time() - start)
+
+
+def _run_haskell(code: str, timeout: int, workdir: str) -> SandboxResult:
+    ghc = shutil.which("ghc")
+    if not ghc:
+        return SandboxResult(False, "[沙箱] 未找到 GHC(Haskell 编译器),请先安装 Haskell", -1, "subprocess", 0)
+    src = os.path.join(workdir, "Main.hs")
+    exe = os.path.join(workdir, "main" + (".exe" if sys.platform == "win32" else ""))
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(textwrap.dedent(code))
+    start = time.time()
+    try:
+        subprocess.run([ghc, src, "-o", exe], capture_output=True, timeout=120,
+                       creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        r = subprocess.run([exe], capture_output=True, text=True, timeout=timeout,
+                           cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        out = r.stdout
+        if r.stderr.strip():
+            out += "\n[stderr]\n" + r.stderr
+        return SandboxResult(r.returncode == 0, out[:6000] or "(无输出)", r.returncode, "subprocess", time.time() - start)
+    except subprocess.TimeoutExpired:
+        return SandboxResult(False, f"[沙箱] 执行超时({timeout}s)", -1, "subprocess", time.time() - start)
+    except Exception as e:
+        return SandboxResult(False, f"[沙箱] 编译/执行异常: {e}", -1, "subprocess", time.time() - start)
+
+
+def _run_julia(code: str, timeout: int, workdir: str) -> SandboxResult:
+    return _run_generic_interpreter(code, "julia", ".jl", timeout, workdir)
+
+
+def _run_r(code: str, timeout: int, workdir: str) -> SandboxResult:
+    return _run_generic_interpreter(code, "Rscript" if sys.platform == "win32" else "Rscript", ".R", timeout, workdir)
+
+
+def _run_octave(code: str, timeout: int, workdir: str) -> SandboxResult:
+    return _run_generic_interpreter(code, "octave-cli" if sys.platform == "win32" else "octave", ".m", timeout, workdir)
+
+
+def _run_ruby(code: str, timeout: int, workdir: str) -> SandboxResult:
+    return _run_generic_interpreter(code, "ruby", ".rb", timeout, workdir)
+
+
+def _run_perl(code: str, timeout: int, workdir: str) -> SandboxResult:
+    return _run_generic_interpreter(code, "perl", ".pl", timeout, workdir)
+
+
+def _run_lua(code: str, timeout: int, workdir: str) -> SandboxResult:
+    return _run_generic_interpreter(code, "lua", ".lua", timeout, workdir)
+
+
+def _run_php(code: str, timeout: int, workdir: str) -> SandboxResult:
+    return _run_generic_interpreter(code, "php", ".php", timeout, workdir)
+
+
+def _run_powerhell(code: str, timeout: int, workdir: str) -> SandboxResult:
+    """PowerShell 执行。"""
+    if sys.platform == "win32":
+        pwsh = shutil.which("pwsh") or shutil.which("powershell")
+        if not pwsh:
+            return SandboxResult(False, "[沙箱] 未找到 PowerShell", -1, "subprocess", 0)
+        script = os.path.join(workdir, "main.ps1")
+        with open(script, "w", encoding="utf-8") as f:
+            f.write(textwrap.dedent(code))
+        start = time.time()
+        try:
+            r = subprocess.run([pwsh, "-NoProfile", "-File", script],
+                               capture_output=True, text=True, timeout=timeout,
+                               cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+            out = r.stdout
+            if r.stderr.strip():
+                out += "\n[stderr]\n" + r.stderr
+            return SandboxResult(r.returncode == 0, out[:6000] or "(无输出)", r.returncode, "subprocess", time.time() - start)
+        except subprocess.TimeoutExpired:
+            return SandboxResult(False, f"[沙箱] 执行超时({timeout}s)", -1, "subprocess", time.time() - start)
+        except Exception as e:
+            return SandboxResult(False, f"[沙箱] 执行异常: {e}", -1, "subprocess", time.time() - start)
+    else:
+        return SandboxResult(False, "[沙箱] PowerShell 仅在 Windows 上可用", -1, "subprocess", 0)
+
+
+def _run_zig(code: str, timeout: int, workdir: str) -> SandboxResult:
+    zig = shutil.which("zig")
+    if not zig:
+        return SandboxResult(False, "[沙箱] 未找到 Zig 编译器,请先安装 Zig", -1, "subprocess", 0)
+    src = os.path.join(workdir, "main.zig")
+    exe = os.path.join(workdir, "main" + (".exe" if sys.platform == "win32" else ""))
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(textwrap.dedent(code))
+    start = time.time()
+    try:
+        subprocess.run([zig, "run", src], capture_output=True, text=True, timeout=timeout,
+                       cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        # zig run 直接执行，不需要单独编译
+        return SandboxResult(True, "(Zig 使用 zig run 直接执行，请检查上方输出)", 0, "subprocess", time.time() - start)
+    except subprocess.TimeoutExpired:
+        return SandboxResult(False, f"[沙箱] 执行超时({timeout}s)", -1, "subprocess", time.time() - start)
+    except Exception as e:
+        return SandboxResult(False, f"[沙箱] 执行异常: {e}", -1, "subprocess", time.time() - start)
+
+
+def _run_v(code: str, timeout: int, workdir: str) -> SandboxResult:
+    v = shutil.which("v")
+    if not v:
+        return SandboxResult(False, "[沙箱] 未找到 V 编译器,请先安装 V", -1, "subprocess", 0)
+    src = os.path.join(workdir, "main.v")
+    exe = os.path.join(workdir, "main" + (".exe" if sys.platform == "win32" else ""))
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(textwrap.dedent(code))
+    start = time.time()
+    try:
+        subprocess.run([v, "run", src], capture_output=True, text=True, timeout=timeout,
+                       cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        return SandboxResult(True, "(V 使用 v run 直接执行，请检查上方输出)", 0, "subprocess", time.time() - start)
+    except subprocess.TimeoutExpired:
+        return SandboxResult(False, f"[沙箱] 执行超时({timeout}s)", -1, "subprocess", time.time() - start)
+    except Exception as e:
+        return SandboxResult(False, f"[沙箱] 执行异常: {e}", -1, "subprocess", time.time() - start)
+
+
+def run_code_sandboxed(
+    code: str,
+    timeout: int = DEFAULT_TIMEOUT,
+    use_docker: Optional[bool] = None,
+    language: str = "python",
+) -> SandboxResult:
     """统一入口:优先 Docker,不可用时降级 subprocess。
 
-    use_docker: True 强制 Docker / False 强制 subprocess / None 自动检测
+    支持的语言(需对应运行时已安装):
+      Python   : python / py
+      JS/TS    : javascript / js / typescript / ts
+      Go       : go
+      Rust     : rust
+      Java     : java
+      C/C++    : c / cpp / c++
+      Swift    : swift
+      Kotlin   : kotlin
+      C#       : csharp / c# / cs
+      Zig      : zig
+      V        : v / vlang
+      Haskell  : haskell / hs
+      Ruby     : ruby / rb
+      PHP      : php
+      Perl     : perl / pl
+      Lua      : lua
+      Dart     : dart
+      Julia    : julia / jl
+      R        : r
+      Octave   : octave / matlab
+      PowerShell: powershell / ps1
+      Shell    : shell / bash / zsh / fish
     """
     if use_docker is None:
         use_docker = docker_available()
 
     if use_docker:
-        return run_in_docker(code, timeout)
-    return run_in_subprocess(code, timeout)
+        return run_in_docker(code, timeout, language)
+    return run_in_subprocess(code, timeout, language)

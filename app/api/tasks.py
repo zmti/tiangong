@@ -108,6 +108,29 @@ async def get_task(task_id: str) -> dict:
     return rec.to_dict()
 
 
+@router.get("/{task_id}/status")
+async def task_status(task_id: str) -> dict:
+    """同步查询任务状态(供前端轮询)。返回 {status, progress, run_id, error, answer}。"""
+    mgr = get_task_manager()
+    rec = mgr.get(task_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"未找到任务: {task_id}")
+    d = rec.to_dict()
+    # 补充进度(正在执行时从 checkpoint 估算)
+    if d.get("status") == "running":
+        from app.core.agent import Agent
+        try:
+            a = Agent()
+            versions = a.versions(rec.run_id) if rec.run_id else []
+            if versions:
+                latest = versions[-1] if versions else {}
+                total_steps = latest.get("steps", 0) or 0
+                d["progress"] = min(1.0, total_steps / max(1, rec.max_steps or 30))
+        except Exception:  # noqa: BLE001
+            d["progress"] = None
+    return d
+
+
 @router.get("/{task_id}/events")
 async def task_events(task_id: str) -> StreamingResponse:
     """SSE 事件流:订阅任务进度(thinking/tool/plan/answer/error/task_done)。"""
@@ -125,7 +148,11 @@ async def task_events(task_id: str) -> StreamingResponse:
                      "status": rec.status, "answer": rec.answer}
             yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/{task_id}/cancel")
@@ -149,10 +176,9 @@ async def delete_task(task_id: str) -> dict:
 
     db = mgr._db_path  # noqa: SLF001
     try:
-        conn = sqlite3.connect(db)
-        conn.execute("DELETE FROM tasks WHERE task_id=?", (task_id,))
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(db) as conn:
+            conn.execute("DELETE FROM tasks WHERE task_id=?", (task_id,))
+            conn.commit()
     except Exception:  # noqa: BLE001
         pass
     return {"task_id": task_id, "deleted": True}

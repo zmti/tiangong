@@ -27,6 +27,8 @@ App.Chat.send = async function () {
     const f = App.selectedImageFile;
     App.selectedImageFile = null;
     App.els.imgPreviewBar.classList.remove('show');
+    App._planCard = null;
+    _startGroup();
     App.Chat.recognizeImage(f);
     return;
   }
@@ -105,6 +107,23 @@ App.Chat.editMessage = async function (wrap, bubble) {
   input.addEventListener('blur', () => finish(true));
 };
 
+/* 启动工具分组:把本次回答的工具调用/思考/计划折叠到单个卡片中 */
+function _startGroup() {
+  if (App._currentGroup) {
+    App._currentGroup.wrap.remove();
+    App._currentGroup = null;
+  }
+  if (App.Group && App.Group.start) App.Group.start();
+}
+
+/* 结束工具分组:根据是否有答案/工具展示最终摘要 */
+function _finishGroup(answerText) {
+  if (App.Group && App.Group.finish) {
+    App.Group.finish(answerText || '', false);
+  }
+  App._currentGroup = null;
+}
+
 /* 核心发送逻辑 */
 App.Chat.doSend = async function (text, opts = {}) {
   const input = App.els.input;
@@ -115,31 +134,42 @@ App.Chat.doSend = async function (text, opts = {}) {
   if (!opts.skipAppendUser) App.appendMessage(text, 'user');
   App.showTyping();
   App.Chat.setStreaming(true);
-  App.Session.renderList();
+  _startGroup();  // 开始工具分组
 
   App.abortController = new AbortController();
   const signal = App.abortController.signal;
   let receivedTokens = false;
+  let isError = false;   // 必须声明,超时回调会检查它
 
+  let res = null;
+  let retries = 0;
   try {
-    const res = await App.api('/v1/chat/stream', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(App.Attach ? App.Attach.patchBody({
-        message: text,
-        session_id: App.sessionId,
-        stream: true,
-        provider: App.selectedProvider() || null,
-        ...App.Chat.modeParams(),
-      }) : {
-        message: text,
-        session_id: App.sessionId,
-        stream: true,
-        provider: App.selectedProvider() || null,
-        ...App.Chat.modeParams(),
-      }),
-      signal,
-    });
+    while (!res && retries < 3) {
+      try {
+        res = await App.api('/v1/chat/stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(App.Attach ? App.Attach.patchBody({
+            message: text,
+            session_id: App.sessionId,
+            stream: true,
+            provider: App.selectedProvider() || null,
+            ...App.Chat.modeParams(),
+          }) : {
+            message: text,
+            session_id: App.sessionId,
+            stream: true,
+            provider: App.selectedProvider() || null,
+            ...App.Chat.modeParams(),
+          }),
+          signal,
+        });
+      } catch (fetchErr) {
+        retries++;
+        if (retries >= 3) throw fetchErr;
+        await new Promise(r => setTimeout(r, 1000 * retries));
+      }
+    }
     if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
 
     const reader = res.body.getReader();
@@ -148,9 +178,43 @@ App.Chat.doSend = async function (text, opts = {}) {
     let mdBuf = '';
     let buffer = '';
     let done = false;
+    // 节流渲染:多个 token 合并后每帧一次 re-render,避免 O(n²) 全量 DOM 重排
+    let renderTimer = null;
+    // 流读取超时:后端卡住时主动断开,避免"执行中"永久不消失
+    let streamTimeout = setTimeout(() => {
+      streamTimeout = null;
+      if (!done && !isError) {
+        done = true;
+        isError = true;
+        App.removeTyping();
+        if (renderTimer !== null) { clearTimeout(renderTimer); renderTimer = null; }
+        App.appendMessage('响应超时,请稍后重试', 'error');
+        _finishGroup();
+      }
+    }, 120000); // 120s 整体超时
+
+    function scheduleRender() {
+      if (renderTimer !== null) return;
+      renderTimer = setTimeout(() => {
+        renderTimer = null;
+        if (answerDiv) {
+          // 流式渲染：使用简化模式，避免重复解析
+          answerDiv.textContent = mdBuf;
+          App.els.messages.scrollTop = App.els.messages.scrollHeight;
+        }
+      }, 16);
+    }
 
     while (true) {
-      const { done: isDone, value } = await reader.read();
+      let isDone;
+      try {
+        const result = await reader.read();
+        ({ done: isDone, value } = result);
+      } catch (_) {
+        // 连接中断（如用户停止/切换会话）
+        isError = true;
+        break;
+      }
       if (isDone) break;
       buffer += decoder.decode(value, { stream: true });
 
@@ -163,12 +227,25 @@ App.Chat.doSend = async function (text, opts = {}) {
           const evt = JSON.parse(line.slice(6));
           if (evt.type === 'tool') {
             App.removeTyping();
-            App.appendToolEvent(evt.name || evt.tool || '工具', evt.arguments, evt.result || '');
+            // 使用 Group 收集工具事件,避免散落显示
+            if (App.Group && App.Group.addTool) {
+              const ok = !String(evt.result || '').includes('Error') &&
+                         !String(evt.result || '').includes('failed');
+              App.Group.addTool(evt.name || evt.tool || '工具', evt.arguments, evt.result || '', ok);
+            } else {
+              App.appendToolEvent(evt.name || evt.tool || '工具', evt.arguments, evt.result || '');
+            }
           } else if (evt.type === 'plan') {
             App.removeTyping();
+            if (App.Group && App.Group.addPlanStep) {
+              App.Group.addPlanStep({ title: evt.plan?.steps?.[0]?.title || '规划步骤' }, 0);
+            }
             App.appendPlan(evt);
           } else if (evt.type === 'thinking') {
             App.removeTyping();
+            if (App.Group && App.Group.setThinking) {
+              App.Group.setThinking(evt.content || '');
+            }
             App.appendThinking(evt.content || '');
           } else if (evt.type === 'token') {
             if (!answerDiv) {
@@ -177,16 +254,29 @@ App.Chat.doSend = async function (text, opts = {}) {
             }
             receivedTokens = true;
             mdBuf += evt.content;
-            answerDiv.innerHTML = App.renderMarkdown(mdBuf);
-            App.els.messages.scrollTop = App.els.messages.scrollHeight;
+            scheduleRender();
           } else if (evt.type === 'error') {
             done = true;
+            isError = true;
             App.removeTyping();
+            if (renderTimer !== null) { clearTimeout(renderTimer); renderTimer = null; }
+            if (answerDiv) { answerDiv.innerHTML = App.renderMarkdown(mdBuf); }
             App.appendMessage(evt.message || '发生错误', 'error');
+            _finishGroup();
           } else if (evt.type === 'done') {
             done = true;
             App.removeTyping();
-            if (!receivedTokens) App.appendMessage('(无内容)', 'bot');
+            if (renderTimer !== null) { clearTimeout(renderTimer); renderTimer = null; }
+            if (answerDiv) { answerDiv.innerHTML = App.renderMarkdown(mdBuf); }
+            // 关闭分组并传入最终答案文本
+            _finishGroup(answerDiv ? (answerDiv.textContent || '') : null);
+            // 检查是否有待确认的中断
+            const intr = evt.interrupt;
+            if (intr && intr.type === 'confirmation' && intr.requests && !receivedTokens) {
+              if (App.Confirmation && App.Confirmation.show) App.Confirmation.show(intr.requests, intr.run_id);
+            } else if (!receivedTokens) {
+              App.appendMessage('(无内容)', 'bot');
+            }
           }
         } catch (e) {
           console.warn('parse sse error', e);
@@ -194,9 +284,13 @@ App.Chat.doSend = async function (text, opts = {}) {
       }
     }
 
+    // 清理流超时计时器
+    if (streamTimeout !== null) { clearTimeout(streamTimeout); streamTimeout = null; }
+
     // 未收到任何 token 且流被异常中断:回退非流式接口
     if (!done && !receivedTokens) {
       App.removeTyping();
+      if (renderTimer !== null) { clearTimeout(renderTimer); renderTimer = null; }
       const fallback = await App.api('/v1/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -215,22 +309,30 @@ App.Chat.doSend = async function (text, opts = {}) {
       const data = await fallback.json();
       const div = App.appendMessage(data.answer || data.detail || '请求失败', data.detail ? 'error' : 'bot');
       if (data.answer && !data.detail) div.innerHTML = App.renderMarkdown(data.answer);
+      // 回退路径也完成分组
+      _finishGroup(data.answer || null);
     }
   } catch (e) {
     // AbortError 由 stop() 处理(已追加提示),这里仅做静默清理
+    if (renderTimer !== null) { clearTimeout(renderTimer); renderTimer = null; }
     if (e.name !== 'AbortError') {
       App.removeTyping();
       App.appendMessage(`请求失败: ${e.message}`, 'error');
+      _finishGroup();
     } else {
       App.removeTyping();
+      _finishGroup();
     }
   } finally {
+    // 确保分组被关闭
+    if (App._currentGroup) {
+      _finishGroup(answerDiv ? (answerDiv.textContent || '') : null);
+    }
     App.Chat.setStreaming(false);
     App.abortController = null;
     if (App.Attach) App.Attach.reset();
     if (App.CtxMeter) App.CtxMeter.refresh();
     App.els.input.focus();
-    App.Session.renderList();
   }
 };
 
@@ -245,6 +347,8 @@ App.Chat.stop = function (silent) {
     App.removeTyping();
     App.appendMessage('⏹ 已停止生成', 'bot');
   }
+  // 停止时也完成分组
+  if (App._currentGroup) _finishGroup();
   App.abortController = null;
 };
 

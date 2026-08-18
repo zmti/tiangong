@@ -154,19 +154,29 @@ class MCPManager:
         """添加 MCP 客户端。"""
         self._clients[name] = client
 
-    def reset(self) -> None:
+    async def reset(self) -> None:
         """清空全部 MCP 客户端与工具映射(用于重新加载配置)。"""
+        for client in list(self._clients.values()):
+            try:
+                await client.close()
+            except Exception:  # noqa: BLE001
+                pass
         self._clients.clear()
         self._tools_map.clear()
-    
-    def remove_client(self, name: str) -> None:
+
+    async def remove_client(self, name: str) -> None:
         """移除 MCP 客户端。"""
         if name in self._clients:
+            client = self._clients[name]
             # 移除该客户端的所有工具映射
             to_remove = [k for k, v in self._tools_map.items() if v[0] == name]
             for k in to_remove:
                 del self._tools_map[k]
             del self._clients[name]
+            try:
+                await client.close()
+            except Exception:  # noqa: BLE001
+                pass
     
     def get_client(self, name: str) -> Optional[MCPClient]:
         """获取指定名称的客户端。"""
@@ -280,6 +290,7 @@ async def init_mcp_from_config() -> dict:
                 env=config.get("env") or {},
                 timeout=float(config.get("timeout", 60)),
                 cwd=config.get("cwd"),
+                auto_reconnect=True,
             )
         else:
             url = config.get("url", "")

@@ -4,6 +4,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Query
 
 from app.core.telemetry import tracer
+from app.core.tenant_context import get_tenant
 
 router = APIRouter(prefix="/v1/traces", tags=["observability"])
 
@@ -14,7 +15,13 @@ async def list_traces(
     run_id: str = Query("", description="按运行 id 过滤"),
     type: str = Query("", description="按事件类型过滤: llm_call / tool / run_start / run_end"),
 ) -> dict:
+    """查询最近 trace。按当前租户过滤。"""
+    from app.core.tenant_context import get_tenant
+    tid = get_tenant()
     events = tracer.recent(limit=limit, run_id=run_id, type_=type)
+    # 按租户过滤:保留当前租户的事件
+    if tid and tid != "default":
+        events = [e for e in events if e.get("tenant_id") == tid or not e.get("tenant_id")]
     return {"total": len(events), "events": events}
 
 

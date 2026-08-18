@@ -228,7 +228,8 @@ class TaskManager:
             delay = max(0.0, float(settings.agent_task_retry_delay or 0))
             last_err = ""
             for attempt in range(max_retries + 1):
-                if self._cancel_flags[task_id].is_set():
+                cancel_flag = self._cancel_flags.get(task_id)
+                if cancel_flag and cancel_flag.is_set():
                     rec.status = "cancelled"
                     rec.error = "任务已被用户取消"
                     break
@@ -246,6 +247,9 @@ class TaskManager:
                     rec.error = (
                         f"任务运行超过 {settings.agent_task_max_minutes} 分钟上限,已终止"
                     )
+                    break
+                except asyncio.CancelledError:
+                    # 已被 _drive 标记为 cancelled,直接跳出重试循环
                     break
                 except Exception as e:  # noqa: BLE001
                     last_err = str(e)
@@ -277,6 +281,8 @@ class TaskManager:
             await self._emit(task_id, {"type": "task_done", "task_id": task_id,
                                        "status": rec.status, "answer": rec.answer})
             await self._drain(task_id)
+            # 清理任务资源,防止内存泄漏
+            self.cleanup_task(task_id)
 
     async def _drive(self, task_id: str) -> None:
         rec = self.get(task_id)
@@ -297,22 +303,49 @@ class TaskManager:
             session_id=rec.session_id,
             mode=rec.mode,
         )
+        # 注入取消标志(asyncio.Event),支持 LLM-call 级中断
+        cancel_event = self._cancel_flags.get(task_id)
+        if cancel_event is not None:
+            agent._cancel_flag = cancel_event
         history = rec.history if rec.use_history else []
         total = 0
-        async for event in agent.run_stream(rec.message, history=history):
-            if self._cancel_flags[task_id].is_set():
-                rec.status = "cancelled"
-                rec.error = "任务已被用户取消"
-                break
-            total += 1
-            await self._emit(task_id, event)
-            if event.get("type") == "tool":
-                rec.steps.append(event)
-            if event.get("type") == "done":
-                rec.steps = event.get("steps", rec.steps)
-                rec.model = event.get("model", rec.model)
-            if total > 5000:  # 兜底防刷屏
-                break
+        # A8: token 预算硬控制
+        max_tokens = int(getattr(settings, "agent_task_max_tokens", 0) or 0)
+        consumed_tokens = 0
+        prev_total_tokens = 0  # 记录上一轮的累计值,计算增量
+        try:
+            async for event in agent.run_stream(rec.message, history=history):
+                cancel_flag = self._cancel_flags.get(task_id)
+                if cancel_flag is not None and cancel_flag.is_set():
+                    rec.status = "cancelled"
+                    rec.error = "任务已被用户取消"
+                    break
+                total += 1
+                # 累计本次 run_stream 过程中产生的 token 用量(增量模式,避免重复累加)
+                if getattr(llm, "last_usage", None):
+                    cur_total = int(llm.last_usage.get("total_tokens", 0) or 0)
+                    delta = max(0, cur_total - prev_total_tokens)
+                    prev_total_tokens = cur_total
+                    consumed_tokens += delta
+                    if max_tokens > 0 and consumed_tokens >= max_tokens:
+                        rec.status = "failed"
+                        rec.error = f"任务消耗 token({consumed_tokens}) 超过上限({max_tokens}),已终止"
+                        await self._emit(task_id, {"type": "error", "message": rec.error})
+                        break
+                await self._emit(task_id, event)
+                if event.get("type") == "tool":
+                    rec.steps.append(event)
+                if event.get("type") == "done":
+                    rec.steps = event.get("steps", rec.steps)
+                    rec.model = event.get("model", rec.model)
+                if total > 5000:  # 兜底防刷屏
+                    break
+        except asyncio.CancelledError:
+            rec.status = "cancelled"
+            rec.error = "任务已被用户取消(LLM-call 级中断)"
+        except Exception as e:  # noqa: BLE001
+            rec.error = str(e)[:500]
+            rec.status = "failed"
         if rec.status == "running":
             rec.status = "done"
         rec.answer = next((s.get("content", "") for s in reversed(rec.steps)
@@ -327,6 +360,15 @@ class TaskManager:
                 await store.add_message(rec.session_id, "user", f"[后台任务] {rec.message}")
                 if rec.answer:
                     await store.add_message(rec.session_id, "assistant", rec.answer)
+        except Exception:  # noqa: BLE001
+            pass
+
+        # 异步发送 Webhook(不阻塞任务完成)
+        try:
+            from app.core.webhook import notify_task_done
+            import asyncio as _asyncio
+
+            _asyncio.create_task(notify_task_done(task_id=task_id, status=rec.status, answer=rec.answer))
         except Exception:  # noqa: BLE001
             pass
 
@@ -371,6 +413,14 @@ class TaskManager:
             return False
         self._cancel_flags[task_id].set()
         return True
+
+    def cleanup_task(self, task_id: str) -> None:
+        """清理任务相关资源(取消标志、队列),防止内存泄漏。"""
+        with self._lock:
+            self._cancel_flags.pop(task_id, None)
+            self._queues.pop(task_id, None)
+            # 同时清理内存中的任务记录,防止长时间运行积累
+            self._tasks.pop(task_id, None)
 
 
 _task_manager: Optional[TaskManager] = None

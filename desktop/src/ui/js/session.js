@@ -216,6 +216,7 @@ App.Session.clearCurrent = async function () {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     App.els.messages.innerHTML = '';
     App._planCard = null;
+    if (App._currentGroup) { App._currentGroup.wrap.remove(); App._currentGroup = null; }
     if (App.Attach) App.Attach.reset();
     if (App.CtxMeter) App.CtxMeter.refresh();
     App.Session.renderList();
@@ -228,8 +229,17 @@ App.Session.clearCurrent = async function () {
 App.Session.select = async function (id) {
   if (id === App.sessionId) return;
   if (App.streaming) App.Chat.stop(true);
+  // 切换会话时关闭当前分组,丢弃未完成的操作记录
+  if (App._currentGroup) {
+    const g = App._currentGroup;
+    g.head.innerHTML = `<span class="rg-pulse">📂</span><span class="rg-label">已切换会话(取消)</span>`;
+    g.wrap.classList.add('req-group-done');
+    App._currentGroup = null;
+  }
   App.sessionId = id;
   App.Session.saveSessionId(id);
+  // 切换会话时清空计划卡片引用,避免复用旧会话的 DOM
+  App._planCard = null;
   document.querySelectorAll('#sessionList .session-item').forEach((el) => {
     el.classList.toggle('active', el.dataset.id === id);
   });
@@ -239,11 +249,51 @@ App.Session.select = async function (id) {
     const res = await App.api(`/v1/chat/history?session_id=${encodeURIComponent(id)}`);
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
+    // 批量构建 HTML 再一次性插入,避免每条消息都触发 DOM append + scroll
+    const fragments = [];
     let lastPlanContent = '';
     for (const m of data.messages || []) {
-      if (m.role === 'user') { App.appendMessage(m.content, 'user'); continue; }
-      if (m.role === 'assistant') { App.appendMessage(m.content, 'bot'); continue; }
-      if (m.role === 'error') { App.appendMessage(m.content, 'error'); continue; }
+      if (m.role === 'user') {
+        const div = document.createElement('div');
+        div.className = 'msg user';
+        const avatar = document.createElement('div');
+        avatar.className = 'avatar';
+        avatar.textContent = '我';
+        const body = document.createElement('div');
+        body.className = 'msg-body';
+        const bubble = document.createElement('div');
+        bubble.className = 'bubble';
+        bubble.textContent = m.content || '';
+        body.appendChild(bubble);
+        div.appendChild(avatar);
+        div.appendChild(body);
+        fragments.push(div);
+        continue;
+      }
+      if (m.role === 'assistant') {
+        const div = document.createElement('div');
+        div.className = 'msg bot';
+        const avatar = document.createElement('div');
+        avatar.className = 'avatar';
+        avatar.textContent = 'AI';
+        const body = document.createElement('div');
+        body.className = 'msg-body';
+        const bubble = document.createElement('div');
+        bubble.className = 'bubble';
+        bubble.innerHTML = App.renderMarkdown(m.content || '');
+        body.appendChild(bubble);
+        div.appendChild(avatar);
+        div.appendChild(body);
+        fragments.push(div);
+        continue;
+      }
+      if (m.role === 'error') {
+        const div = document.createElement('div');
+        div.className = 'msg error';
+        div.textContent = m.content || '';
+        fragments.push(div);
+        continue;
+      }
       if (m.role === 'plan') {
         try {
           const plan = JSON.parse(m.content);
@@ -261,6 +311,13 @@ App.Session.select = async function (id) {
         continue;
       }
     }
+    // 批量插入,只触发一次重排
+    const fragment = document.createDocumentFragment();
+    for (const el of fragments) fragment.appendChild(el);
+    msgs.appendChild(fragment);
+    msgs.scrollTop = msgs.scrollHeight;
+    // 确保欢迎页隐藏
+    document.body.classList.add('has-messages');
     let title = '会话';
     const item = document.querySelector(`#sessionList .session-item[data-id="${CSS.escape(id)}"]`);
     if (item && item.dataset.title) {
@@ -280,6 +337,11 @@ App.Session.select = async function (id) {
 
 App.Session.newSession = async function () {
   if (App.streaming) App.Chat.stop(true);
+  // 清除当前分组状态
+  if (App._currentGroup) {
+    App._currentGroup.wrap.remove();
+    App._currentGroup = null;
+  }
   App.sessionId = 'desktop-' + Date.now().toString(36);
   App.Session.saveSessionId(App.sessionId);
   App.els.sessionLabel.textContent = '新会话';
@@ -291,6 +353,35 @@ App.Session.newSession = async function () {
   App.Session.renderList();
   if (App.Attach) App.Attach.reset();
   if (App.CtxMeter) App.CtxMeter.refresh();
+};
+
+/* 根据第一条用户消息自动生成会话标题(本地截取,无网络请求) */
+App.Session.autoTitleFromMessage = function (text) {
+  const t = String(text || '')
+    .replace(/\r?\n/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/[?？!！:：;；]/g, ' ')
+    .slice(0, 28);
+  return t || '新会话';
+};
+
+/* 流结束后自动重命名当前会话(异步,不阻塞) */
+App.Session.autoRename = async function (userText) {
+  if (!userText || !App.sessionId) return;
+  try {
+    const title = App.Session.autoTitleFromMessage(userText);
+    if (title === '新会话') return; // 跳过空内容
+    await App.api('/v1/chat/rename', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: App.sessionId, title }),
+    });
+    // 更新会话列表显示
+    const item = document.querySelector(`#sessionList .session-item[data-id="${CSS.escape(App.sessionId)}"]`);
+    if (item) { item.dataset.title = title; const t = item.querySelector('.s-title'); if (t) t.textContent = title; }
+    App.els.sessionLabel.textContent = title;
+  } catch (_) { /* 忽略命名失败,不影响体验 */ }
 };
 
 App.Session.toggleCollapse = function () {

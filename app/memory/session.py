@@ -1,7 +1,7 @@
-"""会话记忆:基于 SQLite 的持久化会话历史,重启不丢失。
+"""会话记忆:基于存储后端的持久化会话历史,重启不丢失。
 
 接口与内存版一致(get_or_create / add_message / get_history / clear)。
-生产环境可替换为 Redis,接口保持一致。
+支持 SQLite / Redis / PostgreSQL 后端切换。
 """
 from __future__ import annotations
 
@@ -13,94 +13,113 @@ import time
 from typing import Optional
 
 from app.config import settings
+from app.core.storage_backend import StorageBackend, get_storage_backend
 
 # 单条消息 {"role": "user"/"assistant", "content": str, ...}
 _DB_LOCK = threading.Lock()
 
 
 class SessionStore:
-    """SQLite 会话存储,按 session_id 隔离,含历史容量限制。"""
+    """会话存储,按 session_id 隔离,含历史容量限制。"""
 
-    def __init__(self, db_path: Optional[str] = None, max_messages: int = 60):
-        self._db_path = db_path or os.path.join(settings.resolved_data_dir, "sessions.db")
+    def __init__(self, db_path: Optional[str] = None, max_messages: int = 60, backend: Optional[StorageBackend] = None):
+        """初始化 SessionStore
+        
+        Args:
+            db_path: 数据库路径（SQLite 模式）
+            max_messages: 最大消息数
+            backend: 存储后端实例，优先使用
+        """
+        if backend:
+            self._backend = backend
+            self._db_path = None
+        else:
+            self._db_path = db_path or os.path.join(settings.resolved_data_dir, "sessions.db")
+            self._backend = get_storage_backend(db_path=self._db_path)
+        
         self._max_messages = max_messages
         self._lock = asyncio.Lock()
         self._init_db()
 
-    def _connect(self):
-        import sqlite3
-
-        conn = sqlite3.connect(self._db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
-
     def _init_db(self) -> None:
         with _DB_LOCK:
-            conn = self._connect()
-            try:
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS sessions (
-                        id TEXT PRIMARY KEY,
-                        messages TEXT NOT NULL,
-                        created_at REAL NOT NULL,
-                        updated_at REAL NOT NULL
-                    )
-                    """
-                )
-                # 迁移: 旧库补充 title 列(自定义会话名,空 = 未命名)
-                cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
-                if "title" not in cols:
-                    conn.execute("ALTER TABLE sessions ADD COLUMN title TEXT")
-                conn.commit()
-            finally:
-                conn.close()
+            schema = {
+                "sessions": [
+                    {"name": "id", "type": "TEXT", "constraints": "PRIMARY KEY"},
+                    {"name": "tenant_id", "type": "TEXT", "constraints": "NOT NULL DEFAULT 'default'"},
+                    {"name": "messages", "type": "TEXT", "constraints": "NOT NULL"},
+                    {"name": "created_at", "type": "REAL", "constraints": "NOT NULL"},
+                    {"name": "updated_at", "type": "REAL", "constraints": "NOT NULL"},
+                    {"name": "title", "type": "TEXT", "constraints": ""},
+                ],
+            }
+            self._backend.init_db(schema)
+            # 迁移:为旧数据库补填 tenant_id 列
+            self._migrate_add_tenant_column()
 
-    async def get_or_create(self, session_id: str):
+    def _migrate_add_tenant_column(self) -> None:
+        """迁移:为旧表补加 tenant_id 列(如果不存在)。"""
+        try:
+            self._backend.execute(
+                "ALTER TABLE sessions ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'"
+            )
+        except Exception:
+            pass  # 列已存在
+
+    async def get_or_create(self, session_id: str, tenant_id: Optional[str] = None):
+        from app.core.tenant_context import get_tenant
+        tid = tenant_id or get_tenant() or "default"
         now = time.time()
         with _DB_LOCK:
-            conn = self._connect()
-            try:
-                row = conn.execute(
-                    "SELECT messages, created_at, updated_at FROM sessions WHERE id=?", (session_id,)
-                ).fetchone()
-                if row is None:
-                    conn.execute(
-                        "INSERT INTO sessions (id, messages, created_at, updated_at) VALUES (?,?,?,?)",
-                        (session_id, json.dumps([]), now, now),
-                    )
-                    conn.commit()
-                    messages = []
-                    created = now
-                else:
-                    messages = json.loads(row["messages"])
-                    created = row["created_at"]
-            finally:
-                conn.close()
+            rows = self._backend.select(
+                "sessions",
+                "id = ? AND tenant_id = ?",
+                (session_id, tid),
+                limit=1
+            )
+            if not rows:
+                self._backend.insert(
+                    "sessions",
+                    {
+                        "id": session_id,
+                        "tenant_id": tid,
+                        "messages": json.dumps([]),
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                )
+                messages = []
+                created = now
+            else:
+                row = rows[0]
+                messages = json.loads(row["messages"])
+                created = row["created_at"]
         return {
             "id": session_id,
+            "tenant_id": tid,
             "messages": messages,
             "created_at": created,
             "updated_at": now,
         }
 
-    async def add_message(self, session_id: str, role: str, content: str):
-        session = await self.get_or_create(session_id)
+    async def add_message(self, session_id: str, role: str, content: str, tenant_id: Optional[str] = None):
+        session = await self.get_or_create(session_id, tenant_id)
         messages = list(session["messages"])
         messages.append({"role": role, "content": content})
         if len(messages) > self._max_messages:
             messages = messages[-self._max_messages:]
         now = time.time()
+        tid = tenant_id or session.get("tenant_id", "default")
         with _DB_LOCK:
-            conn = self._connect()
-            try:
-                conn.execute(
-                    "UPDATE sessions SET messages=?, updated_at=? WHERE id=?",
-                    (json.dumps(messages, ensure_ascii=False), now, session_id),
-                )
-                conn.commit()
-            finally:
-                conn.close()
+            self._backend.update(
+                "sessions",
+                {
+                    "messages": json.dumps(messages, ensure_ascii=False),
+                    "updated_at": now,
+                },
+                "id = ? AND tenant_id = ?",
+                (session_id, tid)
+            )
         return session
 
     async def get_history(self, session_id: str, last_n: Optional[int] = None) -> list[dict]:
@@ -112,12 +131,7 @@ class SessionStore:
 
     async def clear(self, session_id: str) -> None:
         with _DB_LOCK:
-            conn = self._connect()
-            try:
-                conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
-                conn.commit()
-            finally:
-                conn.close()
+            self._backend.delete("sessions", "id = ?", (session_id,))
 
     async def search(self, q: str, limit: int = 20) -> list[dict]:
         """在全部会话消息中做大小写不敏感全文检索,返回命中片段。"""
@@ -125,23 +139,22 @@ class SessionStore:
         if not q:
             return []
         low_q = q.lower()
-        sessions = []
+        
         with _DB_LOCK:
-            conn = self._connect()
-            try:
-                rows = conn.execute(
-                    "SELECT id, messages, created_at, updated_at, title FROM sessions "
-                    "ORDER BY updated_at DESC LIMIT 500"
-                ).fetchall()
-            finally:
-                conn.close()
+            rows = self._backend.select(
+                "sessions",
+                "1 = 1",
+                order_by="updated_at DESC",
+                limit=500
+            )
+        
         out: list[dict] = []
         for row in rows:
             try:
                 msgs = json.loads(row["messages"])
             except Exception:  # noqa: BLE001
                 continue
-            custom = (row["title"] or "").strip()
+            custom = (row.get("title") or "").strip()
             title = custom
             snippets: list[dict] = []
             for i, m in enumerate(msgs):
@@ -173,32 +186,30 @@ class SessionStore:
         """设置会话自定义名称(空串表示清除自定义名,回到自动标题)。"""
         await self.get_or_create(session_id)
         with _DB_LOCK:
-            conn = self._connect()
-            try:
-                conn.execute(
-                    "UPDATE sessions SET title=?, updated_at=? WHERE id=?",
-                    (title.strip(), time.time(), session_id),
-                )
-                conn.commit()
-            finally:
-                conn.close()
+            self._backend.update(
+                "sessions",
+                {
+                    "title": title.strip(),
+                    "updated_at": time.time(),
+                },
+                "id = ?",
+                (session_id,)
+            )
 
     async def list_sessions(self, limit: int = 200) -> list[dict]:
         """列出所有会话(含标题、消息数、更新时间),按最近更新倒序。"""
         with _DB_LOCK:
-            conn = self._connect()
-            try:
-                rows = conn.execute(
-                    "SELECT id, messages, created_at, updated_at, title FROM sessions "
-                    "ORDER BY updated_at DESC LIMIT ?",
-                    (limit,),
-                ).fetchall()
-            finally:
-                conn.close()
+            rows = self._backend.select(
+                "sessions",
+                "1 = 1",
+                order_by="updated_at DESC",
+                limit=limit
+            )
+        
         out: list[dict] = []
         for row in rows:
             msgs = json.loads(row["messages"])
-            custom = (row["title"] or "").strip()
+            custom = (row.get("title") or "").strip()
             auto = ""
             for m in msgs:
                 if m.get("role") == "user" and m.get("content"):
@@ -216,7 +227,7 @@ class SessionStore:
 
 
 def _select_session_store():
-    """按配置选择会话存储实现(SQLite 或 Redis),导入时求值一次。"""
+    """按配置选择会话存储实现,导入时求值一次。"""
     try:  # noqa: PLW0129
         from app.core.storage import get_session_backend
 
@@ -236,12 +247,7 @@ _runtime_store = None
 
 
 def get_session_store():
-    """运行时选择可用后端(Redis 可用则缓存,否则回退 SQLite singleton)。
-
-    与模块导入时求值的 session_store 相比:
-    - Redis 在进程启动后才就绪时,此函数仍能在首次调用时选中 Redis;
-    - 选中后缓存客户端(带连接池),避免每个请求重建。
-    """
+    """运行时选择可用后端(Redis 可用则缓存,否则回退 SQLite singleton)。"""
     global _runtime_store
     if _runtime_store is not None:
         return _runtime_store

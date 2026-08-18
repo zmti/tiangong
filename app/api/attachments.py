@@ -1,11 +1,27 @@
 """附件接口:上传 / 列出 / 删除 当前会话的本地文件(供聊天注入上下文)。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+import os
 
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse
+
+from app.config import settings
 from app.memory.attachments import attachment_store
 
 router = APIRouter(prefix="/v1/attachments", tags=["attachments"])
+
+
+@router.get("/images/{att_id}")
+async def get_image(att_id: str) -> FileResponse:
+    """返回已保存图片文件(供 server_url 模式使用)。"""
+    img_dir = os.path.join(settings.resolved_data_dir, "images")
+    # 只允许文件名中不含路径分隔符
+    safe_name = os.path.basename(att_id)
+    path = os.path.join(img_dir, safe_name)
+    if not os.path.isfile(path):
+        raise HTTPException(status_code=404, detail="图片不存在")
+    return FileResponse(path)
 
 
 @router.post("")

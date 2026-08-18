@@ -23,71 +23,79 @@ from typing import Optional
 from app.config import settings
 from app.rag.embeddings import _keyword_tokens
 from app.rag.store import cosine_similarity
+from app.core.storage_backend import StorageBackend, get_storage_backend
 
 # 向量分与关键词分的权重(混合打分)
 VEC_WEIGHT = 0.75
 KW_WEIGHT = 0.25
 # 无关键词命中时,纯向量匹配的最低余弦阈值(过滤哈希嵌入噪声;
 # API 嵌入下真正相关文本的余弦通常 >0.4)
-MIN_VEC_SCORE = 0.2
+# 可通过 settings.rag_min_relevance 覆盖
+_MIN_VEC_SCORE = float(getattr(settings, "rag_min_relevance", 0.3))
+MIN_VEC_SCORE = max(0.0, min(1.0, _MIN_VEC_SCORE))
+# 混合打分后的最低总分数阈值(低于此值不注入上下文)
+MIN_TOTAL_SCORE = float(getattr(settings, "rag_multi_min_relevance", 0.0))
 
 _DB_LOCK = threading.RLock()  # RLock: 构造器内部会再次获取同一把锁(非重入锁会死锁)
 _instance = None
 
 
 class MemoryStore:
-    def __init__(self, db_path: Optional[str] = None):
-        self._db_path = db_path or os.path.join(settings.resolved_data_dir, "memory.db")
+    def __init__(self, db_path: Optional[str] = None, backend: Optional[StorageBackend] = None):
+        """初始化 MemoryStore
+        
+        Args:
+            db_path: 数据库路径（SQLite 模式）
+            backend: 存储后端实例，优先使用
+        """
+        if backend:
+            self._backend = backend
+            self._db_path = None
+        else:
+            self._db_path = db_path or os.path.join(settings.resolved_data_dir, "memory.db")
+            self._backend = get_storage_backend(db_path=self._db_path)
+        
         self._lock = threading.Lock()
-        self._mem_conn = None  # 仅用于 :memory:
         self._init_db()
-
-    def _connect(self):
-        import sqlite3
-
-        if self._db_path == ":memory:":
-            if self._mem_conn is None:
-                # 工具经 asyncio.to_thread 在子线程执行,共享连接需允许跨线程使用;
-                # 并发安全由 self._lock 保证
-                self._mem_conn = sqlite3.connect(":memory:", check_same_thread=False)
-                self._mem_conn.row_factory = sqlite3.Row
-            return self._mem_conn
-        conn = sqlite3.connect(self._db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def _close(self, conn) -> None:
-        if self._db_path != ":memory:":
-            conn.close()
 
     def _init_db(self) -> None:
         with _DB_LOCK:
-            conn = self._connect()
-            try:
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS memories (
-                        id TEXT PRIMARY KEY,
-                        scope TEXT NOT NULL DEFAULT 'global',
-                        session_id TEXT,
-                        content TEXT NOT NULL,
-                        keywords TEXT,
-                        source TEXT DEFAULT 'manual',
-                        hit_count INTEGER DEFAULT 0,
-                        created_at REAL NOT NULL,
-                        updated_at REAL NOT NULL
-                    )
-                    """
-                )
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope)"
-                )
-                cols = [r[1] for r in conn.execute("PRAGMA table_info(memories)").fetchall()]
-                if "vector" not in cols:
-                    conn.execute("ALTER TABLE memories ADD COLUMN vector TEXT")
-                conn.commit()
-            finally:
-                self._close(conn)
+            schema = {
+                "memories": [
+                    {"name": "id", "type": "TEXT", "constraints": "PRIMARY KEY"},
+                    {"name": "tenant_id", "type": "TEXT", "constraints": "NOT NULL DEFAULT 'default'"},
+                    {"name": "scope", "type": "TEXT", "constraints": "NOT NULL DEFAULT 'global'"},
+                    {"name": "session_id", "type": "TEXT", "constraints": ""},
+                    {"name": "content", "type": "TEXT", "constraints": "NOT NULL"},
+                    {"name": "keywords", "type": "TEXT", "constraints": ""},
+                    {"name": "source", "type": "TEXT", "constraints": "DEFAULT 'manual'"},
+                    {"name": "hit_count", "type": "INTEGER", "constraints": "DEFAULT 0"},
+                    {"name": "created_at", "type": "REAL", "constraints": "NOT NULL"},
+                    {"name": "updated_at", "type": "REAL", "constraints": "NOT NULL"},
+                    {"name": "vector", "type": "TEXT", "constraints": ""},
+                ],
+            }
+            self._backend.init_db(schema)
+            # 迁移:为旧数据库补填 tenant_id 列和索引
+            self._migrate_add_tenant_column()
+            self._backend.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope)"
+            )
+            self._backend.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_tenant ON memories(tenant_id)"
+            )
+            self._backend.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memories_tenant_scope ON memories(tenant_id, scope)"
+            )
+
+    def _migrate_add_tenant_column(self) -> None:
+        """迁移:为旧表补加 tenant_id 列(如果不存在)。"""
+        try:
+            self._backend.execute(
+                "ALTER TABLE memories ADD COLUMN tenant_id TEXT NOT NULL DEFAULT 'default'"
+            )
+        except Exception:
+            pass  # 列已存在
 
     def save(
         self,
@@ -97,13 +105,16 @@ class MemoryStore:
         session_id: Optional[str] = None,
         source: str = "manual",
         memory_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> dict:
         """保存一条记忆。返回记录 dict。"""
+        from app.core.tenant_context import get_tenant
         content = (content or "").strip()
         if not content:
             return {"error": "记忆内容不能为空"}
         mid = memory_id or uuid.uuid4().hex
         now = time.time()
+        tid = tenant_id or get_tenant() or "default"
         kw = [k for k in (keywords or []) if str(k).strip()]
         vec = None
         try:
@@ -112,32 +123,32 @@ class MemoryStore:
             vec = run_embed(get_embedder(), [content])[0]
         except Exception:  # noqa: BLE001 嵌入失败不影响记忆保存
             vec = None
+
         with self._lock:
-            conn = self._connect()
-            try:
-                conn.execute(
-                    """
-                    INSERT OR REPLACE INTO memories
-                    (id, scope, session_id, content, keywords, source, created_at, updated_at, vector)
-                    VALUES (?,?,?,?,?,?,?,?,?)
-                    """,
-                    (mid, scope, session_id, content, json.dumps(kw, ensure_ascii=False), source, now, now,
-                     json.dumps(vec) if vec is not None else None),
-                )
-                conn.commit()
-            finally:
-                self._close(conn)
+            self._backend.upsert(
+                "memories",
+                {
+                    "id": mid,
+                    "tenant_id": tid,
+                    "scope": scope,
+                    "session_id": session_id,
+                    "content": content,
+                    "keywords": json.dumps(kw, ensure_ascii=False),
+                    "source": source,
+                    "created_at": now,
+                    "updated_at": now,
+                    "vector": json.dumps(vec) if vec is not None else None,
+                },
+                conflict_columns=["id"]
+            )
         return {"id": mid, "scope": scope, "content": content, "keywords": kw}
 
-    def delete(self, memory_id: str) -> bool:
+    def delete(self, memory_id: str, tenant_id: Optional[str] = None) -> bool:
+        from app.core.tenant_context import get_tenant
+        tid = tenant_id or get_tenant() or "default"
         with self._lock:
-            conn = self._connect()
-            try:
-                cur = conn.execute("DELETE FROM memories WHERE id=?", (memory_id,))
-                conn.commit()
-                return cur.rowcount > 0
-            finally:
-                self._close(conn)
+            self._backend.delete("memories", "id = ? AND tenant_id = ?", (memory_id, tid))
+            return True
 
     def update(
         self,
@@ -158,83 +169,65 @@ class MemoryStore:
             vec = run_embed(get_embedder(), [new_content])[0]
         except Exception:  # noqa: BLE001 嵌入失败不影响更新
             vec = None
+        
         with self._lock:
-            conn = self._connect()
-            try:
-                conn.execute(
-                    "UPDATE memories SET content=?, keywords=?, vector=?, updated_at=? WHERE id=?",
-                    (
-                        new_content.strip(),
-                        json.dumps(new_kw, ensure_ascii=False),
-                        json.dumps(vec) if vec is not None else None,
-                        time.time(),
-                        memory_id,
-                    ),
-                )
-                conn.commit()
-            finally:
-                self._close(conn)
+            self._backend.update(
+                "memories",
+                {
+                    "content": new_content.strip(),
+                    "keywords": json.dumps(new_kw, ensure_ascii=False),
+                    "vector": json.dumps(vec) if vec is not None else None,
+                    "updated_at": time.time(),
+                },
+                "id = ?",
+                (memory_id,)
+            )
         return self.get(memory_id)
 
     def get(self, memory_id: str) -> Optional[dict]:
         with self._lock:
-            conn = self._connect()
-            try:
-                row = conn.execute(
-                    "SELECT * FROM memories WHERE id=?", (memory_id,)
-                ).fetchone()
-            finally:
-                self._close(conn)
-        return self._row_to_dict(row) if row else None
+            rows = self._backend.select("memories", "id = ?", (memory_id,), limit=1)
+        return self._row_to_dict(rows[0]) if rows else None
 
     def _get_row(self, memory_id: str):
         with self._lock:
-            conn = self._connect()
-            try:
-                row = conn.execute(
-                    "SELECT * FROM memories WHERE id=?", (memory_id,)
-                ).fetchone()
-            finally:
-                self._close(conn)
-        return row
+            rows = self._backend.select("memories", "id = ?", (memory_id,), limit=1)
+        return rows[0] if rows else None
 
     def clear(self) -> int:
         with self._lock:
-            conn = self._connect()
-            try:
-                cur = conn.execute("DELETE FROM memories")
-                conn.commit()
-                return cur.rowcount
-            finally:
-                self._close(conn)
+            self._backend.delete("memories", "1 = 1")
+            return 1
 
-    def list(self, limit: int = 50, scope: Optional[str] = None) -> list[dict]:
-        sql = "SELECT * FROM memories"
-        params: list = []
+    def list(self, limit: int = 50, scope: Optional[str] = None, tenant_id: Optional[str] = None) -> list[dict]:
+        from app.core.tenant_context import get_tenant
+        tid = tenant_id or get_tenant() or "default"
+        conditions = ["tenant_id = ?"]
+        params: list = [tid]
         if scope:
-            sql += " WHERE scope=?"
+            conditions.append("scope = ?")
             params.append(scope)
-        sql += " ORDER BY updated_at DESC LIMIT ?"
-        params.append(limit)
+        where = " AND ".join(conditions)
         with self._lock:
-            conn = self._connect()
-            try:
-                rows = conn.execute(sql, params).fetchall()
-            finally:
-                self._close(conn)
+            rows = self._backend.select(
+                "memories",
+                where,
+                tuple(params),
+                order_by="updated_at DESC",
+                limit=limit
+            )
         return [self._row_to_dict(r) for r in rows]
 
     def stats(self) -> dict:
+        from app.core.tenant_context import get_tenant
+        tid = get_tenant() or "default"
         with self._lock:
-            conn = self._connect()
-            try:
-                total = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
-                manual = conn.execute("SELECT COUNT(*) FROM memories WHERE source='manual'").fetchone()[0]
-                auto = conn.execute("SELECT COUNT(*) FROM memories WHERE source='auto'").fetchone()[0]
-                hits = conn.execute("SELECT SUM(hit_count) FROM memories").fetchone()[0] or 0
-            finally:
-                self._close(conn)
-        return {"total": total, "manual": manual, "auto": auto, "hits": hits}
+            total = self._backend.count("memories", "tenant_id = ?", (tid,))
+            manual = self._backend.count("memories", "tenant_id = ? AND source = 'manual'", (tid,))
+            auto = self._backend.count("memories", "tenant_id = ? AND source = 'auto'", (tid,))
+            rows = self._backend.select("memories", "tenant_id = ?", (tid,))
+            hits = sum(r.get("hit_count", 0) for r in rows)
+        return {"total": total, "manual": manual, "auto": auto, "hits": hits, "tenant_id": tid}
 
     def search(
         self,
@@ -243,27 +236,66 @@ class MemoryStore:
         scope: Optional[str] = None,
         session_id: Optional[str] = None,
         count_hit: bool = False,
+        tenant_id: Optional[str] = None,
     ) -> list[dict]:
-        """混合检索:向量余弦相似度 + 关键词覆盖率。
+        """混合检索:向量余弦相似度 + 关键词覆盖率。"""
+        # 同步版本:直接调用内部实现
+        return self._search_sync(query, top_k, scope, session_id, count_hit, tenant_id)
 
-        默认只检索 global 作用域;显式传 scope="session" 才检索会话级记忆。
-        count_hit=True 时对被命中的记忆增加 hit_count(用于统计常用记忆)。
-        历史遗留无向量的记忆回退关键词打分,并在此处懒补嵌入。
+    async def search_async(
+        self,
+        query: str,
+        top_k: int = 5,
+        scope: Optional[str] = None,
+        session_id: Optional[str] = None,
+        count_hit: bool = False,
+        tenant_id: Optional[str] = None,
+    ) -> list[dict]:
+        """异步混合检索:向量余弦相似度 + 关键词覆盖率。
+
+        与 search() 逻辑一致,但嵌入计算走 asyncio 事件循环,
+        适合在 async 上下文中调用以避免线程池开销。
         """
+        import asyncio
+        # 嵌入计算可能在运行中的事件循环里,用 run_in_executor 确保不阻塞
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._search_sync(query, top_k, scope, session_id, count_hit, tenant_id),
+        )
+
+    def _search_sync(
+        self,
+        query: str,
+        top_k: int,
+        scope: Optional[str],
+        session_id: Optional[str],
+        count_hit: bool,
+        tenant_id: Optional[str],
+    ) -> list[dict]:
+        """搜索内部实现(同步)。"""
+        from app.core.tenant_context import get_tenant
         if scope is None:
             scope = "global"
-        sql = "SELECT * FROM memories WHERE scope=?"
-        params: list = [scope]
+        tid = tenant_id or get_tenant() or "default"
+
+        conditions = ["tenant_id = ?", "scope = ?"]
+        params: list = [tid, scope]
         if scope == "session" and session_id:
-            sql += " AND session_id=?"
+            conditions.append("session_id = ?")
             params.append(session_id)
-        sql += " ORDER BY updated_at DESC LIMIT 200"
+
+        where = " AND ".join(conditions)
+        
         with self._lock:
-            conn = self._connect()
-            try:
-                rows = conn.execute(sql, params).fetchall()
-            finally:
-                self._close(conn)
+            rows = self._backend.select(
+                "memories",
+                where,
+                tuple(params),
+                order_by="updated_at DESC",
+                limit=200
+            )
+        
         mems = [self._row_to_dict(r, with_vector=True) for r in rows]
         if not mems:
             return []
@@ -299,9 +331,13 @@ class MemoryStore:
                 score = kw_score
             else:
                 continue
+            # 过滤低于总分数阈值的候选
+            if score < MIN_TOTAL_SCORE:
+                continue
             scored.append((score, mem))
-            if q_vec is not None and vec is None and len(backfill) < 10:
+            if q_vec is not None and vec is None and len(backfill) < 20:
                 backfill.append((mem, mem["id"]))
+        
         if backfill:
             try:
                 from app.rag.embeddings import get_embedder, run_embed
@@ -312,10 +348,14 @@ class MemoryStore:
                     mem["vector"] = v
             except Exception:  # noqa: BLE001 补嵌入失败不影响本次检索
                 pass
+        
         scored.sort(key=lambda x: x[0], reverse=True)
         result = []
         for score, mem in scored[:top_k]:
             result.append({**mem, "vector": None, "relevance": round(score, 4)})
+        # 可选:对结果做二次重排(RRF融合)
+        if getattr(settings, "rerank_mode", "rrf") == "rrf" and len(result) > 1:
+            result = _rerank_rrf(result, query)
         if count_hit and result:
             self._hit([m["id"] for m in result])
         return result
@@ -323,30 +363,40 @@ class MemoryStore:
     def _set_vector(self, memory_id: str, vector: list[float]) -> None:
         """为记忆写入向量(懒补嵌入用)。"""
         with self._lock:
-            conn = self._connect()
-            try:
-                conn.execute(
-                    "UPDATE memories SET vector=? WHERE id=?",
-                    (json.dumps(vector), memory_id),
-                )
-                conn.commit()
-            finally:
-                self._close(conn)
+            self._backend.update(
+                "memories",
+                {"vector": json.dumps(vector)},
+                "id = ?",
+                (memory_id,)
+            )
 
     def _hit(self, memory_ids: list[str]) -> None:
         """命中计数(用于统计哪个记忆常被使用)。"""
         if not memory_ids:
             return
         with self._lock:
-            conn = self._connect()
-            try:
-                conn.executemany(
-                    "UPDATE memories SET hit_count = hit_count + 1 WHERE id=?",
-                    [(i,) for i in memory_ids],
-                )
-                conn.commit()
-            finally:
-                self._close(conn)
+            # SQLite 特殊语法，需要手动处理
+            if hasattr(self._backend, '_db_path'):
+                conn = self._backend.connect()
+                try:
+                    conn.executemany(
+                        "UPDATE memories SET hit_count = hit_count + 1 WHERE id=?",
+                        [(i,) for i in memory_ids],
+                    )
+                    conn.commit()
+                finally:
+                    self._backend.close(conn)
+            else:
+                # 其他后端逐个更新
+                for mid in memory_ids:
+                    row = self._get_row(mid)
+                    if row:
+                        self._backend.update(
+                            "memories",
+                            {"hit_count": row.get("hit_count", 0) + 1},
+                            "id = ?",
+                            (mid,)
+                        )
 
     @staticmethod
     def _row_to_dict(row, with_vector: bool = False) -> dict:
@@ -366,6 +416,38 @@ class MemoryStore:
         return d
 
 
+def _rerank_rrf(candidates: list[dict], query: str, k: int = 60) -> list[dict]:
+    """Reciprocal Rank Fusion 二次重排:融合向量排名与关键词排名。
+
+    对同一组候选分别按向量分数和关键词重叠度计算 RRF 分,
+    取加权融合后重新排序,提升 top-k 精度。
+    """
+    if len(candidates) <= 1:
+        return candidates
+    # 向量分已存在于 candidate["relevance"]
+    vec_scores = {m["id"]: m["relevance"] for m in candidates}
+    # 关键词分(基于查询 token 重叠)
+    q_tokens = set(_keyword_tokens(query or ""))
+    kw_scores: dict[str, float] = {}
+    for m in candidates:
+        mem_tokens = set(m.get("keywords", [])) | set(_keyword_tokens(m.get("content", "")))
+        if q_tokens and mem_tokens:
+            overlap = len(q_tokens & mem_tokens)
+            kw_scores[m["id"]] = overlap / max(1, len(q_tokens))
+        else:
+            kw_scores[m["id"]] = 0.0
+    # RRF 融合
+    rrf_scores: dict[str, float] = {}
+    for m in candidates:
+        mid = m["id"]
+        vec_rank = sum(1 for v in vec_scores.values() if v > vec_scores[mid]) + 1
+        kw_rank = sum(1 for v in kw_scores.values() if v > kw_scores[mid]) + 1
+        rrf_scores[mid] = (1.0 / (k + vec_rank) + 1.0 / (k + kw_rank))
+    # 按 RRF 分重排
+    candidates.sort(key=lambda m: rrf_scores.get(m["id"], 0), reverse=True)
+    return candidates
+
+
 def get_memory_store() -> MemoryStore:
     """单例。"""
     global _instance
@@ -374,3 +456,10 @@ def get_memory_store() -> MemoryStore:
             if _instance is None:
                 _instance = MemoryStore()
     return _instance
+
+
+def run_decay_cleanup(dry_run: bool = False, scope: Optional[str] = None) -> dict:
+    """执行一次记忆衰退清理(供 API 调用)。"""
+    from app.memory.decay import run_decay_cleanup as _inner
+    store = get_memory_store()
+    return _inner(store, scope=scope, dry_run=dry_run)

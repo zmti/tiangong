@@ -32,18 +32,30 @@ _current_run_id: contextvars.ContextVar[str] = contextvars.ContextVar("agent_run
 # 常见模型 token 单价(美元/千 token),用于成本估算;未知模型记 0
 TOKEN_PRICES = {
     "deepseek-chat": {"prompt": 0.00027, "completion": 0.0011},
+    "deepseek-r1": {"prompt": 0.00055, "completion": 0.00219},
     "qwen-plus": {"prompt": 0.0008, "completion": 0.002},
     "qwen3.7-flash": {"prompt": 0.0002, "completion": 0.0006},
     "gpt-4o-mini": {"prompt": 0.00015, "completion": 0.0006},
+    "gpt-4o": {"prompt": 0.0025, "completion": 0.01},
+    "claude-3.5-sonnet": {"prompt": 0.003, "completion": 0.015},
 }
 
 
 def estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
-    """按常见模型单价估算成本(美元);未知模型返回 0。"""
+    """按真实 usage + 静态价格估算成本(美元)。
+
+    优先从模型名匹配已知价格表;未知模型使用默认兜底价格(0.001/千 token)。
+    缓存命中 token 会减少实际计费,此处按 50% 折扣估算。
+    """
     price = TOKEN_PRICES.get((model or "").lower())
     if not price:
-        return 0.0
-    return (prompt_tokens * price["prompt"] + completion_tokens * price["completion"]) / 1000.0
+        # 未知模型使用通用估算价格
+        default_rate = 0.001  # $/千 token
+        return (prompt_tokens + completion_tokens) * default_rate / 1000.0
+    # 缓存命中 token 通常享受 50% 折扣
+    cache_hit = int(prompt_tokens * 0.5)  # 简化估算:50% 命中视为折扣
+    effective_prompt = prompt_tokens - cache_hit
+    return (effective_prompt * price["prompt"] + completion_tokens * price["completion"]) / 1000.0
 
 
 class Tracer:

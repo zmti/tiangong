@@ -216,6 +216,22 @@ def get_registry() -> ToolRegistry:
         from app.tools import git_tool  # noqa: F401  # 注册 git 工具集
         from app.tools import code_search_tool  # noqa: F401  # 注册代码库理解工具
         from app.tools import delegation_tool  # noqa: F401  # 注册子智能体委派工具
+        from app.tools import file_watcher_tool  # noqa: F401  # 注册文件监听工具
+        from app.tools import feedback_tool  # noqa: F401  # 注册用户反馈工具
+        from app.tools import lsp_tool  # noqa: F401  # 注册 LSP 工具(悬停/定义/引用)
+        from app.tools import build_tool  # noqa: F401  # 注册构建感知工具
+        from app.tools import git_pr_tool  # noqa: F401  # 注册 Git PR 工作流工具
+        from app.tools import code_review_tool  # noqa: F401  # 注册代码审阅工具
+        from app.tools import debug_assist_tool  # noqa: F401  # 注册调试辅助工具
+        from app.tools import dependency_tool  # noqa: F401  # 注册依赖管理工具
+        from app.tools import project_tool  # noqa: F401  # 注册项目管理工具(scaffold/analyze/testgen/docs/build)
+        from app.tools import code_file  # noqa: F401  # 注册结构化代码编辑工具(read_file/edit_file/apply_patch/check_syntax)
+        from app.tools import cost_tool  # noqa: F401  # 注册成本追踪工具(cost_summary/cost_report)
+        from app.tools import image_ocr  # noqa: F401  # 注册图片 OCR 工具(image_ocr/screenshot_ocr)
+        from app.tools import search_tool  # noqa: F401  # 注册实时搜索工具(web_search/news_search)
+        from app.tools import multimodal_tool  # noqa: F401  # 注册增强多模态工具(analyze_image_v2/transcribe_audio/synthesize_speech/cross_modal_reason)
+        from app.tools import document_tool  # noqa: F401  # 注册文档深度解析工具(parse_document/document_summary)
+        from app.tools import computer_use  # noqa: F401  # 注册 Computer Use 视觉驾驶工具
         from app.agents import handoff_tool  # noqa: F401  # 注册角色委派/团队工具(list_roles/handoff_to_role)
         from app.rag import documents  # noqa: F401  # 注册 rag_search 工具
 
