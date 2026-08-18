@@ -520,7 +520,12 @@
     App.Settings.saveCriticFromUI();
   });
   App.els.criticModelSelect?.addEventListener('change', () => App.Settings.saveCriticFromUI());
-  // 可视化 ensemble 列表
+  // 可视化 ensemble 列表: 提供商变化时同步加载模型
+  App.els.ensembleProvSelect?.addEventListener('change', () => {
+    const pid = App.els.ensembleProvSelect.value;
+    App.els.ensembleModelSelect.innerHTML = '<option value="">选择模型</option>';
+    if (pid) App.Settings.loadModels(pid, App.els.ensembleModelSelect);
+  });
   App.els.ensembleAddBtn?.addEventListener('click', () => {
     const p = App.els.ensembleProvSelect?.value || '';
     const m = App.els.ensembleModelSelect?.value || '';
@@ -657,10 +662,10 @@
     App.Prompts.render();
     loadProviders();
     loadModePrefs();
-    // 初始化协作模式可视化选择器
-    App.Settings.loadProviders();
-    App.Settings.restoreCritic();
-    App.Settings.restoreEnsemble();
+    // 初始化协作模式可视化选择器（await 保证顺序）
+    await App.Settings.loadProviders();
+    await App.Settings.restoreCritic();
+    await App.Settings.restoreEnsemble();
     await App.Session.restoreLast(ids);
     if (App.CtxMeter) App.CtxMeter.refresh();
   }
@@ -703,9 +708,9 @@
         await loadAllData();
       } else if (okNow && App._dataLoaded) {
         // 后端恢复后刷新协作模式选择器
-        App.Settings.loadProviders();
-        App.Settings.restoreCritic();
-        App.Settings.restoreEnsemble();
+        await App.Settings.loadProviders();
+        await App.Settings.restoreCritic();
+        await App.Settings.restoreEnsemble();
       }
     }, 30000);
   }

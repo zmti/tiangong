@@ -95,20 +95,43 @@ App.Settings.loadModels = async function (providerId, selectEl) {
   }
 };
 
+// 等待 provider 下拉填充完成（轮询，最多 3s）
+function _waitForProviders(selectEl, timeoutMs) {
+  return new Promise((resolve) => {
+    if (!selectEl) { resolve(); return; }
+    const check = () => {
+      const opts = selectEl.querySelectorAll('option');
+      if (opts.length > 1) { resolve(); return; }
+    };
+    check();
+    const poll = setInterval(check, 200);
+    setTimeout(() => { clearInterval(poll); resolve(); }, timeoutMs || 3000);
+  });
+}
+
 // 恢复 critic 选择器的已保存值
-App.Settings.restoreCritic = function () {
+App.Settings.restoreCritic = async function () {
+  await _waitForProviders(App.els.criticProviderSelect, 3000);
   const saved = localStorage.getItem('agent_critic') || '';
   const { provider, model } = _parseProviderModel(saved);
   if (App.els.criticProviderSelect) App.els.criticProviderSelect.value = provider;
-  if (App.els.criticModelSelect) App.els.criticModelSelect.value = model;
-  if (provider) App.Settings.loadModels(provider, App.els.criticModelSelect);
+  if (provider && App.els.criticModelSelect) {
+    App.els.criticModelSelect.value = '';
+    await App.Settings.loadModels(provider, App.els.criticModelSelect);
+    if (App.els.criticModelSelect.querySelector(`option[value="${model}"]`)) {
+      App.els.criticModelSelect.value = model;
+    }
+  }
+  App.Settings.saveCriticFromUI();
 };
 
 // 恢复 ensemble 列表的已保存值
-App.Settings.restoreEnsemble = function () {
+App.Settings.restoreEnsemble = async function () {
+  await _waitForProviders(App.els.ensembleProvSelect, 3000);
   const saved = localStorage.getItem('agent_ensemble') || '';
   const items = saved.split(',').map((s) => s.trim()).filter(Boolean);
   App.Settings.renderEnsembleList(items);
+  App.Settings.saveEnsembleFromUI();
 };
 
 // 渲染 ensemble 模型列表 UI
