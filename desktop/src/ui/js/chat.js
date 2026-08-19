@@ -195,14 +195,14 @@ App.Chat.doSend = async function (text, opts = {}) {
 
     function scheduleRender() {
       if (renderTimer !== null) return;
-      renderTimer = setTimeout(() => {
+      renderTimer = requestAnimationFrame(() => {
         renderTimer = null;
         if (answerDiv) {
           // 流式渲染：使用简化模式，避免重复解析
           answerDiv.textContent = mdBuf;
           App.els.messages.scrollTop = App.els.messages.scrollHeight;
         }
-      }, 16);
+      });
     }
 
     while (true) {

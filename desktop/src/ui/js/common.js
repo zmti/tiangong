@@ -500,7 +500,7 @@ function copyCodeFromButton(btn) {
 function makeAvatar(type) {
   const a = document.createElement('div');
   a.className = 'avatar';
-  a.textContent = type === 'user' ? '我' : 'AI';
+  a.textContent = type === 'user' ? '👤' : '🤖';
   return a;
 }
 

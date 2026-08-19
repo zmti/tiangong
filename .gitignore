@@ -28,7 +28,7 @@ logs/
 */dist/*
 */build/*
 *dist*
-*build*
+# *build*
 */node_modules/*
 */node_modules/*
 .*
