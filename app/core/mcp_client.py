@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from typing import Any, Optional
 
 import httpx
@@ -243,13 +244,16 @@ class MCPManager:
 
 # 全局 MCP 管理器
 _mcp_manager: Optional[MCPManager] = None
+_mcp_manager_lock = threading.Lock()
 
 
 def get_mcp_manager() -> MCPManager:
     """获取全局 MCP 管理器。"""
     global _mcp_manager
     if _mcp_manager is None:
-        _mcp_manager = MCPManager()
+        with _mcp_manager_lock:
+            if _mcp_manager is None:
+                _mcp_manager = MCPManager()
     return _mcp_manager
 
 

@@ -13,6 +13,7 @@ import asyncio
 import inspect
 import json
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
@@ -348,7 +349,7 @@ def register_builtin_skills(registry: SkillRegistry) -> None:
 
 
 _skill_registry: Optional[SkillRegistry] = None
-_skill_lock = __import__("threading").Lock()
+_skill_lock = threading.Lock()
 
 
 def get_skill_registry() -> SkillRegistry:

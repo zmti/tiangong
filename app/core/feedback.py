@@ -427,13 +427,16 @@ Feedback闭环 = FeedbackManager
 
 # 单例
 _feedback_manager: Optional[FeedbackManager] = None
+_feedback_lock = threading.Lock()
 
 
 def get_feedback_manager() -> FeedbackManager:
     """获取反馈管理器单例"""
     global _feedback_manager
     if _feedback_manager is None:
-        _feedback_manager = FeedbackManager()
+        with _feedback_lock:
+            if _feedback_manager is None:
+                _feedback_manager = FeedbackManager()
     return _feedback_manager
 
 

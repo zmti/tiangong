@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -361,10 +362,13 @@ class LongRunningTaskManager:
 
 # 模块级单例
 _manager: Optional[LongRunningTaskManager] = None
+_manager_lock = threading.Lock()
 
 
 def get_long_running_manager() -> LongRunningTaskManager:
     global _manager
     if _manager is None:
-        _manager = LongRunningTaskManager()
+        with _manager_lock:
+            if _manager is None:
+                _manager = LongRunningTaskManager()
     return _manager

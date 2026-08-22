@@ -1,5 +1,5 @@
 const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, globalShortcut, nativeImage, desktopCapturer, screen } = require('electron');
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
@@ -76,6 +76,12 @@ function getBackendExecutable() {
   for (const c of candidates) {
     if (fs.existsSync(c)) return c;
   }
+  // 未找到:记录全部候选路径,便于定位是哪份副本缺后端
+  const list = candidates.map((c) => `  - ${c}`).join('\n');
+  console.error(`未找到后端 agent-backend.exe,请先打包 Python 后端。已检查:\n${list}`);
+  try {
+    dialog.showErrorBox('未找到后端程序', `以下路径均不存在 agent-backend.exe:\n${list}\n\n请确认启动的是完整发行目录(win-unpacked / AgentDesktop-v*),或运行 build_app.ps1 重新打包。`);
+  } catch (_) { /* app.ready 之前无 dialog */ }
   return null;
 }
 
@@ -86,6 +92,39 @@ async function checkHealthFast() {
   } catch (_) {
     return false;
   }
+}
+
+// 端口上有服务,且是带 version 标识的新版(无 version = 旧版残留,不可复用)
+async function isCompatibleBackend() {
+  try {
+    const res = await fetch(`${BACKEND_URL}/health`, { signal: AbortSignal.timeout(1500) });
+    if (!res.ok) return false;
+    const data = await res.json();
+    return Boolean(data && data.version);
+  } catch (_) {
+    return false;
+  }
+}
+
+// 清掉所有残留的 agent-backend.exe(上次未退干净/其他副本遗留的旧版进程)
+function killStaleBackends() {
+  try {
+    execFileSync('taskkill', ['/IM', 'agent-backend.exe', '/F'], {
+      windowsHide: true,
+      stdio: 'ignore',
+    });
+    console.log('[backend] 已清理残留的 agent-backend.exe');
+  } catch (_) { /* 没有残留进程 */ }
+}
+
+// 等待端口释放(进程被杀后 TIME_WAIT/句柄释放需要片刻)
+async function waitForPortFree(timeoutMs = 8000) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (!(await checkHealthFast())) return true;
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  return false;
 }
 
 function startBackend() {
@@ -279,9 +318,15 @@ app.whenReady().then(async () => {
   // 窗口先行加载 UI, 后端并行启动
   createWindow();
 
-  // 已有一个可用后端(上次退出未清理/多开)则直接复用, 避免端口冲突
+  // 端口已有可用后端时:新版(带 version)直接复用;旧版残留则清掉换成当前资源目录里的版本
   const alreadyUp = await checkHealthFast();
-  if (!alreadyUp) {
+  if (alreadyUp && (await isCompatibleBackend())) {
+    console.log('[backend] 检测到兼容后端已在运行,直接复用');
+  } else {
+    if (alreadyUp) {
+      killStaleBackends();
+      await waitForPortFree();
+    }
     const started = startBackend();
     if (!started) {
       dialog.showErrorBox('启动失败', '未找到后端程序,请重新安装或运行 build.bat 构建');

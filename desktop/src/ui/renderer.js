@@ -7,18 +7,11 @@
     input: $('input'),
     sendBtn: $('sendBtn'),
     stopBtn: $('stopBtn'),
-    providerSelect: $('providerSelect'),
-    modelSelect: $('modelSelect'),
+    modelPickerBtn: $('modelPickerBtn'),
+    modelPopover: $('modelPopover'),
     modeSelect: $('modeSelect'),
-    criticModelInput: $('criticModelInput'),
-    ensembleModelsInput: $('ensembleModelsInput'),
-    // 可视化协作模式选择器
-    criticProviderSelect: $('criticProviderSelect'),
-    criticModelSelect: $('criticModelSelect'),
-    ensembleList: $('ensembleList'),
-    ensembleProvSelect: $('ensembleProvSelect'),
-    ensembleModelSelect: $('ensembleModelSelect'),
-    ensembleAddBtn: $('ensembleAddBtn'),
+    modeBadge: $('modeBadge'),
+    modePopover: $('modePopover'),
     imageBtn: $('imageBtn'),
     imageInput: $('imageInput'),
     shotBtn: $('shotBtn'),
@@ -103,11 +96,19 @@
     document.body.classList.add('side-open');
     currentView = view;
     // 懒加载:进入面板时刷新数据
+    if (view === 'session' || view === 'chat') {
+      // 切换到会话相关面板时刷新列表（含 collapse 状态变化）
+      if (App.Session) App.Session.renderList();
+    }
     if (view === 'memory' && App.Memory) App.Memory.refresh();
     if (view === 'runs' && App.Runs) App.Runs.load();
     if (view === 'telemetry' && App.Telemetry) App.Telemetry.load();
     if (view === 'schedule' && App.Schedule) App.Schedule.load();
     if (view === 'prompts' && App.Prompts) App.Prompts.render();
+    if (view === 'settings' && App.Settings) {
+      App.Settings.refreshBackend();
+      if (App.Settings.renderProviderAdmin) App.Settings.renderProviderAdmin();
+    }
   }
 
   function closePanel() {
@@ -224,7 +225,16 @@
   /* 代码块复制按钮(事件委托) */
   App.els.messages.addEventListener('click', (e) => {
     const btn = e.target.closest('.code-copy');
-    if (btn) App.copyCodeFromButton(btn);
+    if (btn) { App.copyCodeFromButton(btn); return; }
+    const fold = e.target.closest('.code-fold-toggle');
+    if (fold) {
+      const block = fold.closest('.code-block');
+      if (!block) return;
+      const collapsed = block.classList.toggle('collapsed');
+      fold.textContent = collapsed
+        ? `⤵ 展开全部 ${block.querySelectorAll('.code-body pre code')[0].textContent.split('\n').length} 行`
+        : '⤴ 收起';
+    }
   });
 
   /* ---------- 输入区自适应:自动增高 + 空内容禁用发送 ---------- */
@@ -424,6 +434,34 @@
   App.els.themeBtn.addEventListener('click', () => App.Settings.toggleTheme());
   App.els.themeToggle.addEventListener('click', () => App.Settings.toggleTheme());
 
+  /* ---------- 执行面板切换 ---------- */
+  const toggleSidePanelBtn = document.getElementById('toggleSidePanel');
+  const execPanelCloseBtn = document.getElementById('execPanelClose');
+  if (toggleSidePanelBtn) {
+    toggleSidePanelBtn.addEventListener('click', () => {
+      document.body.classList.toggle('exec-panel-open');
+      toggleSidePanelBtn.textContent = document.body.classList.contains('exec-panel-open') ? '⚡ 隐藏' : '⚡ 执行';
+    });
+  }
+  if (execPanelCloseBtn) {
+    execPanelCloseBtn.addEventListener('click', () => {
+      document.body.classList.remove('exec-panel-open');
+      if (toggleSidePanelBtn) toggleSidePanelBtn.textContent = '⚡ 执行';
+    });
+  }
+
+  // 执行面板标签切换
+  document.querySelectorAll('.exec-tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.exec-tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.exec-tab-content').forEach(c => c.classList.remove('active'));
+      tab.classList.add('active');
+      const target = tab.dataset.tab;
+      const content = document.getElementById(target + 'Tab');
+      if (content) content.classList.add('active');
+    });
+  });
+
   /* ---------- 灯箱 ---------- */
   App.els.lbClose.addEventListener('click', () => App.closeLb());
   App.els.lbDownload.addEventListener('click', () => App.downloadLb());
@@ -439,136 +477,10 @@
   App.els.messages.addEventListener('error', (e) => {
     if (e.target && e.target.tagName === 'IMG') e.target.style.display = 'none';
   }, true);
-
-  /* ---------- 模型 Provider ---------- */
-  async function loadProviders() {
-    try {
-      const res = await App.api('/v1/providers');
-      if (!res.ok) return;
-      const data = await res.json();
-      App.els.providerSelect.innerHTML = '';
-      (data.providers || []).forEach((p) => {
-        const opt = document.createElement('option');
-        opt.value = p.id;
-        opt.textContent = p.name + (p.configured ? '' : ' (未配置)');
-        opt.disabled = !p.configured;
-        App.els.providerSelect.appendChild(opt);
-      });
-      if (data.default) App.els.providerSelect.value = data.default;
-      // Load models for default provider
-      if (data.default) {
-        await loadModels(data.default);
-      }
-      // Add change listener for provider selection
-      App.els.providerSelect.onchange = async (e) => {
-        await loadModels(e.target.value);
-      };
-    } catch (_) { /* 忽略 */ }
-  }
-  /* ---------- 加载模型列表 ---------- */
-  async function loadModels(providerId) {
-    if (!providerId) {
-      App.els.modelSelect.innerHTML = '<option value="">请先选择提供商</option>';
-      return;
-    }
-    try {
-      const res = await App.api('/v1/models?provider=' + encodeURIComponent(providerId));
-      if (!res.ok) {
-        App.els.modelSelect.innerHTML = '<option value="">加载失败</option>';
-        return;
-      }
-      const data = await res.json();
-      App.els.modelSelect.innerHTML = '';
-      if (!data.models || data.models.length === 0) {
-        const opt = document.createElement('option');
-        opt.value = data.default_model || '';
-        opt.textContent = data.default_model ? data.default_model + ' (默认)' : '无可用模型';
-        App.els.modelSelect.appendChild(opt);
-      } else {
-        data.models.forEach((m) => {
-          const opt = document.createElement('option');
-          opt.value = m.id;
-          opt.textContent = m.name + (m.speed ? ' [' + m.speed + ']' : '');
-          opt.title = (m.quality || '') + (m.speed ? ' | Speed: ' + m.speed : '');
-          if (m.id === data.default_model) opt.selected = true;
-          App.els.modelSelect.appendChild(opt);
-        });
-      }
-      App._modelsData = data;
-    } catch (_) {
-      App.els.modelSelect.innerHTML = '<option value="">加载失败</option>';
-    }
-  }
+  /* ---------- 协作模式(单一状态源 + 就地配置,见 js/mode.js) ---------- */
+  // App.Mode.init() 在 loadAllData 中调用(provider/model 数据就绪后)
 
 
-  /* ---------- 协作模式 / 评审 / 多模型清单(本地持久化) ---------- */
-  function loadModePrefs() {
-    try {
-      App.els.modeSelect.value = localStorage.getItem('agent_mode') || 'auto';
-    } catch (_) { /* 忽略 */ }
-  }
-  function saveModePrefs() {
-    try {
-      localStorage.setItem('agent_mode', App.els.modeSelect.value);
-    } catch (_) { /* 忽略 */ }
-  }
-  App.els.modeSelect.addEventListener('change', saveModePrefs);
-  // 可视化 critic 选择器
-  App.els.criticProviderSelect?.addEventListener('change', () => {
-    const pid = App.els.criticProviderSelect.value;
-    App.Settings.loadModels(pid, App.els.criticModelSelect);
-    App.Settings.saveCriticFromUI();
-  });
-  App.els.criticModelSelect?.addEventListener('change', () => App.Settings.saveCriticFromUI());
-  // 可视化 ensemble 列表: 提供商变化时同步加载模型
-  App.els.ensembleProvSelect?.addEventListener('change', () => {
-    const pid = App.els.ensembleProvSelect.value;
-    App.els.ensembleModelSelect.innerHTML = '<option value="">选择模型</option>';
-    if (pid) App.Settings.loadModels(pid, App.els.ensembleModelSelect);
-  });
-  App.els.ensembleAddBtn?.addEventListener('click', () => {
-    const p = App.els.ensembleProvSelect?.value || '';
-    const m = App.els.ensembleModelSelect?.value || '';
-    if (!p || !m) { App.toast('请先选择提供商和模型', 'err'); return; }
-    // 最多 3 个
-    const currentCount = App.els.ensembleList?.querySelectorAll('.ensemble-item').length || 0;
-    if (currentCount >= 3) { App.toast('最多添加 3 个模型', 'err'); return; }
-    const item = document.createElement('div');
-    item.className = 'ensemble-item';
-    const provSel = document.createElement('select');
-    provSel.className = 'set-select set-select-sm ens-prov';
-    provSel.innerHTML = '<option value="">提供商</option>';
-    (App.els.ensembleProvSelect?.options || []).forEach((opt) => {
-      if (opt.value) { const o = opt.cloneNode(); provSel.appendChild(o); }
-    });
-    const modSel = document.createElement('select');
-    modSel.className = 'set-select set-select-sm ens-model';
-    modSel.innerHTML = '<option value="">选择模型</option>';
-    const countBadge = document.createElement('span');
-    countBadge.className = 'ens-count';
-    countBadge.textContent = `#${currentCount + 1}`;
-    const rmBtn = document.createElement('button');
-    rmBtn.className = 'ens-remove';
-    rmBtn.textContent = '×';
-    rmBtn.title = '移除此模型';
-    rmBtn.addEventListener('click', () => { item.remove(); App.Settings.saveEnsembleFromUI(); });
-    item.appendChild(provSel);
-    item.appendChild(modSel);
-    item.appendChild(countBadge);
-    item.appendChild(rmBtn);
-    App.els.ensembleList.appendChild(item);
-    provSel.value = p;
-    modSel.value = m;
-    provSel.addEventListener('change', () => {
-      const pid = provSel.value;
-      modSel.innerHTML = '<option value="">选择模型</option>';
-      if (pid) App.Settings.loadModels(pid, modSel);
-      App.Settings.saveEnsembleFromUI();
-    });
-    modSel.addEventListener('change', () => { App.Settings.saveEnsembleFromUI(); });
-    App.Settings.loadModels(p, modSel);
-    App.Settings.saveEnsembleFromUI();
-  });
 
   /* ---------- 后端地址解析 ---------- */
   async function resolveBackendUrl() {
@@ -655,19 +567,21 @@
 
   async function loadAllData() {
     App._dataLoaded = true;
-    const ids = (await App.Session.renderList()) || [];
-    App.KB.refresh();
-    App.Tools.load();
-    App.Todo.load();
-    App.Prompts.render();
-    loadProviders();
-    loadModePrefs();
-    // 初始化协作模式可视化选择器（await 保证顺序）
-    await App.Settings.loadProviders();
-    await App.Settings.restoreCritic();
-    await App.Settings.restoreEnsemble();
-    await App.Session.restoreLast(ids);
-    if (App.CtxMeter) App.CtxMeter.refresh();
+    // 各步骤相互隔离:单点异常不再中断后续组件初始化(避免"部分组件不显示")
+    const safe = async (label, fn) => {
+      try { return await fn(); } catch (e) { console.error(`[init] ${label} 失败:`, e); }
+    };
+    const ids = (await safe('renderList', () => App.Session.renderList())) || [];
+    safe('KB', () => App.KB.refresh());
+    safe('Tools', () => App.Tools.load());
+    safe('Todo', () => App.Todo.load());
+    safe('Prompts', () => App.Prompts.render());
+    // 先加载 provider/model 数据,再初始化选择器与协作模式(两者 popover 均依赖 provider 缓存)
+    await safe('loadProviders', () => App.Settings.loadProviders());
+    safe('ModelPicker', () => App.ModelPicker.init());
+    safe('Mode', () => App.Mode.init());
+    await safe('restoreLast', () => App.Session.restoreLast(ids));
+    safe('CtxMeter', () => App.CtxMeter.refresh());
   }
 
   async function init() {
@@ -707,10 +621,8 @@
         App._dataLoaded = true;
         await loadAllData();
       } else if (okNow && App._dataLoaded) {
-        // 后端恢复后刷新协作模式选择器
-        await App.Settings.loadProviders();
-        await App.Settings.restoreCritic();
-        await App.Settings.restoreEnsemble();
+        // 后端恢复后刷新 provider（单线程，不重复 restore）
+        if (App.Settings && App.Settings.loadProviders) await App.Settings.loadProviders();
       }
     }, 30000);
   }

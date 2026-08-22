@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import Optional
 
@@ -195,7 +196,7 @@ class SessionBudgetTracker:
 
 
 _budget_tracker: Optional[SessionBudgetTracker] = None
-_budget_lock = __import__("threading").Lock()
+_budget_lock = threading.Lock()
 
 
 def get_budget_tracker(tenant_id: Optional[str] = None) -> SessionBudgetTracker:

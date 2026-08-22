@@ -145,8 +145,7 @@ class MCPStdioClient:
                 self._tools_cache.clear()
             else:
                 consecutive_failures += 1
-                import logging
-                logging.getLogger(__name__).warning(
+                logger.warning(
                     "MCP Stdio 重连失败 (%d/%d): %s",
                     consecutive_failures, max_failures, result.get("error", "unknown"),
                 )

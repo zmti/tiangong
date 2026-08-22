@@ -255,12 +255,15 @@ class DynamicAgentPool:
 
 # ── 全局实例 ──────────────────────────────────────────────────────
 _pool: Optional[DynamicAgentPool] = None
+_pool_lock = threading.Lock()
 
 
 def get_agent_pool() -> DynamicAgentPool:
     global _pool
     if _pool is None:
-        _pool = DynamicAgentPool()
+        with _pool_lock:
+            if _pool is None:
+                _pool = DynamicAgentPool()
     return _pool
 
 

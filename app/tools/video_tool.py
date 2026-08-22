@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
+import uuid
 
 import httpx
 from pydantic import Field
@@ -24,6 +26,36 @@ def _headers() -> dict:
         "Authorization": f"Bearer {settings.openai_compat_api_key or 'sk-placeholder'}",
         "Content-Type": "application/json",
     }
+
+
+def _videos_dir() -> str:
+    path = os.path.join(settings.resolved_data_dir, "videos")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _save_video(data: bytes) -> str:
+    """保存视频字节到本地,返回相对文件名。"""
+    name = f"{uuid.uuid4().hex}.mp4"
+    with open(os.path.join(_videos_dir(), name), "wb") as f:
+        f.write(data)
+    return name
+
+
+def _video_url(name: str) -> str:
+    """拼本地静态 URL,供前端实时展示与历史回放直接访问。"""
+    host = settings.agent_host
+    if not host or host in ("0.0.0.0", "::", ""):
+        host = "127.0.0.1"
+    return f"http://{host}:{settings.agent_port}/videos/{name}"
+
+
+async def _download_video(url: str, timeout: float = 180) -> bytes:
+    """下载远程视频字节。"""
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream("GET", url) as resp:
+            resp.raise_for_status()
+            return await resp.aread()
 
 
 async def _create_video(prompt: str, width: int, height: int, num_frames: int, frame_rate: int) -> str:
@@ -104,6 +136,25 @@ def generate_video(
         or data.get("file_url")
         or ""
     )
+
+    # 本地兜底:尝试把 mp4 下载到本地 data/videos,经 /videos 静态路由提供,
+    # 避免外部 CDN 不可达导致视频无法播放;下载失败则回退原始远程 URL
+    if video_url:
+        try:
+            raw = asyncio.run(_download_video(video_url))
+            if raw:
+                local_name = _save_video(raw)
+                return {
+                    "format": "local_url",
+                    "duration": duration,
+                    "task_id": task_id,
+                    "video_url": _video_url(local_name),
+                    "remote_url": video_url,
+                    "message": "视频已生成",
+                }
+        except Exception:
+            pass  # 远程不可达/下载失败,回退原始链接
+
     return {
         "format": "url",
         "duration": duration,

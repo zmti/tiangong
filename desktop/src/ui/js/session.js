@@ -1,5 +1,7 @@
 /* 会话模块:列表加载 / 搜索 / 切换 / 新建 / 折叠 */
 App.Session = {};
+/* 会话列表缓存:5s 内不重复请求 */
+App.Session._listCache = { ids: null, ts: 0 };
 
 /* 置顶会话(localStorage 持久化) */
 App.Session.loadPins = function () {
@@ -14,6 +16,8 @@ App.Session.savePins = function (set) {
   try {
     localStorage.setItem('agent_pinned_sessions', JSON.stringify([...set]));
   } catch (_) { /* 忽略 */ }
+  // 会话操作后清缓存,强制下次渲染时重新拉取
+  App.Session._listCache = { ids: null, ts: 0 };
 };
 
 App.Session.togglePin = async function (id) {
@@ -199,6 +203,7 @@ App.Session.remove = async function (id) {
     if (id === App.sessionId) {
       App.Session.newSession();
     } else {
+      App.Session._listCache = { ids: null, ts: 0 };
       App.Session.renderList();
     }
   } catch (e) {
@@ -236,6 +241,16 @@ App.Session.select = async function (id) {
     g.wrap.classList.add('req-group-done');
     App._currentGroup = null;
   }
+  // 切换会话时重置所有状态,避免旧会话数据污染
+  App.clearImageGenerating();
+  App._thinkingWrap = null;
+  App._answerWrap = null;
+  App._mdBuf = '';
+  if (App.ExecTrace) App.ExecTrace.clear();
+  if (App.abortController) {
+    try { App.abortController.abort(); } catch (_) { /* 忽略 */ }
+    App.abortController = null;
+  }
   App.sessionId = id;
   App.Session.saveSessionId(id);
   // 切换会话时清空计划卡片引用,避免复用旧会话的 DOM
@@ -252,6 +267,15 @@ App.Session.select = async function (id) {
     // 批量构建 HTML 再一次性插入,避免每条消息都触发 DOM append + scroll
     const fragments = [];
     let lastPlanContent = '';
+
+    // 预渲染所有 assistant 消息,避免逐条调用 renderMarkdown 导致 O(n*m) 延迟
+    const assistantContents = [];
+    for (const m of data.messages || []) {
+      if (m.role === 'assistant') assistantContents.push(m.content || '');
+    }
+    const renderedAssistant = assistantContents.map((c) => App.renderMarkdown(c));
+
+    let aiIdx = 0;
     for (const m of data.messages || []) {
       if (m.role === 'user') {
         const div = document.createElement('div');
@@ -265,6 +289,30 @@ App.Session.select = async function (id) {
         bubble.className = 'bubble';
         bubble.textContent = m.content || '';
         body.appendChild(bubble);
+
+        // 添加操作按钮(复制、编辑)
+        const act = document.createElement('div');
+        act.className = 'msg-actions';
+        const timeEl = document.createElement('div');
+        timeEl.className = 'msg-time';
+        timeEl.textContent = new Date(m.timestamp || Date.now()).toLocaleTimeString();
+
+        const mkAction = (title, label, fn) => {
+          const b = document.createElement('button');
+          b.className = 'msg-action';
+          b.title = title;
+          b.textContent = label;
+          b.addEventListener('click', fn);
+          act.appendChild(b);
+        };
+        mkAction('复制消息', '复制', () => {
+          const txt = (bubble.textContent || '').trim();
+          if (txt) navigator.clipboard.writeText(txt).catch(() => {});
+        });
+        mkAction('编辑并重发', '编辑', () => { if (App.Chat) App.Chat.editMessage(div, bubble); });
+
+        body.appendChild(act);
+        body.appendChild(timeEl);
         div.appendChild(avatar);
         div.appendChild(body);
         fragments.push(div);
@@ -280,8 +328,37 @@ App.Session.select = async function (id) {
         body.className = 'msg-body';
         const bubble = document.createElement('div');
         bubble.className = 'bubble';
-        bubble.innerHTML = App.renderMarkdown(m.content || '');
+        // 使用预渲染的结果,避免重复 parse
+        bubble.innerHTML = renderedAssistant[aiIdx++] || '';
         body.appendChild(bubble);
+
+        // 添加操作按钮(复制、重新生成)
+        const act = document.createElement('div');
+        act.className = 'msg-actions';
+        const timeEl = document.createElement('div');
+        timeEl.className = 'msg-time';
+        timeEl.textContent = new Date(m.timestamp || Date.now()).toLocaleTimeString();
+
+        const mkAction = (title, label, fn) => {
+          const b = document.createElement('button');
+          b.className = 'msg-action';
+          b.title = title;
+          b.textContent = label;
+          b.addEventListener('click', fn);
+          act.appendChild(b);
+        };
+        mkAction('复制回复', '复制', () => {
+          const txt = (bubble.textContent || '').trim();
+          if (txt) navigator.clipboard.writeText(txt).catch(() => {});
+        });
+        mkAction('重新生成', '重新生成', () => { if (App.Chat) App.Chat.regenerate(div); });
+        mkAction('朗读该回复', '🔊', () => {
+          const txt = (bubble.textContent || '').trim();
+          if (txt) App.speak(txt);
+        });
+
+        body.appendChild(act);
+        body.appendChild(timeEl);
         div.appendChild(avatar);
         div.appendChild(body);
         fragments.push(div);
@@ -299,7 +376,9 @@ App.Session.select = async function (id) {
           const plan = JSON.parse(m.content);
           if (JSON.stringify(plan) !== lastPlanContent) {
             lastPlanContent = JSON.stringify(plan);
-            App.appendPlan({ action: 'create', plan });
+            // 传入 fragments 作为 appendTo,让 appendPlan 把元素加入 fragments 而非直接插入 DOM
+            const p = App.appendPlan({ action: 'create', plan }, fragments);
+            if (p) fragments.push(p);
           }
         } catch (_) { /* 忽略损坏的计划记录 */ }
         continue;
@@ -307,7 +386,11 @@ App.Session.select = async function (id) {
       if (m.role === 'tool') {
         let te = null;
         try { te = JSON.parse(m.content); } catch (_) { te = null; }
-        if (te) App.appendToolEvent(te.name || '工具', te.arguments, te.result || '');
+        if (te) {
+          // 传入 fragments 作为 appendTo,让 appendToolEvent 把元素加入 fragments 而非直接插入 DOM
+          const t = App.appendToolEvent(te.name || '工具', te.arguments, te.result || '', fragments);
+          if (t) fragments.push(t);
+        }
         continue;
       }
     }
@@ -316,8 +399,8 @@ App.Session.select = async function (id) {
     for (const el of fragments) fragment.appendChild(el);
     msgs.appendChild(fragment);
     msgs.scrollTop = msgs.scrollHeight;
-    // 确保欢迎页隐藏
-    document.body.classList.add('has-messages');
+    // 根据 DOM 中的用户消息数量刷新欢迎页显隐
+    App.refreshWelcomePage();
     let title = '会话';
     const item = document.querySelector(`#sessionList .session-item[data-id="${CSS.escape(id)}"]`);
     if (item && item.dataset.title) {
@@ -351,6 +434,8 @@ App.Session.newSession = async function () {
   });
   App.els.input.focus();
   App.Session.renderList();
+  // 清空消息后同步欢迎页显隐(否则残留 has-messages,空会话看不到欢迎页)
+  App.refreshWelcomePage();
   if (App.Attach) App.Attach.reset();
   if (App.CtxMeter) App.CtxMeter.refresh();
 };
@@ -381,6 +466,7 @@ App.Session.autoRename = async function (userText) {
     const item = document.querySelector(`#sessionList .session-item[data-id="${CSS.escape(App.sessionId)}"]`);
     if (item) { item.dataset.title = title; const t = item.querySelector('.s-title'); if (t) t.textContent = title; }
     App.els.sessionLabel.textContent = title;
+    App.Session._listCache = { ids: null, ts: 0 };
   } catch (_) { /* 忽略命名失败,不影响体验 */ }
 };
 

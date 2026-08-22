@@ -1,9 +1,10 @@
 """对话接口:非流式 /v1/chat 与流式 SSE /v1/chat/stream。"""
 from __future__ import annotations
 
+import asyncio
 import json
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Body, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -37,13 +38,16 @@ class ChatRequest(BaseModel):
     stream: bool = Field(False, description="是否流式返回")
     use_history: bool = Field(True, description="是否携带会话历史")
     provider: str | None = Field(None, description="指定模型 provider,默认用配置")
+    model: str | None = Field(None, description="指定模型(留空=该 provider 默认模型)")
     approve_tools: list[str] = Field(default_factory=list, description="本次运行允许执行的危险工具(需开启 AGENT_TOOL_CONFIRM)")
     attachments: list[str] = Field(default_factory=list, description="本次消息携带的附件 ID(已上传到 /v1/attachments)")
-    mode: str = Field("auto", description="协作模式: auto / single / review / ensemble(auto=跟随全局配置)")
+    mode: str = Field("auto", description="协作模式: auto / single / review / ensemble / sequential / hierarchical / consensual")
     critic_provider: str = Field("", description="review/ensemble 模式评审模型 provider(留空=全局配置)")
     critic_model: str = Field("", description="review/ensemble 模式评审模型(留空=该 provider 默认)")
     models: list[str] = Field(default_factory=list, description="ensemble 模式参与模型列表(如 [\"deepseek:deepseek-chat\",\"qwen:qwen-plus\"],留空=全局配置)")
     max_output_tokens: int = Field(0, ge=0, description="输出 token 配额硬控制,0=不限制(超过即截断)")
+    orch_subtasks: int = Field(0, ge=0, description="编排模式(层级/共识/顺序)的子任务数或候选执行体数提示,0=自动")
+    orch_candidates: list[str] = Field(default_factory=list, description="编排模式候选执行体清单(执行模式),如 ['auto','review','ensemble'];空=默认")
 
 
 def _with_attachments(req: ChatRequest, message: str) -> str:
@@ -92,10 +96,99 @@ async def _prepare_attachments(req: ChatRequest, message: str) -> tuple[str, lis
     return prefix + message, parts
 
 
+def _friendly_llm_error(msg: str) -> str:
+    """把常见上游 LLM 报错翻译成用户可操作的中文提示,其余原样返回。"""
+    lowered = (msg or "").lower()
+    if (
+        "does not support image input" in lowered
+        or "not support image" in lowered
+        or "doesn't support image" in lowered
+        or ("cannot read" in lowered and "image" in lowered)
+    ):
+        return "当前使用的模型不支持图片识别。请移除图片附件,或在左下角切换支持视觉的模型(如 qwen-vl)后再试。"
+    if "cannot identify image file" in lowered or "error while loading image" in lowered:
+        return "图片无法被模型读取,请换用清晰的 PNG/JPG 图片后再试。"
+    return msg
+
+
+_VISION_REFUSAL_MARKERS = (
+    "does not support image input",
+    "does not support image",
+    "doesn't support image",
+    "not support image input",
+    "unable to process images",
+    "cannot process images",
+)
+
+
+def _looks_like_vision_refusal(text: str) -> bool:
+    """识别'上游以 200 正常响应返回的不支持视觉说明'。
+
+    部分网关/中转不抛 HTTP 错误,而是把上游错误包装成 assistant 文本
+    (常见残留指令如 'Inform the user.'),导致英文原文被当作答案渲染。
+    """
+    t = (text or "").lower()
+    if not t or "image" not in t:
+        return False
+    if any(m in t for m in _VISION_REFUSAL_MARKERS):
+        return True
+    # 更宽的兜底:'cannot read' 与图片语境同时出现(如 Cannot read "image.png")
+    return "cannot read" in t and ('image.png' in t or 'image_url' in t or 'attachment' in t)
+
+
+async def _stream_with_heartbeat(agent_iter, interval: int = 15):
+    """在 Agent 静默期(长耗时工具调用 / 外部图片生成 API 等)周期性注入 heartbeat 事件。
+
+    前端以"收到任意事件即续期空闲计时器"来判定连接是否存活;若后端在工具调用期间
+    长时间不产出任何 SSE 事件,前端会误判为"响应超时"。heartbeat 让连接保持活跃,
+    且不进入 full_answer / 历史存储。
+
+    实现要点:用一个常驻 producer 任务把 Agent 流完整驱动(整条流处于同一 asyncio
+    Context,保证 run_stream 内的 contextvars token set/reset 在同一上下文完成),
+    事件经队列交给消费协程;消费协程同时等待"队列有事件"或"心跳间隔",二者先到先发。
+    """
+    queue: asyncio.Queue = asyncio.Queue()
+    agen = agent_iter.__aiter__()
+
+    async def _producer():
+        try:
+            async for evt in agen:
+                await queue.put(("evt", evt))
+        except Exception as exc:  # noqa: BLE001
+            await queue.put(("err", exc))
+        finally:
+            await queue.put(("stop", None))
+
+    prod_task = asyncio.ensure_future(_producer())
+    try:
+        while True:
+            get_q = asyncio.ensure_future(queue.get())
+            hb = asyncio.ensure_future(asyncio.sleep(interval))
+            done, _ = await asyncio.wait({get_q, hb}, return_when=asyncio.FIRST_COMPLETED)
+            if get_q in done:
+                hb.cancel()
+                kind, payload = get_q.result()
+                if kind == "stop":
+                    break
+                if kind == "err":
+                    raise payload
+                yield payload
+            else:
+                # 静默达到一个间隔:发心跳(不取消 get_q,事件稍后照常到达)
+                yield {"type": "heartbeat"}
+    finally:
+        prod_task.cancel()
+
+
 def _build_agent(req: ChatRequest) -> Agent:
     registry = get_registry()
     try:
-        llm = LLMClient(req.provider) if req.provider else LLMClient()
+        if req.provider:
+            llm = LLMClient(req.provider, req.model or None)
+        elif req.model:
+            llm = LLMClient(model=req.model)
+        else:
+            llm = LLMClient()
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"模型配置错误: {e}") from e
     return Agent(
@@ -109,53 +202,15 @@ def _build_agent(req: ChatRequest) -> Agent:
         critic_model=req.critic_model,
         ensemble_models=req.models,
         max_output_tokens=req.max_output_tokens,
+        orch_subtasks=req.orch_subtasks,
+        orch_candidates=req.orch_candidates,
     )
 
 
 @router.post("/chat")
-async def chat(req: ChatRequest) -> dict:
-    agent = _build_agent(req)
-    history = []
-    if req.use_history:
-        history = await _store().get_history(req.session_id)
-
-    user_message, mm_parts = await _prepare_attachments(req, req.message)
-    agent.with_multimodal(mm_parts)
-    try:
-        result = await agent.run(user_message, history=history)
-    except LLMError as e:
-        raise HTTPException(status_code=502, detail=str(e)) from e
-
-    if not result.interrupted:
-        await _store().add_message(req.session_id, "user", req.message)
-        for step in result.steps:
-            if step.get("type") == "tool":
-                await _store().add_message(
-                    req.session_id,
-                    "tool",
-                    json.dumps(
-                        {"name": step.get("tool", ""), "arguments": step.get("arguments", ""), "result": step.get("result", "")},
-                        ensure_ascii=False,
-                    ),
-                )
-            elif step.get("type") == "plan":
-                await _store().add_message(
-                    req.session_id,
-                    "plan",
-                    json.dumps(step.get("plan"), ensure_ascii=False),
-                )
-        await _store().add_message(req.session_id, "assistant", result.answer)
-
-    resp = {
-        "answer": result.answer,
-        "session_id": req.session_id,
-        "model": result.model,
-        "steps": result.steps,
-    }
-    if result.interrupted:
-        resp["interrupted"] = True
-        resp["interrupt"] = result.interrupt
-    return resp
+async def chat(req: ChatRequest) -> StreamingResponse:
+    """非流式接口已废弃，统一使用流式输出。"""
+    return await chat_stream(req)
 
 
 class ChatResumeRequest(BaseModel):
@@ -202,8 +257,6 @@ async def chat_resume(req: ChatResumeRequest):
     except RuntimeError as e:
         raise HTTPException(status_code=404, detail=str(e)) from e
     except Exception as e:
-        import logging
-        logging.getLogger("app").error("Resume failed for run_id=%s: %s", req.run_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
     if not result.interrupted:
@@ -251,7 +304,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
         injected_message, mm_parts = await _prepare_attachments(req, req.message)
         agent.with_multimodal(mm_parts)
         try:
-            async for event in agent.run_stream(injected_message, history=history):
+            async for event in _stream_with_heartbeat(agent.run_stream(injected_message, history=history)):
                 if event["type"] == "token":
                     full_answer.append(event["content"])
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
@@ -265,7 +318,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 else:  # done
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
         except LLMError as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'message': _friendly_llm_error(str(e))}, ensure_ascii=False)}\n\n"
             return
         finally:
             await _store().add_message(req.session_id, "user", req.message)
@@ -295,19 +348,16 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
 
 
 @router.post("/stream")
-@router.get("/stream")
 async def stream_alias(
-    message: str = Query(..., description="用户消息"),
-    session_id: str = Query("default", description="会话 ID"),
-    use_history: bool = Query(True, description="是否携带会话历史"),
+    req: ChatRequest = Body(...),
 ) -> StreamingResponse:
-    """SSE 流式接口别名,支持 GET(EventSource 兼容)与 POST。"""
-    return await chat_stream(ChatRequest(
-        message=message,
-        session_id=session_id,
-        use_history=use_history,
-        stream=True,
-    ))
+    """SSE 流式接口(仅 POST)。
+
+    安全说明:旧版 GET 接口会将用户消息放入 URL 查询参数,导致消息内容
+    泄露到服务器访问日志/CDN 日志/浏览器历史。改为 POST 后消息走请求体,
+    不再出现在 URL 日志中。EventSource 客户端需改用 fetch+ReadabilityStream。
+    """
+    return await chat_stream(req)
 
 @router.get("/chat/history")
 async def get_history(session_id: str = Query("default")) -> dict:
@@ -464,11 +514,13 @@ async def vision(
     file: UploadFile = File(...),
     prompt: str = Form("请描述这张图片的内容"),
     session_id: str = Form("default"),
+    provider: str = Form(""),
+    model: str = Form(""),
 ) -> dict:
     """图片识别接口:将图片与文字提示发送给支持视觉的模型。
 
-    当前默认模型(agnes-2.x)不支持视觉输入时会返回明确提示;
-    将来接入 qwen-vl 等视觉模型后,把该请求发给对应 provider 即可。
+    provider/model 由前端传入(左下角模型选择器的当前选择);
+    留空时回退到后端全局配置。
     """
     content = await file.read()
     if len(content) > 20 * 1024 * 1024:
@@ -486,7 +538,8 @@ async def vision(
     try:
         from app.core.llm import LLMClient, LLMError
 
-        llm = LLMClient()
+        # 使用前端选中的模型(与聊天一致);留空回退全局配置
+        llm = LLMClient(provider or None, model or None)
         if not model_supports_vision(llm.info.get("model", "")):
             return {
                 "answer": "",
@@ -502,6 +555,14 @@ async def vision(
             ],
         }]
         answer = await llm.chat(messages)
+        if _looks_like_vision_refusal(answer):
+            # 上游以 200 把"不支持视觉"包装成文本返回,拦截并转成可操作的中文提示
+            return {
+                "answer": "",
+                "error": f"上游模型 {llm.info.get('model', '')} 不支持图片输入。"
+                         "请切换支持视觉的模型(如 qwen-vl、gpt-4o)后再试。",
+                "model": llm.info.get("model", ""),
+            }
         return {"answer": answer, "model": llm.info["model"], "session_id": session_id}
     except LLMError as e:
         msg = str(e)
@@ -526,6 +587,7 @@ async def vision(
         raise
     except Exception as e:  # noqa: BLE001
         return {"answer": "", "error": f"图片识别异常: {e}"}
+
 
 
 @router.post("/audio/transcribe")
@@ -605,6 +667,20 @@ async def list_models(provider: str | None = None) -> dict:
     # 如果指定了 provider，返回该 provider 的模型列表
     if provider:
         provider = provider.lower()
+        if provider.startswith("custom-"):
+            from app.core.provider_registry import get_custom
+
+            entry = get_custom(provider)
+            if entry is None:
+                raise HTTPException(status_code=404, detail=f"自定义提供商不存在: {provider}")
+            models = [
+                {"id": m, "name": m, "speed": "", "quality": ""}
+                for m in entry.get("models", [])
+            ]
+            default = entry.get("model", "")
+            if default and default not in [m["id"] for m in models]:
+                models.insert(0, {"id": default, "name": default, "speed": "", "quality": ""})
+            return {"provider": provider, "configured": True, "models": models}
         if provider in _PROVIDER_DEFAULT_MODELS:
             models = _PROVIDER_DEFAULT_MODELS[provider]
             # 检查是否配置了 API key
@@ -684,6 +760,18 @@ async def list_providers() -> dict:
                     else "gpt-4o-mini"
                 ),
             })
+
+    # 自定义 OpenAI 兼容提供商(设置-模型服务中配置)
+    from app.core.provider_registry import list_custom
+
+    for c in list_custom():
+        providers.append({
+            "id": c["id"],
+            "name": c["name"],
+            "group": "custom",
+            "configured": True,
+            "default_model": c.get("model", ""),
+        })
 
     # 获取当前激活的 provider
     current = settings.agent_llm_provider.lower()

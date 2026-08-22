@@ -98,7 +98,30 @@ class LLMClient:
     # ---- Provider 熔断状态(实例级,避免多会话互相影响) ----
 
     def __init__(self, provider: Optional[str] = None, model: Optional[str] = None):
-        self.provider = PROVIDER_ALIASES.get((provider or settings.agent_llm_provider).lower(), "compat")
+        explicit = (provider or "").strip()
+        raw = (explicit or settings.agent_llm_provider).lower()
+        # 兼容历史整串格式 "provider:model"(旧版前端拼接)
+        if explicit and ":" in raw and raw not in PROVIDER_ALIASES and not raw.startswith("custom-"):
+            head, tail = raw.split(":", 1)
+            if head.lower() in PROVIDER_ALIASES:
+                raw = head.lower()
+                if not model:
+                    model = tail
+        self._custom: Optional[dict] = None
+        if raw.startswith("custom-"):
+            from app.core.provider_registry import get_custom
+
+            self._custom = get_custom(raw)
+        if self._custom:
+            self.provider = raw
+        elif explicit and raw not in PROVIDER_ALIASES:
+            # 显式指定的 provider 无法解析:明确报错,绝不静默换成别的模型
+            raise LLMError(
+                f"所选模型提供商不可用: {explicit}(不存在或已被删除)。"
+                "请重新在左下角选择模型,或在设置-模型服务中检查该提供商。"
+            )
+        else:
+            self.provider = PROVIDER_ALIASES.get(raw, "compat")
         self._model_override = model
         self.client, self.model = self._build()
         self._api_key = self._get_key()
@@ -138,6 +161,8 @@ class LLMClient:
         })
 
     def _get_key(self) -> str:
+        if self._custom:
+            return self._custom.get("api_key", "")
         p = self.provider
         if p == "deepseek":
             return settings.deepseek_api_key
@@ -152,6 +177,11 @@ class LLMClient:
         return settings.openai_compat_api_key
 
     def _build(self) -> tuple[AsyncOpenAI, str]:
+        if self._custom:
+            return AsyncOpenAI(
+                api_key=self._custom.get("api_key") or "sk-placeholder",
+                base_url=self._custom["base_url"],
+            ), self._model_override or self._custom.get("model") or ""
         p = self.provider
         if p == "deepseek":
             return AsyncOpenAI(
@@ -177,6 +207,8 @@ class LLMClient:
         ), self._model_override or settings.openai_compat_model
 
     def _require_key(self) -> None:
+        if self._custom and not self._api_key:
+            raise LLMError(f"自定义提供商「{self._custom.get('name', self.provider)}」未配置 API Key,请在设置-模型服务中填写")
         if self.provider in ("deepseek", "qwen", "openai", "compat") and not self._api_key:
             raise LLMError(f"Provider {self.provider} 未配置 API Key,请在 .env 中设置")
 
@@ -199,6 +231,15 @@ class LLMClient:
 
     def _make_client(self, provider: str, model: str) -> tuple[AsyncOpenAI, str]:
         """按 provider 构造 OpenAI 兼容客户端(供故障转移时重建)。"""
+        if provider.startswith("custom-"):
+            from app.core.provider_registry import get_custom
+
+            entry = get_custom(provider)
+            if entry:
+                return AsyncOpenAI(
+                    api_key=entry.get("api_key") or "sk-placeholder",
+                    base_url=entry["base_url"],
+                ), model or entry.get("model") or ""
         p = provider
         if p == "deepseek":
             return AsyncOpenAI(
@@ -248,6 +289,13 @@ class LLMClient:
                     resp = await fn(client, resolved_model)
                     self._record_success(provider)
                     self.last_usage = self._usage_of(resp)
+                    if idx > 0:
+                        # 故障转移生效:把实例切到实际使用的 provider/model,
+                        # 保证 done.model / trace / info 反映真实模型(粘性切换)
+                        self.provider = provider
+                        self.model = resolved_model
+                        self.client = client
+                        self._api_key = self._get_key()
                     self._trace(kind, t0, self.last_usage, tools_n=tools_n,
                                 **trace_extra)
                     return resp
@@ -334,6 +382,9 @@ class LLMClient:
         if last.get("role") != "user":
             return messages
         content = last.get("content", "")
+        # 多模态内容(content 是 list 时)不注入 CoT 提示
+        if isinstance(content, list):
+            return messages
         if not content or not content.strip():
             return messages
         thinking_suffix = (

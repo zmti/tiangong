@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import os
+import threading
 import time
 from collections import OrderedDict
 from typing import Any, Optional
@@ -77,7 +78,7 @@ class MultiLevelCache:
 
         # LRU 内存缓存: key -> (value, expires_at)
         self._memory: OrderedDict[str, tuple[Any, float]] = OrderedDict()
-        self._lock = __import__("threading").Lock()
+        self._lock = threading.Lock()
 
         # 统计
         self._hits = 0

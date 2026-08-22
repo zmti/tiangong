@@ -75,6 +75,10 @@ def main():
     from app.main import app
 
     sys.path.insert(0, base_dir)
+    sys.path.insert(0, os.path.join(base_dir, '_internal'))
+    # 确保能找到 app 模块(非打包模式需要项目根目录)
+    if not getattr(sys, "frozen", False):
+        sys.path.insert(0, os.path.dirname(os.path.dirname(base_dir)))
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

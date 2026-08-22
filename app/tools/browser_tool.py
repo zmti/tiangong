@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import tempfile
+import threading
 import time
 from typing import Optional
 
@@ -231,15 +232,18 @@ class BrowserSession:
 
 
 _session: Optional[BrowserSession] = None
+_session_lock = threading.Lock()
 
 
 async def _get_session() -> BrowserSession:
     global _session
-    if _session is None or not _session.is_active:
-        _session = BrowserSession()
-        ok = await _session.launch()
-        if not ok:
-            raise RuntimeError("无法启动浏览器,请安装 playwright: pip install playwright && playwright install chromium")
+    with _session_lock:
+        if _session is None or not _session.is_active:
+            _session = BrowserSession()
+            ok = await _session.launch()
+            if not ok:
+                _session = None
+                raise RuntimeError("无法启动浏览器,请安装 playwright: pip install playwright && playwright install chromium")
     return _session
 
 
@@ -343,9 +347,10 @@ async def browser_wait(
 @tool("browser_close", "关闭浏览器", timeout=10)
 async def browser_close() -> dict:
     global _session
-    if _session:
-        await _session.close()
-        _session = None
+    with _session_lock:
+        if _session:
+            await _session.close()
+            _session = None
     return {"status": "ok", "message": "浏览器已关闭"}
 
 

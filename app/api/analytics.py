@@ -122,8 +122,8 @@ async def webhook_status() -> dict:
     try:
         from app.core.webhook import get_webhook_sender
         sender = get_webhook_sender()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Webhook 配置读取失败(不影响接口响应): %s", e)
     return {
         "configured": bool(urls),
         "urls_count": len(urls),

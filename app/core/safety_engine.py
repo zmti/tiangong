@@ -8,6 +8,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+import threading
 from typing import Optional
 
 from app.config import settings
@@ -244,7 +245,7 @@ class SafetyEngine:
 
 # ── 全局实例 ──────────────────────────────────────────────────────
 _instance: Optional[SafetyEngine] = None
-_lock = __import__('threading').Lock()
+_lock = threading.Lock()
 
 
 def get_safety_engine() -> SafetyEngine:

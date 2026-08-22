@@ -66,6 +66,9 @@ PLAN_TOOLS = ("set_plan", "update_plan")
 # 不参与瞬态错误自动重试的工具(超时的终端命令不应被盲目重跑)
 NO_RETRY_TOOLS = ("run_terminal",)
 
+# 多智能体编排模式(Orchestration 层),与执行模式(single/auto/review/ensemble)正交
+ORCHESTRATION_MODES = ("sequential", "hierarchical", "consensual")
+
 
 class AgentResult:
     def __init__(self, answer: str, steps: list[dict], model: str, interrupt: Optional[dict] = None):
@@ -96,6 +99,8 @@ class Agent:
         critic_model: str = "",
         ensemble_models: Optional[list[str]] = None,
         max_output_tokens: int = 0,
+        orch_subtasks: int = 0,
+        orch_candidates: Optional[list[str]] = None,
     ):
         self.llm = llm or LLMClient()
         # 协作模式:请求级优先,否则用全局配置(auto=跟随各开关)
@@ -103,6 +108,11 @@ class Agent:
         # 输出 token 配额硬控制:0 = 不限制;>0 时答案超过即截断并附提示
         self.max_output_tokens = max_output_tokens or int(settings.agent_default_max_output_tokens or 0)
         self.ensemble_models = list(ensemble_models or [])
+        # 编排模式可调参数(UI 配置项):子任务数量提示 / 候选执行体清单。
+        # 仅对 orchestration 类模式生效;执行模式(single/auto/review/ensemble)忽略。
+        self.orch_subtasks = int(orch_subtasks or 0)
+        _valid_modes = ("single", "auto", "review", "ensemble")
+        self.orch_candidates = [c for c in (orch_candidates or []) if c in _valid_modes]
         # critic 独立评审模型(双角色反思);未配置时复用执行模型 self.llm。
         # 请求级 critic_provider/critic_model 优先,其次全局配置。
         self.critic_llm = None
@@ -173,11 +183,14 @@ class Agent:
         """执行 Agent,返回结果和完整执行步骤。带 trace 记录。"""
         if self.mode == "ensemble":
             return await self._run_ensemble(user_input, history or [])
+        if self.mode in ORCHESTRATION_MODES:
+            return await self._run_orchestrated(user_input, history or [])
         state = AgentState(session_id=self.session_id, user_input=user_input)
         return await self._run_state(state, history or [], stream=False)
 
     async def resume(self, run_id: str, new_input: str | None = None,
-                     resume_value: Optional[dict] = None) -> AgentResult:
+                     resume_value: Optional[dict] = None,
+                     stream: bool = False) -> AgentResult:
         """从 checkpoint 恢复并继续执行。
 
         Args:
@@ -187,6 +200,7 @@ class Agent:
                 - [工具名,...]:已批准的工具白名单
                 - {confirmation_id: {"approved": bool}}:按确认请求逐个决定
             若运行处于中断状态则从中断节点继续,否则从头节点继续。
+            stream: 是否流式返回事件(默认为 False,兼容旧调用方)。
         """
         if self._checkpoint is None:
             raise RuntimeError("checkpoint 未启用,无法恢复运行")
@@ -199,7 +213,7 @@ class Agent:
             state.interrupt["resume"] = resume_value
             state.status = "running"
         self._sync_from_state(state)
-        return await self._run_state(state, state.metadata.get("history", []) or [], stream=False)
+        return await self._run_state(state, state.metadata.get("history", []) or [], stream=stream)
 
     def checkpoints(self, limit: int = 50, status: Optional[str] = None) -> list[dict]:
         """列出已持久化的运行记录(供后台任务/断点续跑管理)。"""
@@ -244,6 +258,10 @@ class Agent:
             for ch in result.answer:
                 yield {"type": "token", "content": ch}
             yield {"type": "done", "model": result.model, "steps": result.steps}
+            return
+        if self.mode in ORCHESTRATION_MODES:
+            async for evt in self._run_orchestrated_stream(user_input, history or []):
+                yield evt
             return
         state = AgentState(session_id=self.session_id, user_input=user_input)
         run_id = state.run_id
@@ -390,9 +408,8 @@ class Agent:
         user_input = state.user_input
         history = state.metadata.get("history") or []
 
-        # 输入护栏:Prompt 注入/越权拦截,命中则直接终结本轮
+        # 输入护栏
         from app.core.guardrails import INPUT_BLOCK_MESSAGE, run_input_guardrails
-
         guard = run_input_guardrails(user_input)
         if guard.blocked:
             state.answer = INPUT_BLOCK_MESSAGE
@@ -400,27 +417,40 @@ class Agent:
             state.metadata["guardrail_violations"] = [v.__dict__ for v in guard.violations]
             return END
 
+        # 准备阶段超时保护
+        prepare_timeout = max(30, int(getattr(settings, "agent_llm_timeout", 60) or 60))
+        try:
+            await asyncio.wait_for(
+                self._run_prepare(state, user_input, history, state.steps, 0),
+                timeout=prepare_timeout
+            )
+        except asyncio.TimeoutError:
+            state.emit({"type": "thinking", "content": f"[准备阶段超时({prepare_timeout}s),使用基础配置继续]"})
+            if not state.messages:
+                state.messages = [{"role": "user", "content": user_input}]
+            return
+
+        state.active_tools = self._active_tools
+
+    async def _run_prepare(self, state, user_input, history, steps, step):
+        """prepare 主体逻辑,可被超时包裹。"""
         await self._maybe_route(user_input)
         state.metadata["model"] = self.llm.info["model"]
         history = await self._prepare_history(history)
         state.metadata["history"] = history
 
-        route_evt = await self._maybe_select_tools(user_input, state.steps, 0)
+        route_evt = await self._maybe_select_tools(user_input, steps, step)
         if route_evt:
             state.emit(route_evt)
-        state.active_tools = self._active_tools
 
-        if await self._plan_task(user_input, state.steps, 0):
+        if await self._plan_task(user_input, steps, step):
             state.emit({"type": "plan", "action": "create",
                         "plan": self._plan.to_dict() if self._plan else None})
         if self._plan is not None:
             state.plan = self._plan.to_dict()
 
-        # 分层记忆:异步检索后缓存到实例,供 _build_messages 同步读取
         self._memory_note = await self._build_memory_note_async(user_input, history)
-
         state.messages = self._build_messages(user_input, history)
-
     async def _node_llm(self, state: AgentState, graph: Graph) -> None:
         """调用 LLM;把结果(mode/content/tool_calls)暂存到 metadata 供路由与 tools 节点使用。"""
         rounds = int(state.metadata.get("llm_rounds", 0))
@@ -429,8 +459,11 @@ class Agent:
             return
         state.metadata["llm_rounds"] = rounds + 1
 
-        mode, resp, tool_calls = await self._call_llm(state.messages)
-        state.metadata["mode"] = mode
+        is_stream = state.metadata.get("stream", False)
+        if is_stream:
+            mode, resp, tool_calls = await self._call_llm_stream(state.messages, state)
+        else:
+            mode, resp, tool_calls = await self._call_llm(state.messages)
         state.metadata["resp"] = resp or ""
         state.metadata["tool_calls"] = [tc.to_dict() for tc in tool_calls]
 
@@ -488,6 +521,8 @@ class Agent:
                     if self._is_tool_approved_by_resume(tc, state):
                         self._runtime_approved.add(tc.name)
 
+        # 工具开始执行:先发 tool_start,让前端感知"正在调用工具"并在长耗时调用期间保持连接
+        state.emit({"type": "tool_start", "names": [tc.name for tc in tool_calls]})
         batch = await self._execute_batch(tool_calls, state.steps, step)
         # 代码级自愈:对失败的代码类工具自动执行"分析-修复-重跑"闭环
         batch = await self._maybe_self_heal(state, batch, step)
@@ -534,31 +569,32 @@ class Agent:
             state.emit(evt)
         state.plan = self._plan.to_dict() if self._plan else None
 
-        if state.metadata.get("stream"):
-            tokens: list[str] = []
-            budget = self.max_output_tokens
-            used = 0
-            quota_hit = False
-            async for tok in self.llm.chat_stream(state.messages, temperature=self.temperature):
-                tokens.append(tok)
-                used += 1
-                state.emit({"type": "token", "content": tok})
-                if budget > 0 and len("".join(tokens)) > budget * 4:
-                    quota_hit = True
-                    break
-            answer = "".join(tokens)
-            if quota_hit and budget > 0:
-                from app.memory.context import estimate_tokens
+        # 统一从 _node_llm 已收集的响应开始;流式已逐 token 发出,非流式尚未生成完整回答
+        answer = state.metadata.get("resp", "") or ""
 
-                answer = answer[: int(budget * 4)]
-                state.emit({"type": "thinking",
-                            "content": f"[已达输出配额上限 {budget} token,回答已截断]"})
+        if state.metadata.get("stream"):
+            # 流式模式: 兜底重跑(理论上 resp 已收集完整)
+            if not answer:
+                tokens: list[str] = []
+                budget = self.max_output_tokens
+                async for tok in self.llm.chat_stream(state.messages, temperature=self.temperature):
+                    tokens.append(tok)
+                    state.emit({"type": "token", "content": tok})
+                answer = "".join(tokens)
         else:
-            answer = state.metadata.get("resp", "") or ""
-            if self.max_output_tokens > 0:
-                full, truncated = _truncate_to_token_budget(answer, self.max_output_tokens, self.llm)
-                if truncated:
-                    answer = full + "\n...[已达输出配额上限,回答已截断]"
+            # 非流式模式: _node_llm 已把 LLM 完整响应存到 resp,直接采用;
+            # 如果 resp 为空(如调用失败),再补一次非流式调用
+            if not answer:
+                answer = await self.llm.chat(state.messages, temperature=self.temperature)
+
+        # 输出 token 配额硬控制
+        if self.max_output_tokens > 0 and answer:
+            full, truncated = _truncate_to_token_budget(answer, self.max_output_tokens, self.llm)
+            if truncated:
+                answer = full + "\n...[已达输出配额上限,回答已截断]"
+                if state.metadata.get("stream"):
+                    state.emit({"type": "thinking",
+                                "content": f"[已达输出配额上限 {self.max_output_tokens} token,回答已截断]"})
 
         state.answer = answer
         state.steps.append({"step": step + 1, "type": "answer", "content": answer})
@@ -730,6 +766,188 @@ class Agent:
         if not (0 <= winner < len(results)):
             winner = 0
         return results[winner]
+
+    # ---- 多智能体编排(Orchestration 层):Sequential / Hierarchical / Consensual ----
+    #
+    # 与"执行模式"(single/auto/review/ensemble)正交:执行模式决定"单个智能体怎么干",
+    # 编排模式决定"多个智能体怎么协作"。二者通过 _make_worker 桥接——
+    # 每个子任务都由一个新的执行模式 Agent 完成,因此层级叶子也可以是
+    # ensemble / review 等执行模式(天然递归)。
+
+    def _make_worker(self, mode_name: str) -> "Agent":
+        """为某个执行模式创建一个子智能体(执行体)。"""
+        return Agent(
+            llm=self.llm,
+            registry=self.registry,
+            session_id=self.session_id,
+            mode=mode_name,
+            critic_provider=(self.critic_llm.provider if self.critic_llm else ""),
+            critic_model=(self.critic_llm.model if self.critic_llm else ""),
+            ensemble_models=self.ensemble_models,
+            max_output_tokens=self.max_output_tokens,
+        )
+
+    def _register_orch_agents(self, orch, modes: list[str] | None = None) -> None:
+        """把执行模式注册为编排器的"智能体"(幂等),供任务分解时按需分配。
+
+        modes: 限定只注册这些执行模式(来自 UI 的"候选执行体清单");为 None 时注册全部。
+        """
+        from app.core.orchestrator import AgentCapability
+
+        roster = {
+            "auto": "通用执行:自动判断是否调用工具完成任务",
+            "single": "单模型直接执行,不做额外评审,速度快",
+            "review": "执行后由独立评审模型核查质量,适合校验与总结",
+            "ensemble": "多模型并行生成再由评审模型择优,适合高可靠任务",
+        }
+        tool_names = [t.name for t in self.registry.list()]
+        names = modes if modes else list(roster.keys())
+        for name in names:
+            if name not in roster:
+                continue
+            if name not in orch._agents:
+                orch.register_agent(name, AgentCapability(
+                    name=name, description=roster[name],
+                    tools=list(tool_names), expertise=[name],
+                ))
+
+    def _consensual_candidates(self) -> list[str]:
+        """consensual 模式下的并行候选执行模式清单。优先用 UI 配置的 orch_candidates。"""
+        if self.orch_candidates:
+            return [c for c in self.orch_candidates if c in ("single", "auto", "review", "ensemble")]
+        if self.ensemble_models:
+            return ["single", "auto", "ensemble"]
+        return ["single", "auto", "review"]
+
+    async def _run_orchestrated(self, user_input: str, history: list[dict]) -> AgentResult:
+        """非流式入口:驱动编排流并聚合为 AgentResult。"""
+        answer: list[str] = []
+        steps: list[dict] = []
+        async for ev in self._run_orchestrated_stream(user_input, history or []):
+            if ev["type"] == "token":
+                answer.append(ev["content"])
+            elif ev["type"] in ("tool", "thinking", "plan", "orchestration"):
+                steps.append(ev)
+        return AgentResult(answer="".join(answer), steps=steps, model=self.llm.info["model"])
+
+    async def _run_orchestrated_stream(self, user_input: str, history: list[dict]):
+        """流式编排主循环:按 flow 类型分发,逐 token 转发子智能体输出。
+
+        yield 事件:
+          {"type": "orchestration", "phase": "start"|"task_start"|"task_done"|...}
+          {"type": "token"|"thinking"|"tool"|"plan"}  (来自子智能体,原样转发)
+        """
+        flow = self.mode
+        yield {"type": "orchestration", "phase": "start", "flow": flow,
+               "message": f"启动 {flow} 多智能体编排"}
+
+        if flow == "consensual":
+            async for ev in self._orch_consensual(user_input, history or []):
+                yield ev
+            yield {"type": "orchestration", "phase": "end", "flow": flow}
+            return
+
+        if flow == "sequential":
+            # 顺序多阶段:默认 auto 探索 + review 核查;若 UI 配置了候选执行体清单,
+            # 则按清单顺序串行执行(至少 2 个阶段才构成"顺序编排")。
+            pipeline = self.orch_candidates if len(self.orch_candidates) >= 2 else ["auto", "review"]
+            context = ""
+            for i, worker_mode in enumerate(pipeline):
+                yield {"type": "orchestration", "phase": "task_start",
+                       "index": i, "total": len(pipeline), "agent": worker_mode,
+                       "task": "整体任务(顺序两阶段)"}
+                prompt = user_input
+                if context:
+                    prompt = (f"前序阶段已完成的工作如下,请在其基础上继续完善:\n{context}\n\n"
+                              f"用户原始请求: {user_input}")
+                sink: list[str] = []
+                async for ev in self._orch_run_worker(worker_mode, prompt, history, i, _sink=sink):
+                    yield ev
+                context += f"[阶段 {i + 1} · {worker_mode} 产出]\n{''.join(sink)}\n"
+            yield {"type": "orchestration", "phase": "end", "flow": flow}
+            return
+
+        # hierarchical: 任务分解 -> 拓扑排序 -> 依赖顺序执行 -> 合成
+        from app.core.orchestrator import get_orchestrator, SubTask
+
+        orch = get_orchestrator()
+        # 先注册执行模式"智能体",decompose_task 才能据此分配子任务。
+        # 若 UI 配置了候选执行体清单,则只注册这些模式(子任务只能分配给它们)。
+        self._register_orch_agents(orch, modes=self.orch_candidates or None)
+        try:
+            sub_tasks = await orch.decompose_task(
+                user_input, user_input, self.llm,
+                num_subtasks=self.orch_subtasks,
+            )
+        except Exception:  # noqa: BLE001
+            sub_tasks = None
+        if not sub_tasks:
+            sub_tasks = [SubTask(description=user_input, assigned_agent="auto")]
+        sub_tasks = orch._topological_sort(sub_tasks)
+
+        context = ""
+        for i, task in enumerate(sub_tasks):
+            worker_mode = task.assigned_agent or "auto"
+            if worker_mode not in ("single", "auto", "review", "ensemble"):
+                worker_mode = "auto"
+            yield {"type": "orchestration", "phase": "task_start",
+                   "index": i, "total": len(sub_tasks),
+                   "task": task.description, "agent": worker_mode}
+            prompt = task.description
+            if context:
+                prompt = (f"以下是前序子任务已完成的工作,请在其基础上继续:\n{context}\n\n"
+                          f"当前子任务: {task.description}")
+            answer_parts: list[str] = []
+            try:
+                async for ev in self._orch_run_worker(worker_mode, prompt, history, i, _sink=answer_parts):
+                    yield ev
+            except Exception as e:  # noqa: BLE001
+                yield {"type": "orchestration", "phase": "task_error",
+                       "index": i, "error": str(e)[:200]}
+                break
+            context += f"\n[子任务 {i + 1} · {worker_mode}]\n{''.join(answer_parts)}\n"
+            yield {"type": "orchestration", "phase": "task_done",
+                   "index": i, "agent": worker_mode,
+                   "answer_preview": "".join(answer_parts)[:400]}
+        yield {"type": "orchestration", "phase": "end", "flow": flow}
+
+    async def _orch_run_worker(self, mode_name: str, prompt: str, history, index: int, _sink: list[str] | None = None):
+        """驱动单个执行体并转发其事件;token 同时写入 _sink 供上层汇总上下文。"""
+        worker = self._make_worker(mode_name)
+        async for ev in worker.run_stream(prompt, history=history):
+            if ev["type"] == "token":
+                if _sink is not None:
+                    _sink.append(ev["content"])
+                yield ev
+            elif ev["type"] in ("thinking", "tool", "plan", "tool_start"):
+                yield ev
+
+    async def _orch_consensual(self, user_input: str, history: list[dict]):
+        """共识投票:多个执行体并行作答,评审模型投票择优后流式输出最优答案。"""
+        candidates = self._consensual_candidates()
+        yield {"type": "orchestration", "phase": "parallel_start",
+               "candidates": candidates,
+               "message": f"并行启动 {len(candidates)} 个执行体,随后投票择优"}
+        workers = [self._make_worker(m) for m in candidates]
+        try:
+            results = await asyncio.gather(*[w.run(user_input, history=history) for w in workers])
+        except Exception as e:  # noqa: BLE001
+            yield {"type": "orchestration", "phase": "task_error", "error": str(e)[:200]}
+            return
+
+        yield {"type": "orchestration", "phase": "voting",
+               "message": "多执行体完成,评审模型投票择优中"}
+        best = await self._judge_ensemble(user_input, list(results))
+        if best is None and results:
+            best = results[0]
+        if best is None:
+            yield {"type": "orchestration", "phase": "task_error", "error": "共识投票未产生结果"}
+            return
+        yield {"type": "orchestration", "phase": "vote_result",
+               "winner": best.model,
+               "message": f"投票选出最佳执行体: {best.model}"}
+        for ch in best.answer:
+            yield {"type": "token", "content": ch}
 
     async def _node_reflect(self, state: AgentState, graph: Graph) -> None:
         """自评反思(Reflexion 式):用 LLM 按结构化 schema 评价回答质量。
@@ -920,6 +1138,10 @@ class Agent:
         if getattr(self.llm, "provider", "") == "mock":
             return None
 
+        # 简短问候快速通道:跳过LLM路由
+        cleaned = user_input.strip()
+        if len(cleaned) <= 15 and not any(kw in cleaned for kw in ("代码", "文件", "搜索", "网页", "执行", "运行", "分析", "报告", "计算")):
+            return None
         max_tools = min(int(settings.agent_max_tools or 10), len(self.registry.list()))
         min_confidence = 0.10
 
@@ -966,6 +1188,51 @@ class Agent:
             return "text", resp, []
         return "text", resp, [ToolCall(id="", name=parsed[0], arguments=parsed[1])]
 
+
+    async def _call_llm_stream(
+        self, messages: list[dict], state: AgentState
+    ) -> tuple[str, str, list["ToolCall"]]:
+        """流式调用 LLM:逐 token 发射事件,同时收集完整结果用于路由。"""
+        if self._native_enabled:
+            try:
+                result_holder: dict = {"result": None}
+                collected: list = []
+                async for item in self.llm.chat_stream_with_tools(
+                    messages, tools=self._schemas, temperature=self.temperature,
+                    result_holder=result_holder,
+                ):
+                    if isinstance(item, dict):
+                        state.emit(item)
+                    else:
+                        collected.append(item)
+                        state.emit({"type": "token", "content": item})
+                result = result_holder["result"]
+                if result and result.tool_calls:
+                    return "native", result.content or "", result.tool_calls
+                full = "".join(collected)
+                parsed = self._parse_tool_call(full)
+                if parsed is None:
+                    return "native", full, []
+                return "text", full, [ToolCall(id="", name=parsed[0], arguments=parsed[1])]
+            except Exception:  # noqa: BLE001
+                self._native_enabled = False
+
+        # 文本模式流式
+        try:
+            collected: list = []
+            async for tok in self.llm.chat_stream(messages, temperature=self.temperature):
+                if isinstance(tok, dict):
+                    state.emit(tok)
+                    continue
+                collected.append(tok)
+                state.emit({"type": "token", "content": tok})
+            full = "".join(collected)
+            parsed = self._parse_tool_call(full)
+            if parsed is None:
+                return "text", full, []
+            return "text", full, [ToolCall(id="", name=parsed[0], arguments=parsed[1])]
+        except Exception:  # noqa: BLE001
+            raise
     async def _execute_tool(self, name: str, arguments: str) -> str:
         """执行单个工具(带瞬态错误重试/退避),统一返回 JSON 字符串结果。"""
         if name in PLAN_TOOLS:
@@ -1369,6 +1636,10 @@ class Agent:
 
     async def _maybe_plan(self, user_input: str) -> Optional[TaskPlan]:
         """让 LLM 判断复杂度并生成计划;失败/简单任务返回 None,不影响主循环。"""
+        # 简短消息跳过规划
+        cleaned = user_input.strip()
+        if len(cleaned) <= 20 and not any(kw in cleaned for kw in ("代码", "文件", "搜索", "网页", "执行", "运行", "分析", "报告", "计算", "脚本", "程序")):
+            return None
         try:
             plan = await generate_plan(self.llm, user_input, max_steps=settings.agent_plan_max_steps)
         except Exception:  # noqa: BLE001

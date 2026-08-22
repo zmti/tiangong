@@ -76,6 +76,10 @@ class ToolExecutor:
         self._dangerous_tools = {
             s.strip() for s in settings.agent_dangerous_tools.split(",") if s.strip()
         }
+        # 危险工具频率限制:每个工具名 -> 最近 N 秒内的调用时间戳列表
+        self._dangerous_tool_calls: dict[str, list[float]] = {}
+        # 每分钟危险工具最大调用次数(按工具名分别计数)
+        self._dangerous_tool_rate_limit = int(settings.agent_dangerous_tool_rate_limit or 10)
 
     def get_schemas(self, registry: Optional[ToolRegistry] = None) -> list[dict]:
         """获取当前活跃工具的 OpenAI Schema 列表。"""
@@ -310,6 +314,23 @@ class ToolExecutor:
         stream: bool = False, state=None,
     ) -> list[tuple[ToolCall, str, bool]]:
         """并行执行一批工具调用,记录执行步骤。"""
+        # 危险工具频率限制:超出速率直接拒绝,防止滥用
+        if self._dangerous_tool_rate_limit > 0:
+            now = time.time()
+            for tc in tool_calls:
+                if tc.name in self._dangerous_tools:
+                    calls = self._dangerous_tool_calls.setdefault(tc.name, [])
+                    # 清理超过 60s 的旧记录
+                    self._dangerous_tool_calls[tc.name] = [t for t in calls if now - t < 60]
+                    if len(self._dangerous_tool_calls[tc.name]) >= self._dangerous_tool_rate_limit:
+                        msg = (
+                            f"工具 {tc.name} 触发频率限制:"
+                            f" 最近 60 秒内已调用 {self._dangerous_tool_rate_limit} 次,请稍后重试"
+                        )
+                        logger.warning(msg)
+                        return [(tc, json.dumps({"error": msg, "blocked": True}, ensure_ascii=False), True)]
+                    self._dangerous_tool_calls[tc.name].append(now)
+
         from app.tools.memory_tool import _current_session
         from app.tools.delegation_tool import set_delegate_context, _delegate_parent
 
@@ -349,11 +370,12 @@ class ToolExecutor:
                     # 推送工具完成事件
                     is_err = self.is_tool_error(result)
                     if state:
-                        state.emit({"type": "tool_done", "tool": tc.name, "result_len": len(result), "error": is_err})
+                        state.emit({"type": "tool_done", "tool": tc.name, "result": result, "result_len": len(result), "error": is_err})
                     steps.append({
                         "step": step + 1,
                         "type": "tool_done",
                         "tool": tc.name,
+                        "result": result,
                         "result_len": len(result),
                         "error": is_err,
                     })
@@ -388,11 +410,12 @@ class ToolExecutor:
                         # 推送工具完成事件
                         is_err = self.is_tool_error(result)
                         if state:
-                            state.emit({"type": "tool_done", "tool": tc.name, "result_len": len(result), "error": is_err})
+                            state.emit({"type": "tool_done", "tool": tc.name, "result": result, "result_len": len(result), "error": is_err})
                         steps.append({
                             "step": step + 1,
                             "type": "tool_done",
                             "tool": tc.name,
+                            "result": result,
                             "result_len": len(result),
                             "error": is_err,
                         })
@@ -411,11 +434,12 @@ class ToolExecutor:
                     for tc, result_str in zip(tool_calls, results):
                         is_err = self.is_tool_error(result_str)
                         if state:
-                            state.emit({"type": "tool_done", "tool": tc.name, "result_len": len(result_str), "error": is_err})
+                            state.emit({"type": "tool_done", "tool": tc.name, "result": result_str, "result_len": len(result_str), "error": is_err})
                         steps.append({
                             "step": step + 1,
                             "type": "tool_done",
                             "tool": tc.name,
+                            "result": result_str,
                             "result_len": len(result_str),
                             "error": is_err,
                         })

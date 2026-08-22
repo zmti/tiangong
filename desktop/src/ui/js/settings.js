@@ -1,11 +1,33 @@
-/* 设置模块:主题切换 / 后端信息展示 / 协作模式可视化选择器 */
+/* 设置模块:主题切换 / 后端信息展示 / provider·模型数据缓存
+ * 协作模式配置已迁至 js/mode.js;主模型选择 UI 已迁至 js/model_picker.js */
 App.Settings = {};
+
+// 缓存已加载的provider/model数据
+App.Settings._providers = [];
+App.Settings._modelsByProvider = {};
+
+// 获取当前选中的 provider:model(App.ModelPicker 的只读视图;
+// 仅当 provider 与 model 都明确指定时返回非空,与旧语义一致)
+App.Settings.getSelectedModel = function () {
+  if (App.ModelPicker) {
+    const s = App.ModelPicker.get();
+    return s.provider && s.model ? `${s.provider}:${s.model}` : '';
+  }
+  return '';
+};
 
 App.Settings.applyTheme = function (theme) {
   document.body.dataset.theme = theme;
   try { localStorage.setItem('agent_theme', theme); } catch (_) { /* 忽略 */ }
   const icon = App.els.themeBtn;
-  if (icon) icon.textContent = theme === 'dark' ? '☀️' : '🌙';
+  if (icon) {
+    const moon = icon.querySelector('.icon-moon');
+    const sun = icon.querySelector('.icon-sun');
+    if (moon && sun) {
+      moon.style.display = theme === 'dark' ? 'none' : '';
+      sun.style.display = theme === 'dark' ? '' : 'none';
+    }
+  }
 };
 
 App.Settings.currentTheme = function () {
@@ -24,52 +46,18 @@ App.Settings.refreshBackend = async function () {
   return ok;
 };
 
-/* ---------- 协作模式可视化选择器 ---------- */
-
-// 从 provider:model 字符串解析出 provider 和 model
-function _parseProviderModel(s) {
-  if (!s) return { provider: '', model: '' };
-  const idx = s.indexOf(':');
-  return idx >= 0 ? { provider: s.slice(0, idx).trim(), model: s.slice(idx + 1).trim() } : { provider: s.trim(), model: '' };
-}
-
-// 将 provider:model 格式化回字符串
-function _formatProviderModel(p, m) {
-  return [p, m].filter(Boolean).join(':') || '';
-}
+/* ---------- 主模型选择器辅助(loadModels / provider 缓存) ---------- */
 
 // 缓存已加载的模型数据 { providerId -> [{id, name, speed, quality}] }
 App._modelsCache = {};
 
-// 加载所有可用 provider 列表
+// 加载所有可用 provider 列表并缓存(协作模式 popover 也从缓存读取)
 App.Settings.loadProviders = async function () {
   try {
     const res = await App.api('/v1/providers');
     if (!res.ok) return;
     const data = await res.json();
-    const providers = data.providers || [];
-    // 填充 critic provider 下拉
-    if (App.els.criticProviderSelect) {
-      App.els.criticProviderSelect.innerHTML = '<option value="">提供商</option>';
-      providers.forEach((p) => {
-        const opt = document.createElement('option');
-        opt.value = p.id;
-        opt.textContent = (p.configured ? '' : '(未配置) ') + p.name;
-        opt.disabled = !p.configured;
-        App.els.criticProviderSelect.appendChild(opt);
-      });
-    }
-    // 填充 ensemble 添加行 provider 下拉
-    if (App.els.ensembleProvSelect) {
-      App.els.ensembleProvSelect.innerHTML = '<option value="">提供商</option>';
-      providers.forEach((p) => {
-        const opt = document.createElement('option');
-        opt.value = p.id;
-        opt.textContent = (p.configured ? '' : '(未配置) ') + p.name;
-        opt.disabled = !p.configured;
-        App.els.ensembleProvSelect.appendChild(opt);
-      });
-    }
+    App.Settings._providers = data.providers || [];
   } catch (_) { /* 忽略 */ }
 };
 
@@ -95,116 +83,240 @@ App.Settings.loadModels = async function (providerId, selectEl) {
   }
 };
 
-// 等待 provider 下拉填充完成（轮询，最多 3s）
-function _waitForProviders(selectEl, timeoutMs) {
-  return new Promise((resolve) => {
-    if (!selectEl) { resolve(); return; }
-    const check = () => {
-      const opts = selectEl.querySelectorAll('option');
-      if (opts.length > 1) { resolve(); return; }
-    };
-    check();
-    const poll = setInterval(check, 200);
-    setTimeout(() => { clearInterval(poll); resolve(); }, timeoutMs || 3000);
-  });
+/* ---------- 模型服务管理(自定义 OpenAI 兼容提供商) ---------- */
+
+App.Settings._provCustoms = [];
+
+// 后端缺新接口(404)= 旧版后端进程残留,给出可操作指引
+function provStaleHint() {
+  return '后端版本较旧(接口不存在)。请完全退出应用(托盘图标右键 → 退出)后重新打开,新版启动器会自动替换旧后端。';
 }
 
-// 恢复 critic 选择器的已保存值
-App.Settings.restoreCritic = async function () {
-  await _waitForProviders(App.els.criticProviderSelect, 3000);
-  const saved = localStorage.getItem('agent_critic') || '';
-  const { provider, model } = _parseProviderModel(saved);
-  if (App.els.criticProviderSelect) App.els.criticProviderSelect.value = provider;
-  if (provider && App.els.criticModelSelect) {
-    App.els.criticModelSelect.value = '';
-    await App.Settings.loadModels(provider, App.els.criticModelSelect);
-    if (App.els.criticModelSelect.querySelector(`option[value="${model}"]`)) {
-      App.els.criticModelSelect.value = model;
-    }
-  }
-  App.Settings.saveCriticFromUI();
-};
+App.Settings.renderProviderAdmin = async function () {
+  const box = document.getElementById('providerAdmin');
+  if (!box) return;
+  try {
+    const res = await App.api('/v1/providers/custom');
+    if (res.ok) App.Settings._provCustoms = (await res.json()).providers || [];
+  } catch (_) { /* 忽略 */ }
 
-// 恢复 ensemble 列表的已保存值
-App.Settings.restoreEnsemble = async function () {
-  await _waitForProviders(App.els.ensembleProvSelect, 3000);
-  const saved = localStorage.getItem('agent_ensemble') || '';
-  const items = saved.split(',').map((s) => s.trim()).filter(Boolean);
-  App.Settings.renderEnsembleList(items);
-  App.Settings.saveEnsembleFromUI();
-};
-
-// 渲染 ensemble 模型列表 UI
-App.Settings.renderEnsembleList = function (items) {
-  if (!App.els.ensembleList) return;
-  App.els.ensembleList.innerHTML = '';
-  (items || []).forEach((item, idx) => {
-    const { provider, model } = _parseProviderModel(item);
+  box.textContent = '';
+  App.Settings._provCustoms.forEach((p) => {
     const row = document.createElement('div');
-    row.className = 'ensemble-item';
-    // provider 下拉
-    const provSel = document.createElement('select');
-    provSel.className = 'set-select set-select-sm ens-prov';
-    provSel.innerHTML = '<option value="">提供商</option>';
-    row.appendChild(provSel);
-    // model 下拉
-    const modSel = document.createElement('select');
-    modSel.className = 'set-select set-select-sm ens-model';
-    modSel.innerHTML = '<option value="">选择模型</option>';
-    row.appendChild(modSel);
-    // 数量角标
-    const countBadge = document.createElement('span');
-    countBadge.className = 'ens-count';
-    countBadge.textContent = `#${idx + 1}`;
-    row.appendChild(countBadge);
-    // 删除按钮
-    const rmBtn = document.createElement('button');
-    rmBtn.className = 'ens-remove';
-    rmBtn.textContent = '×';
-    rmBtn.title = '移除此模型';
-    rmBtn.addEventListener('click', () => {
-      row.remove();
-      App.Settings.saveEnsembleFromUI();
+    row.className = 'prov-item';
+    const info = document.createElement('div');
+    info.className = 'prov-info';
+    const name = document.createElement('b');
+    name.textContent = p.name;
+    const meta = document.createElement('span');
+    meta.className = 'muted';
+    meta.textContent = (p.model || '未设默认模型') + (p.api_key_masked ? ' · ' + p.api_key_masked : '');
+    meta.title = p.base_url || '';
+    info.append(name, meta);
+    const ops = document.createElement('div');
+    ops.className = 'prov-ops';
+    const editBtn = document.createElement('button');
+    editBtn.type = 'button';
+    editBtn.textContent = '编辑';
+    editBtn.addEventListener('click', () => App.Settings._openProvForm(p));
+    const delBtn = document.createElement('button');
+    delBtn.type = 'button';
+    delBtn.className = 'danger';
+    delBtn.textContent = '删除';
+    delBtn.addEventListener('click', async () => {
+      if (!window.confirm(`删除提供商「${p.name}」?正在使用它的会话将回退到全局配置。`)) return;
+      try { await App.api('/v1/providers/custom/' + encodeURIComponent(p.id), { method: 'DELETE' }); } catch (_) { /* 忽略 */ }
+      App.Settings.refreshProvidersUI();
     });
-    row.appendChild(rmBtn);
-    App.els.ensembleList.appendChild(row);
-    // 恢复值
-    provSel.value = provider;
-    modSel.value = model;
-    // provider 变更时加载对应模型
-    provSel.addEventListener('change', () => {
-      const pid = provSel.value;
-      modSel.innerHTML = '<option value="">选择模型</option>';
-      if (pid) App.Settings.loadModels(pid, modSel);
-      App.Settings.saveEnsembleFromUI();
-    });
-    modSel.addEventListener('change', () => { App.Settings.saveEnsembleFromUI(); });
-    // 初始加载
-    if (provider) App.Settings.loadModels(provider, modSel);
+    ops.append(editBtn, delBtn);
+    row.append(info, ops);
+    box.appendChild(row);
   });
+
+  const addBtn = document.createElement('button');
+  addBtn.type = 'button';
+  addBtn.className = 'lb-btn prov-add';
+  addBtn.textContent = '＋ 添加 OpenAI 兼容提供商';
+  addBtn.addEventListener('click', () => App.Settings._openProvForm(null));
+  box.appendChild(addBtn);
+
+  const formWrap = document.createElement('div');
+  formWrap.id = 'provFormWrap';
+  box.appendChild(formWrap);
 };
 
-// 从 UI 收集 ensemble 值并持久化
-App.Settings.saveEnsembleFromUI = function () {
-  if (!App.els.ensembleList) return;
-  const items = [];
-  App.els.ensembleList.querySelectorAll('.ensemble-item').forEach((row) => {
-    const p = (row.querySelector('.ens-prov')?.value) || '';
-    const m = (row.querySelector('.ens-model')?.value) || '';
-    const val = _formatProviderModel(p, m);
-    if (val) items.push(val);
-  });
-  const raw = items.join(',');
-  localStorage.setItem('agent_ensemble', raw);
-  // 同步隐藏的 input(兼容 chat.js 读取)
-  if (App.els.ensembleModelsInput) App.els.ensembleModelsInput.value = raw;
+App.Settings.refreshProvidersUI = async function () {
+  await App.Settings.renderProviderAdmin();
+  await App.Settings.loadProviders();
+  App._modelsCache = {};
 };
 
-// 从 UI 收集 critic 值并持久化
-App.Settings.saveCriticFromUI = function () {
-  const p = App.els.criticProviderSelect?.value || '';
-  const m = App.els.criticModelSelect?.value || '';
-  const val = _formatProviderModel(p, m);
-  localStorage.setItem('agent_critic', val);
-  if (App.els.criticModelInput) App.els.criticModelInput.value = val;
+// 打开表单;p=null 新建,p=条目 编辑(Key 留空沿用旧值)
+App.Settings._openProvForm = function (p) {
+  const wrap = document.getElementById('provFormWrap');
+  if (!wrap) return;
+  wrap.textContent = '';
+
+  const form = document.createElement('div');
+  form.className = 'prov-form';
+
+  const mkField = (labelText, inputEl) => {
+    const label = document.createElement('label');
+    const span = document.createElement('span');
+    span.textContent = labelText;
+    label.append(span, inputEl);
+    return label;
+  };
+
+  const nameIn = document.createElement('input');
+  nameIn.type = 'text';
+  nameIn.placeholder = '如:硅基流动 / DeepSeek 中转 / 公司网关';
+  nameIn.value = p ? p.name : '';
+
+  const urlIn = document.createElement('input');
+  urlIn.type = 'text';
+  urlIn.placeholder = 'https://api.example.com/v1';
+  urlIn.value = p ? p.base_url : '';
+
+  const keyIn = document.createElement('input');
+  keyIn.type = 'password';
+  keyIn.placeholder = p && p.api_key_masked ? `已保存 ${p.api_key_masked},留空则不修改` : 'sk-...';
+  keyIn.autocomplete = 'off';
+
+  // 默认模型:datalist 兼顾手填与下拉选择
+  const dlId = 'provModelDatalist';
+  const modelIn = document.createElement('input');
+  modelIn.type = 'text';
+  modelIn.setAttribute('list', dlId);
+  modelIn.placeholder = '获取模型列表后选择,或直接手填';
+  modelIn.value = p ? (p.model || '') : '';
+  const dl = document.createElement('datalist');
+  dl.id = dlId;
+
+  const status = document.createElement('div');
+  status.className = 'prov-status muted';
+
+  const ops = document.createElement('div');
+  ops.className = 'prov-form-ops';
+
+  const fetchBtn = document.createElement('button');
+  fetchBtn.type = 'button';
+  fetchBtn.textContent = '🔄 获取模型列表';
+  const testBtn = document.createElement('button');
+  testBtn.type = 'button';
+  testBtn.textContent = '测试连接';
+  const saveBtn = document.createElement('button');
+  saveBtn.type = 'button';
+  saveBtn.className = 'primary';
+  saveBtn.textContent = '保存';
+  const cancelBtn = document.createElement('button');
+  cancelBtn.type = 'button';
+  cancelBtn.textContent = '取消';
+
+  const baseUrl = () => {
+    let u = urlIn.value.trim();
+    if (u && !/^https?:\/\//i.test(u)) u = 'https://' + u;
+    return u.replace(/\/+$/, '');
+  };
+  const apiKey = () => keyIn.value.trim() || (p ? '' : '');
+
+  const probe = async () => {
+    const base = baseUrl();
+    if (!base) { status.textContent = '请先填写 Base URL'; status.className = 'prov-status err'; return null; }
+    status.textContent = '请求中…';
+    status.className = 'prov-status muted';
+    try {
+      const res = await App.api('/v1/providers/custom/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ base_url: base, api_key: keyIn.value.trim(), id: p ? p.id : null }),
+      });
+      if (res.status === 404) {
+        status.textContent = '失败:' + provStaleHint();
+        status.className = 'prov-status err';
+        return null;
+      }
+      const data = await res.json();
+      if (!data.ok) {
+        status.textContent = '失败:' + (data.error || '未知错误');
+        status.className = 'prov-status err';
+        return null;
+      }
+      return data.models || [];
+    } catch (e) {
+      status.textContent = '失败:' + e.message;
+      status.className = 'prov-status err';
+      return null;
+    }
+  };
+
+  fetchBtn.addEventListener('click', async () => {
+    const models = await probe();
+    if (models === null) return;
+    dl.textContent = '';
+    models.forEach((m) => {
+      const opt = document.createElement('option');
+      opt.value = m;
+      dl.appendChild(opt);
+    });
+    status.textContent = `成功,发现 ${models.length} 个模型`;
+    status.className = 'prov-status ok';
+  });
+
+  testBtn.addEventListener('click', async () => {
+    const models = await probe();
+    if (models === null) return;
+    status.textContent = `连接正常(发现 ${models.length} 个模型)`;
+    status.className = 'prov-status ok';
+  });
+
+  cancelBtn.addEventListener('click', () => { wrap.textContent = ''; });
+
+  saveBtn.addEventListener('click', async () => {
+    const name = nameIn.value.trim();
+    const base = baseUrl();
+    if (!name) { status.textContent = '请填写名称'; status.className = 'prov-status err'; return; }
+    if (!base) { status.textContent = '请填写 Base URL'; status.className = 'prov-status err'; return; }
+    try {
+      const res = await App.api('/v1/providers/custom', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: p ? p.id : null,
+          name,
+          base_url: base,
+          api_key: keyIn.value.trim(),
+          model: modelIn.value.trim(),
+        }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        status.textContent = res.status === 404
+          ? '保存失败:' + provStaleHint()
+          : '保存失败:' + (data.detail || res.status);
+        status.className = 'prov-status err';
+        return;
+      }
+    } catch (e) {
+      status.textContent = '保存失败:' + e.message;
+      status.className = 'prov-status err';
+      return;
+    }
+    wrap.textContent = '';
+    App.Settings.refreshProvidersUI();
+  });
+
+  ops.append(fetchBtn, testBtn, saveBtn, cancelBtn);
+  form.append(
+    mkField('名称', nameIn),
+    mkField('Base URL(OpenAI 兼容)', urlIn),
+    mkField('API Key', keyIn),
+    mkField('默认模型', modelIn),
+    dl,
+    status,
+    ops,
+  );
+  wrap.appendChild(form);
+  nameIn.focus();
 };
+

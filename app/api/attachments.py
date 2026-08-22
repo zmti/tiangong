@@ -15,8 +15,15 @@ router = APIRouter(prefix="/v1/attachments", tags=["attachments"])
 @router.get("/images/{att_id}")
 async def get_image(att_id: str) -> FileResponse:
     """返回已保存图片文件(供 server_url 模式使用)。"""
+    # 先从 attachments 目录查找
+    for session_id in os.listdir(os.path.join(settings.resolved_data_dir, "attachments")):
+        session_dir = os.path.join(settings.resolved_data_dir, "attachments", session_id)
+        if os.path.isdir(session_dir):
+            for f in os.listdir(session_dir):
+                if f.startswith(att_id + "_"):
+                    return FileResponse(os.path.join(session_dir, f))
+    # 回退到 images 目录
     img_dir = os.path.join(settings.resolved_data_dir, "images")
-    # 只允许文件名中不含路径分隔符
     safe_name = os.path.basename(att_id)
     path = os.path.join(img_dir, safe_name)
     if not os.path.isfile(path):

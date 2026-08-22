@@ -149,8 +149,8 @@ async def handoff_to_role(
             agent_state.status = "failed"
             agent_state.error = "无回答结果"
         store._persist(agent_state)
-    except Exception:
-        pass  # 持久化失败不影响主流程
+    except Exception as e:
+        logger.warning("角色子智能体状态持久化失败: %s", e)
 
     base = {
         "status": "ok",

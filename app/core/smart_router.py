@@ -10,12 +10,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from typing import Optional
 
 from app.config import settings
 from app.tools.categories import SYSTEM_TOOLS, TOOL_CATEGORIES, get_category
+
+logger = logging.getLogger(__name__)
 
 
 # ── 路由历史(学习用) ──────────────────────────────────────────────
@@ -136,7 +139,7 @@ def _get_embedding(query: str) -> Optional[list[float]]:
         return None
 
 
-def select_tools_enhanced(
+async def select_tools_enhanced(
     llm,
     user_input: str,
     registry,
@@ -211,30 +214,40 @@ def select_tools_enhanced(
                 _record_routing_success(user_input, names, avg_conf)
                 return names, avg_conf, f"embedding_match(相似度阈值{min_confidence})"
         except Exception:
-            pass
+            logger.warning("工具路由 embedding 级失败", exc_info=True)
 
     # 3. 第三级:LLM 路由(兜底)
     try:
-        from app.router import select_tools as _llm_select
-        names = asyncio.run(_llm_select(llm, user_input, registry, max_tools))
+        from app.core.router import select_tools as _llm_select
+        names = await _llm_select(llm, user_input, registry, max_tools)
         if names:
             _record_routing_success(user_input, names, 0.5)
             return names, 0.5, "llm_fallback"
     except Exception:
-        pass
+        logger.warning("工具路由 LLM 级失败", exc_info=True)
 
-    # 4. 全部失败:回退全量(但限制数量)
-    fallback = [t.name for t in registry.list()
-                if t.name not in SYSTEM_TOOLS and t.enabled][:max_tools]
+    # 4. 全部失败:回退全量(但限制数量,并优先保留常用核心工具)
+    priority = [
+        "generate_image", "generate_video", "web_search", "rag_search",
+        "read_document", "write_file", "edit_file", "search_files",
+        "list_directory", "run_code", "query_sqlite", "fetch_webpage",
+    ]
+    fallback: list[str] = []
+    for n in priority:
+        t = registry.get(n)
+        if t and t.enabled and n not in SYSTEM_TOOLS and n not in fallback:
+            fallback.append(n)
+    if len(fallback) < max_tools:
+        for t in registry.list():
+            if len(fallback) >= max_tools:
+                break
+            if t.name not in SYSTEM_TOOLS and t.enabled and t.name not in fallback:
+                fallback.append(t.name)
     if fallback:
         _record_routing_failure(user_input, "all_levels_failed")
-        return fallback, 0.0, "fallback_full"
+        return fallback[:max_tools], 0.0, "fallback_full"
 
     return [], 0.0, "empty_registry"
-
-
-# 需要 asyncio 支持
-import asyncio as _asyncio
 
 
 # ── 路由统计 API ──────────────────────────────────────────────────

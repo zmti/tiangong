@@ -164,18 +164,36 @@ curl -X POST http://localhost:8080/v1/chat -H "Content-Type: application/json" \
 
 ### 桌面端使用
 
-输入栏模型选择器右侧新增**协作模式**下拉框:`自动` / `单模型` / `评审` / `多模型择优`(对应 `auto`/`single`/`review`/`ensemble`),选择即对本会话生效并持久化。
+输入栏模型选择器右侧是**协作模式**下拉框,按两组呈现(对应后端执行模式与多智能体编排两层,正交设计):
+
+**基础模式**(单个智能体怎么干):
 
 | 模式 | 含义 |
 |------|------|
 | 自动 | 跟随后端全局配置,默认 |
-| 单模型 | 一个模型直接做,最快最省 |
-| 评审 | 一个模型做、另一个模型测质量(强制开启事实校验 + 独立评审) |
-| 多模型择优 | 多个模型并行做同一任务,评审选优 |
+| 快速回答 | 单模型直接做,最快最省(`single`) |
+| 质量把关 | 一个模型做、另一个模型测质量,强制开启事实校验 + 独立评审(`review`) |
+| 多模型择优 | 多个模型并行做同一任务,评审选优(`ensemble`) |
 
-⚙️ **设置面板**可配置(本地持久化):
-- **评审模型(critic)**:格式 `provider:model`,如 `qwen:qwen-plus`。用于评审/多模型择优模式的质量把关;留空则用后端全局 `AGENT_CRITIC_PROVIDER`。
-- **多模型择优清单**:逗号分隔 `provider:model`,如 `deepseek:deepseek-chat,qwen:qwen-plus`。多模型择优模式并行参与的模型;留空则用后端全局 `AGENT_ENSEMBLE_MODELS`。
+**多智能体团队**(多个智能体怎么协作):
+
+| 模式 | 含义 |
+|------|------|
+| 流水线团队 | 自动探索 → 独立评审,两阶段顺序完善(`sequential`) |
+| 分工协作 | LLM 拆解子任务,分配给合适执行体并汇总(`hierarchical`) |
+| 擂台赛 | 单模型/自动/评审 三方并行作答,投票选最优(`consensual`) |
+
+配置就地完成:选中需要参数的模式会自动弹出**配置浮层**,并出现模式徽标(如 `择优 ×3`)——
+
+- **质量把关**:就地选择评审模型(critic);与主模型相同时提示"可能自评偏袒"
+- **多模型择优**:就地增删参与模型(最多 3 个);不足 2 个时提示效果等同单模型
+- **团队模式**:以"团队模板"呈现(快审流水线/分工协作/擂台赛),子任务数量仅分工协作生效;底层"候选执行体清单"折叠在「高级:自定义执行体」中
+
+所有模式配置统一持久化在 `localStorage.agent_mode_state`(旧版分散键 `agent_mode`/`agent_critic`/`agent_ensemble` 首次启动自动迁移);留空的项由后端全局 `AGENT_CRITIC_PROVIDER`/`AGENT_ENSEMBLE_MODELS` 兜底。
+
+**主模型选择器**:输入栏左下角是模型按钮(如 `🤖 DeepSeek · deepseek-chat`),点击展开浮层就地选择——搜索过滤、按提供商分组的模型清单(带速度标签)、未配置 API Key 的提供商灰显;点提供商标题行 = 用其默认模型,顶部「默认模型」行 = 跟随后端 `AGENT_LLM_PROVIDER`。选择持久化在 `localStorage.agent_model_state`(旧版分散键 `agent_provider`/`agent_model_<pid>` 自动迁移);请求经独立的 `provider` + `model` 字段传给后端,不再拼 `provider:model` 整串。协作模式浮层里的评审模型、择优参与模型也复用同一浮层组件(`App.ModelPicker.choose`),全应用不再有级联的"提供商→模型"下拉框。
+
+**模型服务管理(自定义提供商)**:设置面板新增「模型服务」区,可零代码接入任意 OpenAI 兼容厂商——填名称、Base URL、API Key 后点「获取模型列表」自动发现模型(`GET {base_url}/models`),选默认模型保存即可;配好的提供商会自动出现在主模型选择器浮层里。数据持久化在 `data/providers.json`(Key 掩码展示、编辑留空沿用旧值),后端按 `custom-*` id 查表构造客户端,与 `.env` 内置厂商并存。相关接口:`GET/POST /v1/providers/custom`、`DELETE /v1/providers/custom/{id}`、`POST /v1/providers/custom/test`(测连+模型发现)。
 
 > 注:桌面端需要重新打包后端(含 `mode` 接口支持)与前端 UI 才生效,详见 `desktop/build.bat` / `build_app.ps1`。
 

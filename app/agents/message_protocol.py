@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -160,15 +161,19 @@ class AgentMessageQueue:
 
 # 模块级单例
 _message_queue: Optional[AgentMessageQueue] = None
+_message_queue_lock = threading.Lock()
 
 
 def get_task_queue() -> AgentMessageQueue:
     global _message_queue
     if _message_queue is None:
-        _message_queue = AgentMessageQueue()
+        with _message_queue_lock:
+            if _message_queue is None:
+                _message_queue = AgentMessageQueue()
     return _message_queue
 
 
 def reset_message_queue() -> None:
     global _message_queue
-    _message_queue = None
+    with _message_queue_lock:
+        _message_queue = None

@@ -13,6 +13,7 @@ AgentTeam 是角色的集合。用 roles.py 默认注册一批开箱即用的角
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -79,12 +80,15 @@ class RoleRegistry:
 
 
 _registry: Optional[RoleRegistry] = None
+_registry_lock = threading.Lock()
 
 
 def get_role_registry() -> RoleRegistry:
     global _registry
     if _registry is None:
-        _registry = RoleRegistry()
+        with _registry_lock:
+            if _registry is None:
+                _registry = RoleRegistry()
     return _registry
 
 

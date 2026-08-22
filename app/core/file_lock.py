@@ -175,10 +175,13 @@ class FileLockManager:
 
 # 全局单例
 _lock_manager: Optional[FileLockManager] = None
+_lock_manager_lock = threading.Lock()
 
 
 def get_lock_manager() -> FileLockManager:
     global _lock_manager
     if _lock_manager is None:
-        _lock_manager = FileLockManager()
+        with _lock_manager_lock:
+            if _lock_manager is None:
+                _lock_manager = FileLockManager()
     return _lock_manager

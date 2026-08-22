@@ -2,6 +2,9 @@ import os
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# 应用版本:随协议/接口变更递增;桌面端启动器据此识别旧版残留进程
+APP_VERSION = "1.1.0"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -129,6 +132,8 @@ class Settings(BaseSettings):
 
     # ---- Agent ----
     agent_max_steps: int = 10
+    # 同一 Agent 实例最大并发运行数(0=不限制);防止大量并发请求耗尽 LLM 配额和服务器资源
+    agent_max_concurrent_runs: int = 5
     agent_temperature: float = 0.7
     agent_system_prompt: str = "你是一个智能助手,请用中文回答。"
     # 单条历史消息最大字符数(防止大工具结果/图片 base64 塞爆上下文)
@@ -328,6 +333,8 @@ class Settings(BaseSettings):
     agent_tool_confirm: bool = True
     # 危险工具清单(逗号分隔)
     agent_dangerous_tools: str = "run_terminal,run_code"
+    # 每个危险工具每分钟最大调用次数(0=不限制)
+    agent_dangerous_tool_rate_limit: int = 10
 
     # ---- 多租户 ----
     # 启用多租户:每个 API Key 归属一个租户,支持独立的用量统计和数据隔离

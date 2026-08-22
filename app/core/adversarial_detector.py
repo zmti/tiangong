@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 from typing import Optional
 
 from app.config import settings
@@ -156,13 +157,16 @@ class AdversarialDetector:
 
 # 单例
 _detector: Optional[AdversarialDetector] = None
+_detector_lock = threading.Lock()
 
 
 def get_adversarial_detector(llm=None) -> AdversarialDetector:
     """获取对抗攻击检测器单例。"""
     global _detector
     if _detector is None:
-        _detector = AdversarialDetector(llm)
+        with _detector_lock:
+            if _detector is None:
+                _detector = AdversarialDetector(llm)
     return _detector
 
 

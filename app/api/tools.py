@@ -1,7 +1,7 @@
 """工具管理接口:查看已注册工具。"""
 from __future__ import annotations
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from app.config import settings
@@ -68,6 +68,8 @@ async def list_providers() -> dict:
     """可用模型 Provider 列表(带 key 与否,供 UI 下拉)。"""
     import os
 
+    from app.core.provider_registry import list_custom
+
     providers = [
         {"id": "deepseek", "name": "DeepSeek", "configured": bool(settings.deepseek_api_key)},
         {"id": "qwen", "name": "通义千问 Qwen", "configured": bool(settings.qwen_api_key)},
@@ -75,11 +77,99 @@ async def list_providers() -> dict:
         {"id": "openai", "name": "OpenAI", "configured": bool(os.environ.get("OPENAI_API_KEY"))},
         {"id": "compat", "name": "OpenAI 兼容", "configured": bool(settings.openai_compat_base_url)},
     ]
+    providers += [
+        {"id": c["id"], "name": c["name"], "configured": True}
+        for c in list_custom()
+    ]
     return {
         "providers": providers,
         "default": settings.agent_llm_provider,
         "active": settings.agent_llm_provider,
     }
+
+
+class ProviderUpsert(BaseModel):
+    id: str | None = None
+    name: str
+    base_url: str
+    api_key: str = ""
+    model: str = ""
+
+
+class ProviderTest(BaseModel):
+    base_url: str
+    api_key: str = ""
+    id: str | None = None  # 编辑时 Key 留空表示沿用旧值
+
+
+@router.get("/providers/custom")
+async def list_custom_providers() -> dict:
+    """自定义提供商列表(Key 掩码,不回传明文)。"""
+    from app.core.provider_registry import list_custom, mask_key
+
+    items = []
+    for c in list_custom():
+        items.append({
+            "id": c.get("id", ""),
+            "name": c.get("name", ""),
+            "base_url": c.get("base_url", ""),
+            "model": c.get("model", ""),
+            "api_key_masked": mask_key(c.get("api_key", "")),
+            "models": c.get("models", []),
+        })
+    return {"providers": items}
+
+
+@router.post("/providers/custom")
+async def save_custom_provider(req: ProviderUpsert) -> dict:
+    from app.core.provider_registry import upsert_custom
+
+    try:
+        entry = upsert_custom(
+            pid=req.id,
+            name=req.name,
+            base_url=req.base_url,
+            api_key=req.api_key,
+            model=req.model,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True, "id": entry["id"]}
+
+
+@router.delete("/providers/custom/{pid}")
+async def delete_custom_provider(pid: str) -> dict:
+    from app.core.provider_registry import delete_custom
+
+    return {"ok": delete_custom(pid)}
+
+
+@router.post("/providers/custom/test")
+async def test_custom_provider(req: ProviderTest) -> dict:
+    """测试连通性并尝试拉取模型列表(GET {base_url}/models)。"""
+    import httpx
+
+    from app.core.provider_registry import get_custom, normalize_base_url
+
+    key = req.api_key.strip()
+    if not key and req.id:
+        old = get_custom(req.id)
+        key = (old or {}).get("api_key", "")
+    base = normalize_base_url(req.base_url)
+    if not base.startswith(("http://", "https://")):
+        return {"ok": False, "error": f"Base URL 无效: {base}"}
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
+    try:
+        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
+            resp = await client.get(f"{base}/models", headers=headers)
+        if resp.status_code == 200:
+            data = resp.json().get("data", []) or []
+            models = [m.get("id", "") for m in data if isinstance(m, dict) and m.get("id")]
+            return {"ok": True, "models": models}
+        return {"ok": False, "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+    except Exception as exc:
+        msg = str(exc) or repr(exc) or type(exc).__name__
+        return {"ok": False, "error": msg[:300]}
 
 
 class TodoCreate(BaseModel):

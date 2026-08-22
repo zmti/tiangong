@@ -1,6 +1,8 @@
 """FastAPI 入口。"""
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 from contextlib import asynccontextmanager
 
@@ -14,44 +16,47 @@ from app.config import settings
 from app.tools.registry import get_registry
 from app.api.chat import list_models
 
+logger = logging.getLogger(__name__)
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # 预热: 触发工具注册
+# ===== 初始化函数定义 =====
+
+def _init_registry():
+    """预热: 触发工具注册"""
     from app.tools.registry import get_registry
-
     get_registry()
 
-    # 嵌入后端质量检查:local(HashEmbedding)无语义,建议配置 API 后端
+
+def _check_embedding_backend():
+    """嵌入后端质量检查"""
     try:
-        from app.config import settings as _cfg
-        if (_cfg.embedding_backend or "local").lower() == "local":
-            backend = _cfg.embedding_api_base_url or _cfg.openai_compat_base_url
+        if (settings.embedding_backend or "local").lower() == "local":
+            backend = settings.embedding_api_base_url or settings.openai_compat_base_url
             if not backend:
                 logger.warning(
                     "embedding_backend=local(HashEmbedding) 无语义检索能力,建议配置 "
                     "EMBEDDING_API_BASE_URL/EMBEDDING_API_KEY 以启用向量语义搜索"
                 )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("嵌入后端检查失败(不影响主服务): %s", e)
 
-    # 多模态功能检查:图片生成/识别/语音
+
+def _check_multimodal_features():
+    """多模态功能检查:图片生成/识别/语音"""
     try:
-        from app.config import settings as _cfg
         from app.core.multimodal import model_supports_vision
 
         # 图片生成检查
-        if not _cfg.openai_compat_base_url:
+        if not settings.openai_compat_base_url:
             logger.warning(
                 "[功能未启用] 图片生成功能需要配置 OPENAI_COMPAT_BASE_URL + OPENAI_COMPAT_API_KEY"
             )
         else:
-            logger.info("[功能已启用] 图片生成 (base_url: %s)", _cfg.openai_compat_base_url)
+            logger.info("[功能已启用] 图片生成 (base_url: %s)", settings.openai_compat_base_url)
 
         # 图片识别检查
-        llm_provider = _cfg.agent_llm_provider.lower()
-        llm_model = getattr(_cfg, f"{llm_provider}_model", "") or _cfg.agent_llm_provider
+        llm_provider = settings.agent_llm_provider.lower()
+        llm_model = getattr(settings, f"{llm_provider}_model", "") or settings.agent_llm_provider
         if model_supports_vision(llm_model):
             logger.info("[功能已启用] 图片识别 (模型支持 vision: %s)", llm_model)
         else:
@@ -62,121 +67,165 @@ async def lifespan(app: FastAPI):
             )
 
         # ASR/TTS 检查
-        if _cfg.asr_base_url:
+        if settings.asr_base_url:
             logger.info("[功能已启用] ASR 语音识别")
         else:
             logger.info("[功能未启用] ASR 语音识别 (需配置 ASR_BASE_URL)")
 
-        if _cfg.tts_base_url:
+        if settings.tts_base_url:
             logger.info("[功能已启用] TTS 语音合成")
         else:
             logger.info("[功能未启用] TTS 语音合成 (需配置 TTS_BASE_URL)")
 
-    except Exception:
-        pass
-    
-    # 初始化 MCP 连接(如果配置了)并把远程工具注册进 Agent 工具集
+    except Exception as e:
+        logger.warning("多模态功能检查失败(不影响主服务): %s", e)
+
+
+async def _init_mcp():
+    """初始化 MCP 连接并把远程工具注册进 Agent 工具集"""
     try:
         from app.core.mcp_client import init_mcp_from_config
         from app.tools.mcp_tool import register_mcp_tools
 
         await init_mcp_from_config()
         register_mcp_tools()
-    except Exception:
-        pass  # MCP 初始化失败不影响主服务
+    except Exception as e:
+        logger.warning("MCP 初始化失败(不影响主服务): %s", e)
 
-    # 启动定时任务调度器(注册内置函数并加载持久化任务)
+
+def _init_scheduler():
+    """启动定时任务调度器"""
     try:
         from app.tools.schedule_tool import _get_scheduler
-
         _get_scheduler().start()
-    except Exception:
-        pass  # 调度器启动失败不影响主服务
+    except Exception as e:
+        logger.warning("定时任务调度器启动失败(不影响主服务): %s", e)
 
-    # 启动 Webhook 重试队列排空(后台定期检查未送达事件)
+
+def _init_webhook_queue():
+    """启动 Webhook 重试队列排空"""
     try:
         from app.core.webhook import start_webhook_queue_drainer
-
         start_webhook_queue_drainer()
-    except Exception:
-        pass  # Webhook 初始化失败不影响主服务
+    except Exception as e:
+        logger.warning("Webhook 队列排空启动失败(不影响主服务): %s", e)
 
-    # 启动会话自动清理后台任务(A4)
+
+def _init_session_archiver():
+    """启动会话自动清理后台任务"""
     try:
         from app.core.session_archive import get_session_archiver
-
         archiver = get_session_archiver()
         archiver.start_background_cleanup()
-    except Exception:
-        pass  # 会话清理启动失败不影响主服务
+    except Exception as e:
+        logger.warning("会话自动清理启动失败(不影响主服务): %s", e)
 
-    # 启动长时自主任务后台循环(M5)
+
+async def _init_long_running():
+    """启动长时自主任务后台循环"""
     try:
         from app.core.long_running import get_long_running_manager
-
         mgr = get_long_running_manager()
         asyncio.get_event_loop().create_task(mgr.start_background_loop())
-    except Exception:
-        pass  # 长时任务循环启动失败不影响主服务
+    except Exception as e:
+        logger.warning("长时任务后台循环启动失败(不影响主服务): %s", e)
 
-    # 初始化租户管理器(确保数据表就绪)
+
+def _init_tenant_manager():
+    """初始化租户管理器"""
     try:
         from app.core.tenant import get_tenant_manager
-
         get_tenant_manager()
-    except Exception:
-        pass  # 租户初始化失败不影响主服务
+    except Exception as e:
+        logger.warning("租户管理器初始化失败(不影响主服务): %s", e)
 
-    # 启动工具热加载器(app/tools/ 下新增 .py 自动注册)
+
+def _init_tool_hot_loader():
+    """启动工具热加载器"""
     try:
         from app.core.tool_watcher import start_tool_hot_loader
-
         start_tool_hot_loader()
-    except Exception:
-        pass  # 热加载器启动失败不影响主服务
+    except Exception as e:
+        logger.warning("工具热加载器启动失败(不影响主服务): %s", e)
 
-    # 启动记忆 TTL 后台清理(自动淘汰过期低价值记忆)
+
+def _init_memory_ttl():
+    """启动记忆 TTL 后台清理"""
     try:
         from app.core.memory_ttl import start_memory_ttl_cleanup
-
         start_memory_ttl_cleanup()
-    except Exception:
-        pass  # 记忆 TTL 初始化失败不影响主服务
+    except Exception as e:
+        logger.warning("记忆 TTL 清理启动失败(不影响主服务): %s", e)
 
-    yield
 
-    # 优雅关闭:停止 Webhook 队列排空任务
+# ===== 停止函数定义 =====
+
+async def _stop_webhook_queue():
     try:
         from app.core.webhook import stop_webhook_queue_drainer
-
         await stop_webhook_queue_drainer()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Webhook 队列排空停止失败: %s", e)
 
-    # 停止会话自动清理
+
+def _stop_session_archiver():
     try:
         from app.core.session_archive import get_session_archiver
-
         get_session_archiver().stop_background_cleanup()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("会话自动清理停止失败: %s", e)
 
-    # 停止长时任务循环
+
+async def _stop_long_running():
     try:
         from app.core.long_running import get_long_running_manager
-
         mgr = get_long_running_manager()
         await mgr.stop_background_loop()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("长时任务循环停止失败: %s", e)
 
-    # 停止记忆 TTL 后台清理
+
+def _stop_memory_ttl():
     try:
         from app.core.memory_ttl import stop_memory_ttl_cleanup
-
         stop_memory_ttl_cleanup()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("记忆 TTL 清理停止失败: %s", e)
+
+
+# ===== 统一初始化入口 =====
+
+async def _startup():
+    """应用启动时统一初始化所有组件"""
+    # 同步初始化
+    _init_registry()
+    _check_embedding_backend()
+    _check_multimodal_features()
+    _init_scheduler()
+    _init_webhook_queue()
+    _init_session_archiver()
+    _init_tenant_manager()
+    _init_tool_hot_loader()
+    _init_memory_ttl()
+    
+    # 异步初始化
+    await _init_mcp()
+    await _init_long_running()
+
+
+async def _shutdown():
+    """应用关闭时优雅停止所有组件"""
+    await _stop_webhook_queue()
+    _stop_session_archiver()
+    await _stop_long_running()
+    _stop_memory_ttl()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await _startup()
+    yield
+    await _shutdown()
 
 
 app = FastAPI(title="Agent Service", version="1.0.0", lifespan=lifespan)
@@ -230,7 +279,33 @@ app.include_router(artifacts.router, dependencies=_auth)  # Artifacts 实时渲�
 # 本地生成图片的静态目录(data/images),供聊天与历史直接展示
 _images_dir = os.path.join(settings.resolved_data_dir, "images")
 os.makedirs(_images_dir, exist_ok=True)
-app.mount("/images", StaticFiles(directory=_images_dir), name="images")
+# 使用 API 路由代替 StaticFiles，避免 PyInstaller 打包问题
+@app.get("/images/{filename}")
+async def get_image(filename: str):
+    """提供本地生成的图片"""
+    import fastapi
+    filepath = os.path.join(_images_dir, filename)
+    if not os.path.isfile(filepath):
+        raise fastapi.HTTPException(status_code=404, detail="File not found")
+    # 检测 MIME 类型
+    ext = os.path.splitext(filename)[1].lower()
+    mime_types = {
+        '.png': 'image/png',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.gif': 'image/gif',
+        '.webp': 'image/webp',
+        '.bmp': 'image/bmp',
+    }
+    mime_type = mime_types.get(ext, 'application/octet-stream')
+    with open(filepath, 'rb') as f:
+        content = f.read()
+    return fastapi.responses.Response(content=content, media_type=mime_type)
+
+# 本地生成视频的静态目录(data/videos),供聊天与历史直接播放
+_videos_dir = os.path.join(settings.resolved_data_dir, "videos")
+os.makedirs(_videos_dir, exist_ok=True)
+app.mount("/videos", StaticFiles(directory=_videos_dir), name="videos")
 
 
 @app.get("/")
@@ -257,7 +332,9 @@ async def health() -> dict:
     import time as _time
     from pathlib import Path as _Path
 
-    status = {"status": "ok"}
+    from app.config import APP_VERSION
+
+    status = {"status": "ok", "version": APP_VERSION}
 
     # 1. LLM 连通性(轻量探测:尝试解析 provider 配置,不做实际请求)
     llm_ok = bool(settings.agent_llm_provider)
@@ -309,7 +386,8 @@ async def health() -> dict:
         }
         if disk_free < disk_total * 0.05:  # 剩余不足 5%
             status["status"] = "degraded"
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        logger.debug("磁盘信息读取失败: %s", e)
         status["disk"] = {"error": "无法读取磁盘信息"}
 
     # 4. 运行时统计
@@ -322,7 +400,8 @@ async def health() -> dict:
             "recent_llm_calls_1min": llm_calls_1min,
             "buffer_size": len(_tracer._buffer),  # noqa: SLF001
         }
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        logger.debug("运行时指标读取失败: %s", e)
         status["runtime"] = {"error": "无法读取运行时指标"}
 
     # 5. 后台任务状态
@@ -335,7 +414,8 @@ async def health() -> dict:
             "running": sum(1 for t in all_tasks if t.get("status") == "running"),
             "queued": sum(1 for t in all_tasks if t.get("status") == "queued"),
         }
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        logger.debug("任务状态读取失败: %s", e)
         status["tasks"] = {"error": "无法读取任务状态"}
 
     # 综合状态

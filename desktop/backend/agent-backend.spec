@@ -1,4 +1,4 @@
-﻿# -*- mode: python ; coding: utf-8 -*-
+# -*- mode: python ; coding: utf-8 -*-
 import os
 
 from PyInstaller.utils.hooks import collect_all
@@ -21,6 +21,29 @@ def _collect_dir(src):
 app_datas, app_binaries, app_hiddenimports = collect_all('app')
 uvicorn_datas, uvicorn_binaries, uvicorn_hiddenimports = collect_all('uvicorn')
 
+# conda 系 Python 的 C 运行库放在 <prefix>/Library/bin,PyInstaller 不会自动收集,
+# 冻结后依次报 "_ctypes/_sqlite3/_lzma/... DLL load failed"。按名单缺啥补啥。
+import sys
+_lib_bin = os.path.join(sys.base_prefix, 'Library', 'bin')
+for _name in (
+    'ffi.dll',            # _ctypes
+    'sqlite3.dll',        # _sqlite3
+    'liblzma.dll',        # _lzma
+    'libbz2.dll',         # _bz2(大小写两种命名都试)
+    'LIBBZ2.dll',
+    'zlib.dll',           # _hashlib / _zlib
+    'libexpat.dll',       # pyexpat / _elementtree
+    'libcrypto-3-x64.dll',  # _ssl
+    'libssl-3-x64.dll',
+    'libmpdec-4.dll',     # _decimal
+):
+    _src = os.path.join(_lib_bin, _name)
+    if os.path.isfile(_src):
+        app_binaries.append((_src, '.'))
+_ffi_dlls = os.path.join(sys.base_prefix, 'DLLs', 'ffi.dll')
+if os.path.isfile(_ffi_dlls):
+    app_binaries.append((_ffi_dlls, '.'))
+
 a = Analysis(
     [r'E:\dev\agent-service\desktop\backend\launcher.py'],
     pathex=[r'E:\dev\agent-service', venv_site],
@@ -39,13 +62,15 @@ a = Analysis(
         'uvicorn.lifespan',
         'uvicorn.lifespan.on',
         'edge_tts',
+        'numpy',
         'matplotlib',
         'matplotlib.backends.backend_agg',
-        'matplotlib.backends.backend_pdf',
-        'matplotlib.backends.backend_svg',
-        'numpy',
-    ] + app_hiddenimports + uvicorn_hiddenimports,
-    hookspath=[],
+    'websockets',
+    'websockets.exceptions',
+    'croniter',
+    'croniter.croniter',
+  ] + app_hiddenimports + uvicorn_hiddenimports,
+    hookspath=[r'E:\dev\agent-service\desktop\backend\hooks'],
     runtime_hooks=[],
     excludes=[
         'tkinter', 'scipy', 'pandas', 'IPython', 'notebook',

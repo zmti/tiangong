@@ -1,14 +1,67 @@
 /* 公共工具:命名空间 / API 封装 / Markdown 渲染 / 消息 DOM / 灯箱 */
 window.App = {
   backendUrl: '',
-  sessionId: 'desktop-' + Date.now().toString(36),
+  // 会话ID持久化:首次创建后保存到localStorage,刷新后恢复
+  sessionId: (() => {
+    try {
+      const saved = localStorage.getItem('agent_session_id');
+      if (saved && saved.startsWith('desktop-')) return saved;
+    } catch (_) {}
+    return 'desktop-' + Date.now().toString(36);
+  })(),
   streaming: false,
   abortController: null,
   selectedImageFile: null,
   els: {},
   _groupId: 0,
   _currentGroup: null,
+  _mdBuf: '',
   Group: {},
+  // 执行轨迹面板(由common.js末尾的App.ExecTrace模块提供)
+  ExecTrace: {},
+};
+// 持久化sessionId(仅在首次创建时保存)
+try {
+  if (!localStorage.getItem('agent_session_id')) {
+    localStorage.setItem('agent_session_id', App.sessionId);
+  }
+} catch (_) {}
+
+
+/* 从工具结果串中提取图片 URL(兼容 JSON / Python repr / 纯 URL / dict) */
+App.parseImageUrl = function (resultStr) {
+  if (!resultStr) return '';
+  let url = '';
+  // 1. 直接匹配 URL(支持带查询参数的 CDN URL)
+  const m = String(resultStr).match(/(https?:\/\/[^\s"'`()<>]+?\.(?:png|jpe?g|webp|gif|jpeg))/i);
+  if (m) return m[1] || '';
+  // 2. JSON 解析
+  try {
+    const obj = typeof resultStr === 'string' ? JSON.parse(resultStr) : resultStr;
+    if (obj && typeof obj === 'object') {
+      url = obj.image_url || obj.url || '';
+      if (url) return url;
+    }
+  } catch (_) {}
+  // 3. Python dict repr: {'image_url': '/images/xxx.png'}
+  try {
+    const quoted = String(resultStr).replace(/'/g, '"');
+    const obj = JSON.parse(quoted);
+    url = obj.image_url || obj.url || '';
+    if (url) return url;
+  } catch (_) {}
+  return '';
+};
+
+/* 根据 DOM 中的用户消息数量刷新欢迎页显隐 */
+App.refreshWelcomePage = function () {
+  const msgs = App.els.messages;
+  const hasUserMsg = msgs ? Array.from(msgs.querySelectorAll('.msg.user')).length > 0 : false;
+  if (hasUserMsg) {
+    document.body.classList.add('has-messages');
+  } else {
+    document.body.classList.remove('has-messages');
+  }
 };
 
 /* ---------- 请求分组:将一次对话的工具调用/思考/计划折叠为单个卡片 ---------- */
@@ -249,6 +302,22 @@ function highlightCode(lang, code) {
   }).join('\n');
 }
 
+/* 语法高亮入口:优先本地 highlight.js(覆盖字符串/注释/函数/属性等完整 token),
+ * 未加载或不认识该语言时回退到上面的轻量关键词高亮。 */
+function hljsHighlight(lang, code) {
+  const H = window.hljs;
+  if (H) {
+    try {
+      const l = String(lang || '').toLowerCase().trim();
+      if (l && H.getLanguage(l)) return H.highlight(code, { language: l, ignoreIllegals: true }).value;
+      const alias = LANG_ALIAS[l];
+      if (alias && H.getLanguage(alias)) return H.highlight(code, { language: alias, ignoreIllegals: true }).value;
+      if (!l) return H.highlightAuto(code).value;
+    } catch (_) { /* fallthrough */ }
+  }
+  return highlightCode(lang, code);
+}
+
 /* ---------- 轻量语法检查(括号配对 + 块注释跨行) ---------- */
 const SYNTAX_PAIR = { '(': ')', '[': ']', '{': '}' };
 const SYNTAX_OPEN = new Set(['(', '[', '{']);
@@ -380,7 +449,9 @@ function renderTaskItem(item) {
 
 function renderMarkdown(md) {
   if (!md) return '';
-  const lines = String(md).replace(/\r\n/g, '\n').split('\n');
+  // 兜底：移除任何残留的 <thinking>...</thinking> 块，防止思考原文污染主答案
+  const cleaned = String(md).replace(/<thinking[^>]*>[\s\S]*?<\/thinking>/gi, '').trim();
+  const lines = cleaned.replace(/\r\n/g, '\n').split('\n');
   let html = '';
   let inCode = false;
   let codeLang = '';
@@ -402,14 +473,24 @@ function renderMarkdown(md) {
   function flushCodeBlock() {
     const lang = codeLang;
     const codeText = codeBuf.join('\n');
-    const highlighted = highlightCode(lang, codeText);
+    const highlighted = hljsHighlight(lang, codeText);
     const issues = checkSyntax(lang, codeText);
     let badge = '';
     if (issues.length) {
       const tip = issues.slice(0, 4).map((x) => `L${x.line}: ${x.msg}`).join('\n');
-      badge = `<span class="syntax-warn" title="${escapeAttr(tip + (issues.length > 4 ? `\n… 共 ${issues.length} 处` : ''))}">⚠ ${issues.length}</span>`;
+      badge = `<span class="syntax-warn" title="${escapeAttr(tip + (issues.length > 4 ? `\n… 共 ${issues.length} 处` : ''))}" data-tip="${escapeAttr(tip)}">⚠ ${issues.length}</span>`;
     }
-    html += `<div class="code-block${issues.length ? ' has-issue' : ''}"><button class="code-copy" title="复制代码">复制</button>${badge}<pre><code${lang ? ` class="lang-${escapeAttr(lang)}"` : ''}>${highlighted}</code></pre></div>`;
+    const lineCount = codeBuf.length;
+    const foldable = lineCount > 30;
+    html += `<div class="code-block${issues.length ? ' has-issue' : ''}${foldable ? ' foldable collapsed' : ''}">`
+      + `<div class="code-head">`
+      + `<span class="code-lang">${escapeHtml(normLang(lang) || 'text')}</span>`
+      + `${badge}`
+      + `<button class="code-copy" type="button" title="复制代码">复制</button>`
+      + `</div>`
+      + `<div class="code-body"><pre><code${lang ? ` class="lang-${escapeAttr(lang)}"` : ''}>${highlighted}</code></pre></div>`
+      + (foldable ? `<button class="code-fold-toggle" type="button">⤵ 展开全部 ${lineCount} 行</button>` : '')
+      + `</div>`;
   }
 
   let i = 0;
@@ -510,18 +591,33 @@ function currentTime() {
   return `${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
-/* 用户/助手消息返回 .bubble(便于流式填充);工具/错误消息返回外层容器。
- * 结构: [avatar] [ msg-body > bubble / msg-actions / msg-time ],避免操作条挤压气泡。 */
+/* ---------- 轮次容器：每一轮对话一个统一容器 ----------
+ * 结构: [avatar] [ process-rail ] [ answer/doc ]
+ * - process-rail: 默认折叠展示摘要，展开为垂直时间线
+ * - answer: assistant 回答, 文档式排版(无厚边框)
+ * - user: 保留气泡形式 */
 function appendMessage(text, type = 'bot') {
   const wrap = document.createElement('div');
   wrap.className = `msg ${type}`;
 
   if (type === 'user' || type === 'bot') {
+    if (type === 'bot' && !text) {
+      wrap.style.display = 'none';
+    }
     const avatar = makeAvatar(type);
-    const body = document.createElement('div');
-    body.className = 'msg-body';
-    const bubble = document.createElement('div');
-    bubble.className = 'bubble';
+    const rail = document.createElement('div');
+    rail.className = 'process-rail';
+    rail.innerHTML = `<span class="rail-summary">⚙ 已完成</span>`;
+    rail.title = '点击展开过程';
+    rail.addEventListener('click', () => rail.classList.toggle('open'));
+    const answer = document.createElement('div');
+    answer.className = 'answer-doc';
+    if (type === 'bot') {
+      if (text) answer.innerHTML = renderMarkdown(text);
+      else answer.textContent = '';
+    } else {
+      answer.textContent = text;
+    }
     const act = document.createElement('div');
     act.className = 'msg-actions';
     const timeEl = document.createElement('div');
@@ -529,7 +625,6 @@ function appendMessage(text, type = 'bot') {
     timeEl.textContent = currentTime();
 
     if (type === 'bot') {
-      if (text) bubble.innerHTML = renderMarkdown(text);
       const mk = (title, label, fn) => {
         const b = document.createElement('button');
         b.className = 'msg-action';
@@ -539,16 +634,15 @@ function appendMessage(text, type = 'bot') {
         act.appendChild(b);
       };
       mk('复制回复', '复制', () => {
-        const txt = (bubble.textContent || '').trim();
+        const txt = (answer.textContent || answer.innerText || '').trim();
         if (txt) navigator.clipboard.writeText(txt).catch(() => {});
       });
       mk('重新生成', '重新生成', () => { if (App.Chat) App.Chat.regenerate(wrap); });
       mk('朗读该回复', '🔊', () => {
-        const txt = (bubble.textContent || '').trim();
+        const txt = (answer.textContent || answer.innerText || '').trim();
         if (txt) App.speak(txt);
       });
     } else {
-      bubble.textContent = text;
       const mk = (title, label, fn) => {
         const b = document.createElement('button');
         b.className = 'msg-action';
@@ -558,37 +652,83 @@ function appendMessage(text, type = 'bot') {
         act.appendChild(b);
       };
       mk('复制这条消息', '复制', () => {
-        const txt = (bubble.textContent || '').trim();
+        const txt = (answer.textContent || '').trim();
         if (txt) navigator.clipboard.writeText(txt).catch(() => {});
       });
-      mk('编辑这条消息并重新发送', '编辑', () => { if (App.Chat) App.Chat.editMessage(wrap, bubble); });
+      mk('编辑这条消息并重新发送', '编辑', () => { if (App.Chat) App.Chat.editMessage(wrap, answer); });
     }
 
-    body.appendChild(bubble);
-    body.appendChild(act);
-    body.appendChild(timeEl);
     wrap.appendChild(avatar);
-    wrap.appendChild(body);
+    wrap.appendChild(rail);
+    wrap.appendChild(answer);
+    wrap.appendChild(act);
+    wrap.appendChild(timeEl);
     App.els.messages.appendChild(wrap);
     App.els.messages.scrollTop = App.els.messages.scrollHeight;
-    // 确保欢迎页隐藏
-    document.body.classList.add('has-messages');
-    return bubble;
+    if (type === 'user') App.refreshWelcomePage();
+    bubble._wrap = wrap;
+    return answer; // 返回 answer DOM 供后续过程轴累积使用
   }
 
-  if (type === 'bot' && text) {
-    wrap.innerHTML = renderMarkdown(text);
-  } else {
-    wrap.textContent = text;
+  // 非 user/bot 类型(tool/plan/orchestration)直接插入到最近的 answer 前
+  // 这样工具结果/思考会出现在对应轮次的答案上方
+  const lastMsg = App.els.messages.querySelector(`[class*="msg"]:last-child`);
+  if (lastMsg) {
+    const target = lastMsg.querySelector('.answer-doc') || lastMsg;
+    // 根据 type 决定插入位置
+    if (type === 'thinking') {
+      const thinkingEl = document.createElement('div');
+      thinkingEl.className = 'thinking-inline';
+      thinkingEl.textContent = text || '';
+      target.prepend(thinkingEl);
+      return thinkingEl;
+    } else if (type === 'tool') {
+      const toolEl = document.createElement('div');
+      toolEl.className = 'tool-inline';
+      toolEl.innerHTML = `<div class="tool-label">🔧 ${text || '工具'}</div>`;
+      target.prepend(toolEl);
+      return toolEl;
+    } else if (type === 'plan') {
+      const planEl = document.createElement('div');
+      planEl.className = 'plan-inline';
+      planEl.innerHTML = `<span class="plan-label">📋 ${text || '计划'}</span>`;
+      target.prepend(planEl);
+      return planEl;
+    }
   }
-  App.els.messages.appendChild(wrap);
-  App.els.messages.scrollTop = App.els.messages.scrollHeight;
-  // 确保欢迎页隐藏
-  document.body.classList.add('has-messages');
-  return wrap;
+  // 兜底：直接追加
+  App.els.messages.textContent = text;
+  return null;
 }
 
-function appendToolEvent(name, args, result) {
+function appendToolEvent(name, args, result, appendTo = null) {
+  // 图片生成:历史记录/兜底场景下渲染为简洁图片卡片,不显示工具调用标签和 JSON 参数
+  if (name === 'generate_image') {
+    const url = App.parseImageUrl(result);
+    if (url) {
+      const wrap = document.createElement('div');
+      wrap.className = 'msg bot';
+      // 补齐头像占位,与普通 bot 气泡左对齐,避免无头像时整体左移错位
+      const avatar = makeAvatar('bot');
+      const body = document.createElement('div');
+      body.className = 'msg-body';
+      body.innerHTML = '<div class="img-gen-bubble img-gen-history">'
+        + '<img class="img-gen-result" src="' + App.escapeHtml(url) + '" alt="生成结果">'
+        + '</div>';
+      wrap.appendChild(avatar);
+      wrap.appendChild(body);
+      // appendTo 可能是数组(批量插入)或 DOM 元素
+      if (appendTo) {
+        if (Array.isArray(appendTo)) appendTo.push(wrap);
+        else appendTo.appendChild(wrap);
+      } else {
+        App.els.messages.appendChild(wrap);
+        App.els.messages.scrollTop = App.els.messages.scrollHeight;
+      }
+      return wrap;
+    }
+  }
+
   const div = document.createElement('div');
   div.className = 'msg tool';
 
@@ -649,6 +789,35 @@ function appendToolEvent(name, args, result) {
     div.appendChild(actions);
   }
 
+  // 工具结果含 video_url:渲染视频播放器
+  const vidUrl = parsedObj && parsedObj.video_url ? String(parsedObj.video_url) : '';
+  if (vidUrl) {
+    const vid = document.createElement('video');
+    vid.src = vidUrl;
+    vid.controls = true;
+    vid.preload = 'metadata';
+    vid.className = 'msg-img';
+    div.appendChild(vid);
+    const actions = document.createElement('div');
+    actions.className = 'tool-actions';
+    const mkBtn = (txt, fn) => {
+      const b = document.createElement('button');
+      b.textContent = txt;
+      b.className = 'lb-btn';
+      b.addEventListener('click', fn);
+      actions.appendChild(b);
+    };
+    mkBtn('💾 下载', () => {
+      const a = document.createElement('a');
+      a.href = vidUrl;
+      a.download = 'video.mp4';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    });
+    div.appendChild(actions);
+  }
+
   const visual = renderToolVisual(name, parsedObj);
   if (visual) {
     const body = document.createElement('div');
@@ -664,8 +833,14 @@ function appendToolEvent(name, args, result) {
 
   appendVersionButton(div, result);
 
-  App.els.messages.appendChild(div);
-  App.els.messages.scrollTop = App.els.messages.scrollHeight;
+  // appendTo 可能是数组(批量插入)或 DOM 元素
+  if (appendTo) {
+    if (Array.isArray(appendTo)) appendTo.push(div);
+    else appendTo.appendChild(div);
+  } else {
+    App.els.messages.appendChild(div);
+    App.els.messages.scrollTop = App.els.messages.scrollHeight;
+  }
   return div;
 }
 
@@ -678,23 +853,39 @@ function stripThinkingTags(content) {
     .trim();
 }
 
-/* 思考过程:折叠卡片(点击标题展开/收起) */
+/* 思考过程:折叠卡片(点击标题展开/收起)
+ * 同一轮对话复用同一张卡(累积内容);插入到答案气泡之前而非末尾,
+ * 避免流式过程中 thinking 被推到答案之后造成错位。 */
 function appendThinking(content) {
-  const div = document.createElement('div');
-  div.className = 'msg thinking';
-  const label = document.createElement('div');
-  label.className = 'think-label';
-  label.textContent = '💭 思考过程';
-  const body = document.createElement('div');
-  body.className = 'think-body';
-  const text = stripThinkingTags(content).slice(0, 2000);
-  body.textContent = text;
-  label.addEventListener('click', () => div.classList.toggle('open'));
-  div.appendChild(label);
-  div.appendChild(body);
-  App.els.messages.appendChild(div);
+  // 存在执行分组时，思考详情已收入分组，不再创建独立大卡片
+  if (App._currentGroup && App.Group && App.Group.setThinking) {
+    App.Group.setThinking(content);
+    return null;
+  }
+  if (!App._thinkingWrap) {
+    const div = document.createElement('div');
+    div.className = 'msg thinking';
+    const label = document.createElement('div');
+    label.className = 'think-label';
+    label.textContent = '💭 思考过程';
+    const body = document.createElement('div');
+    body.className = 'think-body';
+    label.addEventListener('click', () => div.classList.toggle('open'));
+    div.appendChild(label);
+    div.appendChild(body);
+    // 插入到答案气泡之前(若存在),否则追加到末尾
+    const anchor = App._answerWrap;
+    if (anchor && anchor.parentNode === App.els.messages) {
+      App.els.messages.insertBefore(div, anchor);
+    } else {
+      App.els.messages.appendChild(div);
+    }
+    App._thinkingWrap = div;
+  }
+  const body = App._thinkingWrap.querySelector('.think-body');
+  body.textContent = stripThinkingTags(content).slice(0, 2000);
   App.els.messages.scrollTop = App.els.messages.scrollHeight;
-  return div;
+  return App._thinkingWrap;
 }
 
 /* ---------- 任务计划卡片 ---------- */
@@ -704,24 +895,32 @@ function planStatusText(s) {
   return { pending: '待办', in_progress: '进行中', done: '已完成', failed: '失败', skipped: '跳过' }[s] || s;
 }
 
-function appendPlan(evt) {
+function appendPlan(evt, appendTo = null) {
   const plan = evt.plan;
-  if (!plan) return;
+  if (!plan) return null;
   let div;
-  if (evt.action === 'create' || !App._planCard) {
+  const isNew = evt.action === 'create' || !App._planCard;
+  if (isNew) {
     div = document.createElement('div');
     div.className = 'msg plan';
     const label = document.createElement('div');
     label.className = 'plan-label';
     label.textContent = '📋 任务计划';
     div.appendChild(label);
-    App.els.messages.appendChild(div);
+    // appendTo 可能是数组(批量插入)或 DOM 元素
+    if (appendTo) {
+      if (Array.isArray(appendTo)) appendTo.push(div);
+      else appendTo.appendChild(div);
+    } else {
+      App.els.messages.appendChild(div);
+    }
     App._planCard = div;
   } else {
     div = App._planCard;
   }
   App.renderPlanCard(div, plan);
-  App.els.messages.scrollTop = App.els.messages.scrollHeight;
+  if (!appendTo) App.els.messages.scrollTop = App.els.messages.scrollHeight;
+  return div;
 }
 
 function renderPlanCard(div, plan) {
@@ -889,6 +1088,8 @@ function renderToolVisual(name, obj) {
     if (name === 'code_context') return '<div class="term-head">📄 ' + App.escapeHtml(obj.path || '') + ` L${obj.start_line}-${obj.end_line} / ${obj.total_lines}</div><pre class="term-out">` + App.escapeHtml(obj.content || '') + '</pre>';
     if (name === 'project_tree') return '<div class="term-head">🌳 项目结构 · ' + App.escapeHtml((obj.files || 0) + ' 文件 / ' + (obj.total_lines || 0) + ' 行') + '</div><pre class="term-out">' + App.escapeHtml(obj.tree || '') + '</pre>';
     if (name === 'code_semantic_search') return renderCodeSearch({ query: obj.query, results: (obj.results || []).map((r) => ({ file: r.file, line: '', text: `相关度 ${r.score}` })), truncated: false });
+    if (name === 'generate_image') return null; // 图片生成已在 appendToolEvent 中渲染为专属卡片
+    if (name === 'generate_video') return `<div class="term-head">🎬 视频已生成</div><div class="term-out">${App.escapeHtml(obj.duration ? `时长: ${obj.duration}s` : (obj.format || ''))}</div>`;
   } catch (_) { return null; }
   return null;
 }
@@ -1025,8 +1226,7 @@ function showTyping() {
 function removeTyping() {
   const t = document.getElementById('typing');
   if (t) t.remove();
-  const w = document.getElementById('welcome');
-  if (w) w.style.display = 'none';
+  // 不在此处隐藏 welcome:由 appendMessage 在有真实用户消息时统一控制
 }
 
 /* ---------- 灯箱 ---------- */
@@ -1175,12 +1375,14 @@ async function api(path, opts = {}) {
   const headers = opts.headers || {};
   if (App.backendApiKey) headers['Authorization'] = 'Bearer ' + App.backendApiKey;
   opts.headers = headers;
-  // 默认 30s 超时,避免请求永久挂起
+  // 默认 60s 超时,避免请求永久挂起(知识库上传/文件操作可能需要更长时间)
   if (!opts.signal) {
     const ctl = new AbortController();
     opts.signal = ctl.signal;
-    setTimeout(() => ctl.abort(), 30000);
+    setTimeout(() => ctl.abort(), 60000);
   }
+  // cache: 'no-store' 防止浏览器缓存 SSE 响应,确保流式数据实时到达
+  if (!opts.cache) opts.cache = 'no-store';
   return fetch(App.backendUrl + path, opts);
 }
 
@@ -1408,6 +1610,12 @@ App.Confirmation = {
               } else if (evt.type === 'done') {
                 interrupted = evt.interrupted || false;
                 interruptData = evt.interrupt || null;
+              } else if (evt.type === 'thinking') {
+                // thinking 事件也累加到答案中，避免确认后答案空白
+                if (!answer) answer = evt.content || '';
+              } else if (evt.type === 'confirmation' && evt.requests && App.Confirmation && App.Confirmation.show) {
+                // 续跑中又遇到需要确认的工具，直接显示确认卡片
+                App.Confirmation.show(evt.requests, runId);
               }
             } catch (_) { /* 忽略解析错误 */ }
           }
@@ -1421,6 +1629,9 @@ App.Confirmation = {
         } else if (answer) {
           const div = App.appendMessage(answer, 'bot');
           div.innerHTML = App.renderMarkdown(answer);
+        } else {
+          // 无答案也无中断:显示提示避免空消息
+          App.appendMessage('(续跑完成,无输出)', 'system');
         }
       }
     } catch (e) {
@@ -1446,7 +1657,13 @@ App.Confirmation = {
 };
 
 function selectedProvider() {
-  return App.els.providerSelect ? App.els.providerSelect.value : '';
+  // 只返回 provider ID(后端 LLMClient 按别名表解析);
+  // 具体模型经 /v1/chat 的独立 model 字段传递(App.ModelPicker.get().model)
+  return App.ModelPicker ? (App.ModelPicker.get().provider || '') : '';
+}
+
+function selectedModel() {
+  return App.ModelPicker ? (App.ModelPicker.get().model || '') : '';
 }
 
 /* ---------- 状态 ---------- */
@@ -1495,8 +1712,243 @@ App.lineDiff = lineDiff;
 App.buildDiffHtml = buildDiffHtml;
 App.api = api;
 App.selectedProvider = selectedProvider;
+App.selectedModel = selectedModel;
 App.setStatus = setStatus;
 App.pingBackend = pingBackend;
 App.copyCodeFromButton = copyCodeFromButton;
 App.confirm = confirmDialog;
 App.toast = toast;
+App.stripThinkingTags = stripThinkingTags;
+
+/* ---------- 执行轨迹面板:使用右侧固定面板 ---------- */
+App.ExecTrace = (function () {
+  let steps = [];      // 已记录步骤 {name, icon, status, time, elapsed}
+  let startTime = 0;
+  let panelOpen = false;
+
+  // 工具类型图标映射
+  const TOOL_ICONS = {
+    read: '📖', write: '✏️', exec: '▶️', search: '🔍', browser: '🌐',
+    edit: '🔧', system: '⚙️', tool: '🔨', file: '📄', code: '💻',
+    generate_image: '🖼️', python: '🐍', shell: '⚡', plan: '📋',
+  };
+  function getIcon(name) {
+    const n = (name || '').toLowerCase();
+    for (const [k, v] of Object.entries(TOOL_ICONS)) {
+      if (n.includes(k)) return v;
+    }
+    return '🔨';
+  }
+
+  function getElapsed(ms) {
+    if (!ms || ms < 1000) return '<1s';
+    if (ms < 60000) return (ms / 1000).toFixed(1) + 's';
+    return (ms / 60000).toFixed(1) + 'm';
+  }
+
+  function ensurePanel() {
+    if (!panelOpen) {
+      document.body.classList.add('exec-panel-open');
+      panelOpen = true;
+      // 切换到轨迹标签
+      const traceTab = document.querySelector('.exec-tab[data-tab="trace"]');
+      if (traceTab) traceTab.click();
+    }
+  }
+
+  function renderList() {
+    const listEl = document.getElementById('execTraceList');
+    if (!listEl) return;
+
+    if (steps.length === 0) {
+      listEl.innerHTML = '<div class="exec-empty">暂无执行记录</div>';
+      return;
+    }
+
+    const running = steps.filter(s => s.status === 'running').length;
+    const done = steps.filter(s => s.status === 'done').length;
+    const failed = steps.filter(s => s.status === 'fail').length;
+
+    let html = `<div class="exec-trace-header" style="padding:8px 12px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--border);">
+      <span>${done}✓</span>
+      <span style="margin:0 6px;">·</span>
+      <span style="color:var(--err)">${failed}✗</span>
+      <span style="margin:0 6px;">·</span>
+      <span style="color:var(--primary)">${running}⏳</span>
+      <span style="margin:0 6px;">·</span>
+      <span>${getElapsed(Date.now() - startTime)}</span>
+    </div>`;
+
+    html += '<div class="exec-trace-list">';
+    for (const s of steps) {
+      const cls = s.status === 'fail' ? 'et-fail' : s.status === 'running' ? 'et-running' : 'et-done';
+      html += `<div class="exec-trace-item ${cls}" title="${escapeHtml(s.args || '')}">
+        <span class="exec-trace-icon">${s.icon}</span>
+        <span class="exec-trace-name">${escapeHtml(s.name)}</span>
+        <span class="exec-trace-status">${s.status === 'running' ? '⏳' : s.status === 'fail' ? '✗' : '✓'}</span>
+        <span class="exec-trace-time">${s.time}</span>
+      </div>`;
+    }
+    html += '</div>';
+    listEl.innerHTML = html;
+  }
+
+  // 开始轨迹
+  function start() {
+    startTime = Date.now();
+    steps = [];
+    ensurePanel();
+    renderList();
+  }
+
+  // 添加步骤(工具调用开始)
+  function addStep(name, args, status) {
+    const icon = getIcon(name);
+    const elapsed = Date.now() - startTime;
+    steps.push({ name, icon, status: status || 'running', args, time: new Date().toLocaleTimeString(), elapsed });
+    ensurePanel();
+    renderList();
+  }
+
+  // 更新步骤状态
+  function updateStep(name, status, result) {
+    const step = steps.find(s => s.name === name && s.status === 'running');
+    if (!step) return;
+    step.status = status;
+    step.result = result;
+    step.elapsed = Date.now() - startTime;
+    renderList();
+  }
+
+  // 结束轨迹,显示摘要
+  function finish(answer) {
+    const total = steps.length;
+    const done = steps.filter(s => s.status === 'done' || s.status === 'fail').length;
+    const failed = steps.filter(s => s.status === 'fail').length;
+    const elapsed = Date.now() - startTime;
+
+    // 更新所有running状态为done
+    steps.forEach(s => { if (s.status === 'running') s.status = 'done'; });
+    renderList();
+
+    steps = [];
+    startTime = 0;
+    return { total, done, failed, elapsed };
+  }
+
+  // 清除面板(切换会话时调用)
+  function clear() {
+    steps = [];
+    startTime = 0;
+    const listEl = document.getElementById('execTraceList');
+    if (listEl) listEl.innerHTML = '<div class="exec-empty">暂无执行记录</div>';
+  }
+
+  // 切换面板可见性
+  function toggle() {
+    panelOpen = !panelOpen;
+    document.body.classList.toggle('exec-panel-open', panelOpen);
+  }
+
+  return { start, addStep, updateStep, finish, clear, toggle };
+})();
+
+App.ExecTrace = App.ExecTrace;
+
+/* ---------- 代码预览面板:使用右侧固定面板 ---------- */
+App.CodePreview = (function () {
+  let previews = [];  // 预览列表
+
+  function ensurePanel() {
+    if (!document.body.classList.contains('exec-panel-open')) {
+      document.body.classList.add('exec-panel-open');
+      // 切换到预览标签
+      setTimeout(() => {
+        const previewTab = document.querySelector('.exec-tab[data-tab="preview"]');
+        if (previewTab) previewTab.click();
+      }, 100);
+    } else {
+      const previewTab = document.querySelector('.exec-tab[data-tab="preview"]');
+      if (previewTab) previewTab.click();
+    }
+  }
+
+  function renderList() {
+    const container = document.getElementById('codePreviewContainer');
+    if (!container) return;
+
+    if (previews.length === 0) {
+      container.innerHTML = '<div class="exec-empty">暂无代码预览</div>';
+      return;
+    }
+
+    let html = '';
+    for (const p of previews) {
+      html += `<div class="code-preview-card">
+        <div class="cpp-card-header">
+          <span class="cpp-card-name">${escapeHtml(p.name)}</span>
+          <span class="cpp-card-type">${escapeHtml(p.type)}</span>
+        </div>
+        <div class="cpp-card-body"><pre>${escapeHtml(p.code)}</pre></div>
+        <div class="cpp-card-actions">
+          <button class="cpp-card-btn" onclick="App.CodePreview.copyCode(${previews.indexOf(p)})">📋 复制</button>
+          <button class="cpp-card-btn" onclick="App.CodePreview.clearCode(${previews.indexOf(p)})">🗑 清空</button>
+        </div>
+      </div>`;
+    }
+    container.innerHTML = html;
+  }
+
+  // 显示代码预览
+  function show(code, name, type = 'code') {
+    ensurePanel();
+    previews.push({ code, name, type });
+    renderList();
+  }
+
+  // 复制代码
+  window._copyCode = function(idx) {
+    if (previews[idx] && previews[idx].code) {
+      navigator.clipboard.writeText(previews[idx].code).catch(() => {});
+    }
+  };
+
+  // 清空代码
+  window._clearCode = function(idx) {
+    if (previews[idx]) {
+      previews[idx].code = '';
+      renderList();
+    }
+  };
+
+  // 尝试从工具结果中提取代码并显示预览
+  function tryShowFromResult(name, result) {
+    if (!result) return false;
+    const str = String(result);
+
+    // Python代码
+    if (name === 'python' || name === 'exec_code' || name.includes('python')) {
+      const m = str.match(/```python\s*\n([\s\S]*?)\n\s*```/) ||
+                 str.match(/^([\s\S]*?def |[\s\S]*?import |[\s\S]*?print\()/m);
+      if (m) { show(m[1].trim(), name, 'Python'); return true; }
+    }
+
+    // HTML代码
+    if (name === 'html' || name.includes('html') || str.includes('<html') || str.includes('<!DOCTYPE')) {
+      show(str.trim(), name, 'HTML');
+      return true;
+    }
+
+    // Markdown
+    if (name === 'markdown' || (str.includes('#') && !str.includes('{'))) {
+      show(str.trim(), name, 'Markdown');
+      return true;
+    }
+
+    return false;
+  }
+
+  return { show, tryShowFromResult, copyCode: window._copyCode, clearCode: window._clearCode };
+})();
+
+App.CodePreview = App.CodePreview;

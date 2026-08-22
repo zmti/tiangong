@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -413,11 +414,14 @@ class TaskScheduler:
 
 # 全局调度器实例
 _scheduler: Optional[TaskScheduler] = None
+_scheduler_lock = threading.Lock()
 
 
 def get_scheduler() -> TaskScheduler:
     """获取全局调度器。"""
     global _scheduler
     if _scheduler is None:
-        _scheduler = TaskScheduler()
+        with _scheduler_lock:
+            if _scheduler is None:
+                _scheduler = TaskScheduler()
     return _scheduler

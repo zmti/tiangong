@@ -6,9 +6,10 @@ __pycache__/
 venv/
 .venv_build/
 venv_build
+.venv314/
+
+# 环境变量
 .env
-
-
 
 # 数据
 data/
@@ -21,14 +22,62 @@ logs/
 
 # 测试产物
 .pytest_cache/
+pytest-debug.log*
 
+# 临时文件
+*_test.py
+_test_*.py
+*_test_body.json
+check_*.py
+copy_*.py
+inspect_*.py
+update_*.py
+*_debug.py
+command
+command.sh
+task_command
+terminal_command
+terminal_command.txt
+*.log
+build.log
+backend-debug.log
+backend-full.log
+debug_md.html
+nul
 
-*.git
-*.dist
-*/dist/*
-*/build/*
-*dist*
-# *build*
+# 构建产物
+build/
+build_pyinstaller/
+desktop/backend/build_pyinstaller/
+desktop/build/
+desktop/out/
+desktop/backend/dist/
+desktop/backend/build_pyinstaller/
+desktop/build-work/
+desktop/backend/
+desktop/node_modules/
+desktop/dist/
+
+dist/
+
+# 数据文件
+*.db
+*.db-shm
+*.db-wal
+
+# Node
 */node_modules/*
-*/node_modules/*
-.*
+node_modules/
+
+# Electron
+.electron-data/
+.electron-fresh/
+.electron-isolated/
+.electron-userdata/
+electron_userdata/
+electron_userdata_dev/
+
+# OS
+.DS_Store
+Thumbs.db
+

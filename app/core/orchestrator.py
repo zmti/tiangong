@@ -204,8 +204,18 @@ class MultiAgentOrchestrator:
         task: str,
         user_input: str,
         llm: Any,
+        num_subtasks: int = 0,
     ) -> list[SubTask]:
-        """任务分解: 将复杂任务分解为子任务"""
+        """任务分解: 将复杂任务分解为子任务。
+
+        num_subtasks: UI 配置的子任务数量提示(0=不限制,由模型自行决定)。
+        """
+        count_hint = ""
+        if num_subtasks and num_subtasks > 0:
+            count_hint = (
+                f"\n建议将任务分解为约 {num_subtasks} 个子任务"
+                f"(可按实际复杂度在 ±1 范围内微调,但不要偏离太多)。"
+            )
         prompt = f"""你是一个任务分解专家。请将以下任务分解为可执行的子任务。
 
 任务: {task}
@@ -226,7 +236,7 @@ class MultiAgentOrchestrator:
   {{"description": "测试代码", "assigned_agent": "tester", "dependencies": [1]}}
 ]
 
-只输出 JSON，不要其他内容。"""
+只输出 JSON，不要其他内容。{count_hint}"""
 
         try:
             response = await llm.chat([{"role": "user", "content": prompt}], temperature=0.3)
@@ -497,11 +507,14 @@ class MultiAgentOrchestrator:
 
 # 单例
 _orchestrator: Optional[MultiAgentOrchestrator] = None
+_orchestrator_lock = threading.Lock()
 
 
 def get_orchestrator() -> MultiAgentOrchestrator:
     """获取编排器单例"""
     global _orchestrator
     if _orchestrator is None:
-        _orchestrator = MultiAgentOrchestrator()
+        with _orchestrator_lock:
+            if _orchestrator is None:
+                _orchestrator = MultiAgentOrchestrator()
     return _orchestrator
