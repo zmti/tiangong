@@ -166,7 +166,7 @@
         html += `<h${level}>${renderInline(line.replace(/^#{1,6}\s+/, ''))}</h${level}>`;
       } else if (/^\s*[-*+]\s+/.test(line)) {
         listType = 'ul';
-        listBuf.push(line.replace(/^\s*[-*+)\s+/, ''));
+        listBuf.push(line.replace(/^\s*[-*+]\s+/, ''));
       } else if (/^\s*\d+[.)]\s+/.test(line)) {
         listType = 'ol';
         listBuf.push(line.replace(/^\s*\d+[.)]\s+/, ''));
