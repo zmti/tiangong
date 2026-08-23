@@ -51,16 +51,22 @@ function createTrayIcon() {
 
 // 从后端 .env 读取 AGENT_API_KEY,注入渲染进程的请求头(后端未配置则留空 = 无鉴权)
 function readBackendApiKey() {
+  // 开发模式:从项目根 .env 读取
+  const projectRoot = path.join(__dirname, '..', '..');
+  const devEnv = path.join(projectRoot, '.env');
+  const candidates = [devEnv];
+  // 生产模式:从 exe 同目录 .env 读取
   const exe = getBackendExecutable();
-  if (!exe) return '';
-  const envFile = path.join(path.dirname(exe), '.env');
-  try {
-    const txt = fs.readFileSync(envFile, 'utf-8');
-    const line = txt.split(/\r?\n/).find((l) => /^\s*AGENT_API_KEY\s*=/.test(l));
-    if (line) {
-      return line.replace(/^\s*AGENT_API_KEY\s*=\s*/, '').replace(/^["']|["']$/g, '').trim();
-    }
-  } catch (_) { /* .env 不存在时无鉴权 */ }
+  if (exe) candidates.push(path.join(path.dirname(exe), '.env'));
+  for (const envFile of candidates) {
+    try {
+      const txt = fs.readFileSync(envFile, 'utf-8');
+      const line = txt.split(/\r?\n/).find((l) => /^\s*AGENT_API_KEY\s*=/.test(l));
+      if (line) {
+        return line.replace(/^\s*AGENT_API_KEY\s*=\s*/, '').replace(/^["']|["']$/g, '').trim();
+      }
+    } catch (_) { /* .env 不存在时无鉴权 */ }
+  }
   return '';
 }
 
@@ -178,7 +184,7 @@ function startBackend() {
   const mainPy = path.join(projectRoot, 'app', 'main.py');
 
   if (fs.existsSync(pythonExe) && fs.existsSync(mainPy)) {
-    // 使用 Python 源码后端
+    // 开发模式:使用项目 .venv 的 Python 源码后端
     const args = ['-m', 'uvicorn', 'app.main:app', '--host', '127.0.0.1', '--port', String(BACKEND_PORT)];
     console.log('[backend] 使用 Python 源码后端:', pythonExe);
     backendProcess = spawn(pythonExe, args, {
@@ -187,7 +193,7 @@ function startBackend() {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
   } else {
-    // 回退到预编译 exe
+    // 生产模式:使用预编译 exe
     const exe = getBackendExecutable();
     if (!exe) {
       console.error('未找到后端程序 (Python 或 exe)，请先打包 Python 后端');
