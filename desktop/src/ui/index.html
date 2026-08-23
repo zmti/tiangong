@@ -43,6 +43,9 @@
       <button class="nav-btn" data-view="tools" title="工具">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
       </button>
+      <button class="nav-btn" data-view="workflow" title="工作流">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+      </button>
       <button class="nav-btn" data-view="settings" title="设置">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
       </button>
@@ -122,6 +125,8 @@
             <button id="attachBtn" class="tool-btn" title="添加本地文件附件">📎</button>
             <button id="shotBtn" class="tool-btn" title="截屏识图">📸</button>
             <button id="imageBtn" class="tool-btn" title="上传图片识别">🖼</button>
+            <button id="micBtn" class="tool-btn" title="语音输入">🎤</button>
+            <button id="videoBtn" class="tool-btn" title="上传视频分析">🎬</button>
           </div>
         </div>
         <div class="composer-body">
@@ -134,6 +139,7 @@
         <div class="composer-hint">
           <span><kbd>Enter</kbd> 发送 · <kbd>Shift</kbd>+<kbd>Enter</kbd> 换行 · <kbd>/</kbd> 唤起提示词</span>
           <span class="ch-attach">支持 <kbd>Ctrl</kbd>+<kbd>V</kbd> 粘贴图片、拖拽文件</span>
+          <span class="ch-voice">🎤 语音输入 · 🎬 视频分析</span>
         </div>
       </div>
     </footer>
@@ -346,6 +352,7 @@
   <input type="file" id="fileInput" multiple hidden>
   <input type="file" id="imageInput" accept="image/*" hidden>
   <input type="file" id="attachInput" multiple hidden>
+  <input type="file" id="videoInput" accept="video/*" hidden>
 
   <div id="lightbox">
     <button class="lb-close" id="lbClose" title="关闭">×</button>
@@ -356,7 +363,37 @@
     </div>
   </div>
 
+  <!-- 工作流面板 -->
+  <div class="side-content" id="workflowPanel">
+    <div class="panel-head">
+      <span class="panel-title">⚙️ 工作流</span>
+      <div class="head-actions">
+        <button class="mini-btn" id="wfNewBtn" title="新建工作流">+ 新建</button>
+        <button class="mini-btn" id="wfRefreshBtn" title="刷新">刷新</button>
+        <button class="mini-btn close-panel" title="关闭">×</button>
+      </div>
+    </div>
+    <div id="wfToolbar" class="wf-toolbar" style="display:none">
+      <button class="mini-btn" id="wfAddNodeBtn">+ 添加节点</button>
+      <button class="mini-btn" id="wfSaveBtn">💾 保存</button>
+      <button class="mini-btn" id="wfRunBtn" style="background:var(--accent)">▶ 运行</button>
+      <button class="mini-btn danger" id="wfDeleteBtn">🗑 删除</button>
+    </div>
+    <div id="wfDesigner" class="wf-designer">
+      <svg id="wfSvg" class="wf-svg"></svg>
+      <div id="wfNodePanel" class="wf-node-panel"></div>
+    </div>
+    <div id="wfList" class="wf-list"></div>
+  </div>
+
   <script src="vendor/highlight.min.js"></script>
+  <script src="js/init.js"></script>
+  <script src="js/state.js"></script>
+  <script src="js/api.js"></script>
+  <script src="js/markdown.js"></script>
+  <script src="js/messages.js"></script>
+  <script src="js/group.js"></script>
+  <script src="js/utils.js"></script>
   <script src="js/common.js"></script>
   <script src="js/attachments.js"></script>
   <script src="js/session.js"></script>
@@ -372,6 +409,10 @@
   <script src="js/model_picker.js"></script>
   <script src="js/mode.js"></script>
   <script src="js/chat.js"></script>
+  <script src="js/workflow.js?v=2"></script>
+  <link rel="stylesheet" href="style-workflow.css">
+  <script src="js/voice.js"></script>
+  <script src="js/video.js"></script>
   <script src="renderer.js"></script>
 </body>
 </html>

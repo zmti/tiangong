@@ -242,7 +242,7 @@ App.Session.select = async function (id) {
     App._currentGroup = null;
   }
   // 切换会话时重置所有状态,避免旧会话数据污染
-  App.clearImageGenerating();
+  if (typeof App.clearImageGenerating === 'function') App.clearImageGenerating();
   App._thinkingWrap = null;
   App._answerWrap = null;
   App._mdBuf = '';
@@ -277,7 +277,7 @@ App.Session.select = async function (id) {
 
     let aiIdx = 0;
     for (const m of data.messages || []) {
-      if (m.role === 'user') {
+      if (m.role === 'user' || m.kind === 'text') {
         const div = document.createElement('div');
         div.className = 'msg user';
         const avatar = document.createElement('div');
@@ -286,7 +286,7 @@ App.Session.select = async function (id) {
         const body = document.createElement('div');
         body.className = 'msg-body';
         const bubble = document.createElement('div');
-        bubble.className = 'bubble';
+        bubble.className = 'answer-doc';
         bubble.textContent = m.content || '';
         body.appendChild(bubble);
 
@@ -327,7 +327,7 @@ App.Session.select = async function (id) {
         const body = document.createElement('div');
         body.className = 'msg-body';
         const bubble = document.createElement('div');
-        bubble.className = 'bubble';
+        bubble.className = 'answer-doc';
         // 使用预渲染的结果,避免重复 parse
         bubble.innerHTML = renderedAssistant[aiIdx++] || '';
         body.appendChild(bubble);
@@ -401,13 +401,15 @@ App.Session.select = async function (id) {
     msgs.scrollTop = msgs.scrollHeight;
     // 根据 DOM 中的用户消息数量刷新欢迎页显隐
     App.refreshWelcomePage();
-    let title = '会话';
+let title = '会话';
     const item = document.querySelector(`#sessionList .session-item[data-id="${CSS.escape(id)}"]`);
-    if (item && item.dataset.title) {
-      title = item.dataset.title;
+    if (item && item.dataset) {
+      const titleFromItem = item.dataset.title;
+      if (titleFromItem) title = titleFromItem;
     } else if (data.messages && data.messages.length) {
-      const first = data.messages.find((m) => m.role === 'user');
-      if (first) title = String(first.content).slice(0, 30);
+      // 优先使用 kind 字段(新结构),回退 role 字段(旧结构)
+      const first = data.messages.find((m) => m.role === 'user' || m.kind === 'text');
+      if (first) title = String(first.content || first.content || '').slice(0, 30);
     }
     App.els.sessionLabel.textContent = title;
   } catch (e) {

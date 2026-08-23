@@ -112,7 +112,7 @@ App.Chat.regenerate = async function (wrap) {
   let userNode = null;
   for (let i = baseIdx; i >= 0; i--) {
     if (nodes[i].classList.contains('user')) {
-      const b = nodes[i].querySelector('.bubble');
+      const b = nodes[i].querySelector('.answer-doc');
       userText = b ? (b.textContent || '').trim() : '';
       userNode = nodes[i];
       break;
@@ -262,28 +262,81 @@ App.Chat.doSend = async function (text, opts = {}) {
       _finishGroup();
     }
   }, CONNECT_TIMEOUT_MS);
-  try {
-    while (!res && retries < 3) {
+
+  // 节流渲染:多个 token 合并后每帧一次 re-render,避免 O(n²) 全量 DOM 重排
+  let renderTimer = null;
+  // 流读取超时(空闲间隙):后端在 120s 内无任何事件(判定为卡死)时主动断开
+  let streamTimeout = null;
+  // 绝对上限:即使后端持续产生事件,也不得超过 10 分钟,防止永久挂起
+  let hardTimeout = null;
+
+  function cleanupStream() {
+    if (streamTimeout !== null) { clearTimeout(streamTimeout); streamTimeout = null; }
+    if (hardTimeout !== null) { clearTimeout(hardTimeout); hardTimeout = null; }
+    if (renderTimer !== null) { clearTimeout(renderTimer); renderTimer = null; }
+  }
+
+  function scheduleRender() {
+    if (renderTimer !== null) return;
+    renderTimer = setTimeout(() => {
+      renderTimer = null;
+      if (!answerDiv) return;
+      const md = App._mdBuf || '';
+      let html = '';
       try {
-        const pick = App.ModelPicker ? App.ModelPicker.get() : { provider: '', model: '' };
-        res = await App.api('/v1/chat/stream', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(App.Attach ? App.Attach.patchBody({
+        html = App.renderMarkdown(md);
+      } catch (renderErr) {
+        console.error('[renderMarkdown] ERROR:', renderErr);
+        html = '<p>' + md + '</p>';  // fallback: show raw text
+      }
+      // 整段重渲染:保证跨切片边界的代码块/列表/表格等块级结构被正确解析
+      answerDiv.innerHTML = html;
+      // 仅当用户已在底部极近距离(<5%)时才跟随滚动,否则保持原位
+      if (App.els.messages.scrollHeight - App.els.messages.scrollTop <= App.els.messages.clientHeight * 0.05) {
+        App.els.messages.scrollTop = App.els.messages.scrollHeight;
+      }
+    }, 16);
+  }
+
+try {
+      while (!res && retries < 3) {
+        try {
+          // 【修复】安全获取 ModelPicker 状态(优先组件 → 备用 localStorage → 最后空值)
+          let pickProvider = '', pickModel = '';
+          if (App.ModelPicker && App.ModelPicker.get) {
+            const state = App.ModelPicker.get();
+            pickProvider = state.provider || '';
+            pickModel = state.model || '';
+          } else {
+            // 备用：直接从 localStorage 读取(防止 ModelPicker 组件未初始化)
+            try {
+              const raw = localStorage.getItem('agent_model_state');
+              if (raw) {
+                const saved = JSON.parse(raw);
+                if (saved && typeof saved === 'object') {
+                  pickProvider = typeof saved.provider === 'string' ? saved.provider : '';
+                  pickModel = typeof saved.model === 'string' ? saved.model : '';
+                }
+              }
+            } catch (_) {}
+          }
+          // 【修复】只在真正空时才置 null，避免把 "" 误转为 null
+          const finalProvider = pickProvider ? pickProvider : null;
+          const finalModel = pickModel ? pickModel : null;
+
+          // 组装请求体(聊天界面为单模型选择)
+          const body = {
             message: text,
             session_id: App.sessionId,
             stream: true,
-            provider: pick.provider || null,
-            model: pick.model || null,
+            provider: finalProvider,
+            model: finalModel,
             ...App.Chat.modeParams(),
-          }) : {
-            message: text,
-            session_id: App.sessionId,
-            stream: true,
-            provider: pick.provider || null,
-            model: pick.model || null,
-            ...App.Chat.modeParams(),
-          }),
+          };
+          res = await App.api('/v1/chat/stream', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(App.Attach ? App.Attach.patchBody(body) : body),
           signal,
         });
       } catch (fetchErr) {
@@ -306,20 +359,16 @@ App.Chat.doSend = async function (text, opts = {}) {
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
-    // answerDiv 已在外层声明(第148行)，此处不重新声明以避免遮蔽
     let buffer = '';
     let value = null; // reader.read() 返回的 Uint8Array 块,显式声明避免隐式全局变量
-    // 节流渲染:多个 token 合并后每帧一次 re-render,避免 O(n²) 全量 DOM 重排
-    let renderTimer = null;
-    // 流读取超时(空闲间隙):后端在 120s 内无任何事件(判定为卡死)时主动断开
-    let streamTimeout = null;
     // 绝对上限:即使后端持续产生事件,也不得超过 10 分钟,防止永久挂起
-    let hardTimeout = setTimeout(() => {
+    hardTimeout = setTimeout(() => {
       hardTimeout = null;
       if (!done && !isError) {
         done = true;
         isError = true;
         cleanupStream();
+        if (App.abortController) App.abortController.abort(new DOMException('硬超时', 'TimeoutError'));
         if (typingShown) App.removeTyping();
         App.appendMessage('响应超时(超过上限),请稍后重试', 'error');
         _finishGroup();
@@ -335,6 +384,7 @@ App.Chat.doSend = async function (text, opts = {}) {
           done = true;
           isError = true;
           cleanupStream();
+          if (App.abortController) App.abortController.abort(new DOMException('StreamTimeout', 'TimeoutError'));
           App.clearImageGenerating();
           if (typingShown) App.removeTyping();
           App.appendMessage('响应超时,请稍后重试', 'error');
@@ -343,25 +393,6 @@ App.Chat.doSend = async function (text, opts = {}) {
       }, 120000); // 120s 空闲间隙
     }
     resetStreamTimeout();
-
-    // 清理函数:统一释放计时器和信号,防止多次调用造成竞态
-    function cleanupStream() {
-      if (streamTimeout !== null) { clearTimeout(streamTimeout); streamTimeout = null; }
-      if (hardTimeout !== null) { clearTimeout(hardTimeout); hardTimeout = null; }
-      if (renderTimer !== null) { clearTimeout(renderTimer); renderTimer = null; }
-    }
-
-    function scheduleRender() {
-      if (renderTimer !== null) return;
-      // 用 setTimeout 代替 requestAnimationFrame:窗口/标签页失焦时 rAF 会暂停,导致后台渲染卡住
-      renderTimer = setTimeout(() => {
-        renderTimer = null;
-        if (!answerDiv) return;
-        // 整段重渲染:保证跨切片边界的代码块/列表/表格等块级结构被正确解析(修复"内容错乱/不能正确显示")
-        answerDiv.innerHTML = App.renderMarkdown(App._mdBuf || '');
-        App.els.messages.scrollTop = App.els.messages.scrollHeight;
-      }, 16);
-    }
 
     while (true) {
       let isDone;
@@ -422,9 +453,9 @@ App.Chat.doSend = async function (text, opts = {}) {
           } else if (evt.type === 'tool') {
             // tool 事件:通过 inline 卡片在答案上方展示，避免主流重复卡片
             App.removeTyping();
-            App.ExecTrace.updateStep(_toolName, ok ? 'done' : 'fail', evt.result);
             const ok = !String(evt.result || '').includes('Error') &&
                        !String(evt.result || '').includes('failed');
+            App.ExecTrace.updateStep(_toolName, ok ? 'done' : 'fail', evt.result);
             // 创建工具 inline 卡片
             const toolEl = document.createElement('div');
             toolEl.className = 'tool-inline';
@@ -433,9 +464,9 @@ App.Chat.doSend = async function (text, opts = {}) {
               const obj = typeof evt.arguments === 'string' ? JSON.parse(evt.arguments) : evt.arguments;
               if (obj && typeof obj === 'object') argsDisplay = String(JSON.stringify(obj, null, 2)).slice(0, 100);
             } catch (_) { /* 非 JSON 保持文本 */ }
-            toolEl.innerHTML = `<div class="tool-label">🔧 ${_toolName || '工具'}</div>`
-                          + (argsDisplay ? `<div class="tool-args">${argsDisplay}</div>` : '')
-                          + (evt.result ? `<div class="tool-result">${String(evt.result).slice(0, 300)}</div>` : '');
+            toolEl.innerHTML = `<div class="tool-label">🔧 ${App.escapeHtml(_toolName || '工具')}</div>`
+                          + (argsDisplay ? `<div class="tool-args">${App.escapeHtml(argsDisplay)}</div>` : '')
+                          + (evt.result ? `<div class="tool-result">${App.escapeHtml(String(evt.result).slice(0, 300))}</div>` : '');
             // 插入到最近的 answer doc 之前
             const lastMsg = App.els.messages.querySelector(`[class*="msg"]:last-child .answer-doc`);
             if (lastMsg) { lastMsg.parentNode.insertBefore(toolEl, lastMsg); }
@@ -456,8 +487,8 @@ App.Chat.doSend = async function (text, opts = {}) {
               App.ExecTrace.updateStep(doneToolName, 'done', '');
               const toolEl = document.createElement('div');
               toolEl.className = 'tool-inline';
-              toolEl.innerHTML = `<div class="tool-label">🔧 ${doneToolName}</div>`
-                                + (evt.result ? `<div class="tool-result">${String(evt.result).slice(0, 300)}</div>` : '');
+              toolEl.innerHTML = `<div class="tool-label">🔧 ${App.escapeHtml(doneToolName)}</div>`
+                                + (evt.result ? `<div class="tool-result">${App.escapeHtml(String(evt.result).slice(0, 300))}</div>` : '');
               // 插入到最近的 answer doc 之前
               const lastMsg = App.els.messages.querySelector(`[class*="msg"]:last-child .answer-doc`);
               if (lastMsg) { lastMsg.parentNode.insertBefore(toolEl, lastMsg); }
@@ -535,8 +566,10 @@ App.Chat.doSend = async function (text, opts = {}) {
               if (waitMsg) waitMsg.remove();
               // 创建可见的空 bot 消息(先显示容器,后续增量追加内容)
               answerDiv = App.appendMessage('', 'bot');
+              // 空文本时 wrapper 默认 display:none,这里解除隐藏以便流式内容可见
+              if (answerDiv && answerDiv._wrap) answerDiv._wrap.style.display = '';
               // 记录答案容器锚点,thinking/tool/plan 卡需插入到它之前而非末尾(防止跑到答案后面错位)
-              App._answerWrap = answerDiv || null;
+              App._answerWrap = answerDiv._wrap || null;
             }
             receivedTokens = true;
             const { text, thinking } = processTokenChunk(evt.content || '');
@@ -570,7 +603,15 @@ App.Chat.doSend = async function (text, opts = {}) {
             if (typingShown) App.removeTyping();
             // 流式完成后整段重渲染,确保最终内容(含跨切片块级结构)正确
             if (answerDiv) {
-              answerDiv.innerHTML = App.renderMarkdown(App._mdBuf || '');
+              const finalMd = App._mdBuf || '';
+              let finalHtml = '';
+              try {
+                finalHtml = App.renderMarkdown(finalMd);
+              } catch (renderErr) {
+                console.error('[renderMarkdown] done handler ERROR:', renderErr);
+                finalHtml = '<p>' + finalMd + '</p>';  // fallback
+              }
+              answerDiv.innerHTML = finalHtml;
             }
             // 关闭分组并传入最终答案文本
             _finishGroup(answerDiv ? (answerDiv.textContent || '') : null);
@@ -739,9 +780,15 @@ App.Chat.recognizeImage = async function (file) {
   fd.append('prompt', '请描述这张图片的内容');
   fd.append('session_id', App.sessionId);
   // 与聊天一致:使用左下角模型选择器的当前选择(留空回退后端全局配置)
-  const pick = App.ModelPicker ? App.ModelPicker.get() : { provider: '', model: '' };
-  fd.append('provider', pick.provider || '');
-  fd.append('model', pick.model || '');
+  const pickBase = App.ModelPicker ? App.ModelPicker.get() : { provider: '', model: '' };
+  const body = {
+    file,
+    prompt: '请描述这张图片的内容',
+    session_id: App.sessionId,
+    provider: pickBase.provider || null,
+    model: pickBase.model || null,
+    ...App.Chat.modeParams(),
+  };
   App.appendMessage(`🖼 识别图片: ${file.name}`, 'user');
   App.showTyping();
   App.Chat.setStreaming(true);
