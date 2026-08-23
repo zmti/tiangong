@@ -1,0 +1,148 @@
+/* ===================== Workflow Panel ===================== */
+#workflowPanel {
+  display: flex !important;
+  flex-direction: column;
+  gap: 0;
+  padding: 0 !important;
+  overflow: hidden !important;
+}
+
+#workflowPanel .panel-head {
+  padding: 8px 12px;
+  margin-bottom: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.wf-toolbar {
+  display: flex !important;
+  gap: 6px;
+  align-items: center;
+  padding: 6px 8px;
+  background: var(--bg-elev) !important;
+  border-radius: 0;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  flex: 0 0 auto;
+}
+
+.wf-toolbar .mini-btn { flex: 0 0 auto; }
+.wf-toolbar .wf-spacer { flex: 1; }
+
+.wf-designer {
+  flex: 1;
+  min-height: 300px;
+  border: none;
+  border-radius: 0;
+  background: var(--bg-soft);
+  overflow: hidden;
+  position: relative;
+}
+
+.wf-designer svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.wf-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-y: auto;
+  max-height: 200px;
+  flex: 0 0 auto;
+  padding: 8px;
+}
+
+.wf-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.wf-item:hover { border-color: var(--accent); background: var(--bg-hover); }
+.wf-item.active { border-color: var(--accent); background: var(--accent-soft); }
+
+.wf-item-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.wf-item-name {
+  font-weight: 500;
+  font-size: 13px;
+  color: var(--text);
+}
+
+.wf-item-meta {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.wf-item-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.wf-item-actions .mini-btn {
+  font-size: 11px;
+  padding: 2px 6px;
+}
+
+.wf-empty {
+  text-align: center;
+  padding: 40px 20px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.wf-empty::before {
+  content: '⚙️';
+  display: block;
+  font-size: 32px;
+  margin-bottom: 8px;
+}
+
+/* SVG node styles */
+.wf-svg .node-rect {
+  rx: 8;
+  ry: 8;
+  fill: var(--bg-elev);
+  stroke: var(--border);
+  stroke-width: 2;
+  cursor: move;
+  transition: stroke 0.15s;
+}
+
+.wf-svg .node-rect:hover,
+.wf-svg .node-rect.selected {
+  stroke: var(--accent);
+}
+
+.wf-svg .node-text {
+  fill: var(--text);
+  font-size: 12px;
+  font-family: var(--font);
+  text-anchor: middle;
+  dominant-baseline: middle;
+  pointer-events: none;
+}
+
+.wf-svg .edge-line {
+  stroke: var(--accent);
+  stroke-width: 2;
+  fill: none;
+}
+
+.wf-svg .edge-line:hover {
+  stroke: var(--primary);
+  stroke-width: 3;
+}

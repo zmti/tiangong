@@ -81,7 +81,7 @@
 
   /* ---------- 面板切换 ---------- */
   let currentView = 'chat';
-  const panelMap = { todo: 'todoPanel', kb: 'kbPanel', memory: 'memoryPanel', runs: 'runsPanel', telemetry: 'telemetryPanel', schedule: 'schedulePanel', prompts: 'promptsPanel', tools: 'toolsPanel', settings: 'settingsPanel' };
+  const panelMap = { todo: 'todoPanel', kb: 'kbPanel', memory: 'memoryPanel', runs: 'runsPanel', telemetry: 'telemetryPanel', schedule: 'schedulePanel', prompts: 'promptsPanel', tools: 'toolsPanel', workflow: 'workflowPanel', settings: 'settingsPanel' };
 
   function showView(view) {
     document.querySelectorAll('.nav-btn').forEach((b) => b.classList.toggle('active', b.dataset.view === view));
@@ -109,6 +109,7 @@
       App.Settings.refreshBackend();
       if (App.Settings.renderProviderAdmin) App.Settings.renderProviderAdmin();
     }
+    if (view === 'workflow' && App.Workflow) App.Workflow.loadList();
   }
 
   function closePanel() {
@@ -625,6 +626,11 @@
         if (App.Settings && App.Settings.loadProviders) await App.Settings.loadProviders();
       }
     }, 30000);
+
+    // 初始化语音和视频模块
+    if (App.Voice) App.Voice.init();
+    if (App.Video) App.Video.init();
+    if (App.Workflow) App.Workflow.init();
   }
 
   init();
