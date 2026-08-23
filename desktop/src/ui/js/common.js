@@ -46,7 +46,7 @@
       const running = steps.filter(s => s.status === 'running').length;
       const done = steps.filter(s => s.status === 'done').length;
       const failed = steps.filter(s => s.status === 'fail').length;
-      let html = '<div class="exec-trace-header" style="padding:8px 12px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--border);">'
+      html += `<div class="exec-trace-header" style="padding:8px 12px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--border);">`
         + `<span>${done}✓</span><span style="margin:0 6px;">·</span>`
         + `<span style="color:var(--err)">${failed}✗</span><span style="margin:0 6px;">·</span>`
         + `<span style="color:var(--primary)">${running}⏳</span><span style="margin:0 6px;">·</span>`
