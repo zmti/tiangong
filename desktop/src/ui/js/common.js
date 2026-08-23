@@ -164,7 +164,7 @@
   }
   async function speak(text) {
     stopSpeak();
-    const clean = String(text).replace(/[#*`~\\-_>|]/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, 2000);
+    const clean = String(text).replace(/[#*`~\\\-_|>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 2000);
     if (!clean) return;
     let lastErr = '';
     for (let attempt = 0; attempt < 2; attempt++) {
