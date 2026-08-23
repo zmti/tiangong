@@ -46,19 +46,19 @@
       const running = steps.filter(s => s.status === 'running').length;
       const done = steps.filter(s => s.status === 'done').length;
       const failed = steps.filter(s => s.status === 'fail').length;
-      html += `<div class="exec-trace-header" style="padding:8px 12px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--border);">`
-        + `<span>${done}✓</span><span style="margin:0 6px;">·</span>`
-        + `<span style="color:var(--err)">${failed}✗</span><span style="margin:0 6px;">·</span>`
-        + `<span style="color:var(--primary)">${running}⏳</span><span style="margin:0 6px;">·</span>`
-        + `<span>${getElapsed(Date.now() - startTime)}</span></div>`;
+      let html = '<div class="exec-trace-header" style="padding:8px 12px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--border);">'
+        + '<span>' + done + '✓</span><span style="margin:0 6px;">·</span>'
+        + '<span style="color:var(--err)">' + failed + '✗</span><span style="margin:0 6px;">·</span>'
+        + '<span style="color:var(--primary)">' + running + '⏳</span><span style="margin:0 6px;">·</span>'
+        + '<span>' + getElapsed(Date.now() - startTime) + '</span></div>';
       html += '<div class="exec-trace-list">';
       for (const s of steps) {
         const cls = s.status === 'fail' ? 'et-fail' : s.status === 'running' ? 'et-running' : 'et-done';
-        html += `<div class="exec-trace-item ${cls}" title="${App.escapeHtml(s.args || '')}">`
-          + `<span class="exec-trace-icon">${s.icon}</span>`
-          + `<span class="exec-trace-name">${App.escapeHtml(s.name)}</span>`
-          + `<span class="exec-trace-status">${s.status === 'running' ? '⏳' : s.status === 'fail' ? '✗' : '✓'}</span>`
-          + `<span class="exec-trace-time">${s.time}</span></div>`;
+        html += '<div class="exec-trace-item ' + cls + '" title="' + App.escapeHtml(s.args || '') + '">'
+          + '<span class="exec-trace-icon">' + s.icon + '</span>'
+          + '<span class="exec-trace-name">' + App.escapeHtml(s.name) + '</span>'
+          + '<span class="exec-trace-status">' + (s.status === 'running' ? '⏳' : s.status === 'fail' ? '✗' : '✓') + '</span>'
+          + '<span class="exec-trace-time">' + s.time + '</span></div>';
       }
       html += '</div>';
       listEl.innerHTML = html;
@@ -164,7 +164,7 @@
   }
   async function speak(text) {
     stopSpeak();
-    const clean = String(text).replace(/[#*`>|~\\-_]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 2000);
+    const clean = String(text).replace(/[#*`>|~\\-_]/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, 2000);
     if (!clean) return;
     let lastErr = '';
     for (let attempt = 0; attempt < 2; attempt++) {
