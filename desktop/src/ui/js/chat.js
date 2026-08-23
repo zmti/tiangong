@@ -422,10 +422,15 @@ try {
           const evt = JSON.parse(line.slice(6));
           receivedAnyEvent = true; // 标记已收到合法 SSE 事件
           console.log('[SSE]', evt.type, evt.subtype || '', evt.provider || '', evt.content ? evt.content.substring(0, 30) : '');
+          // 调试: 记录心跳接收情况
+          if (evt.type === 'heartbeat') {
+            console.log('[SSE] Heartbeat received, resetting stream timeout');
+          }
           resetStreamTimeout(); // 收到任意事件即续期空闲计时器,避免慢任务被误杀
           // heartbeat 事件:后端发送保活信号,前端仅续期超时但不显示
           if (evt.type === 'heartbeat') {
-            resetStreamTimeout();
+            // resetStreamTimeout() 已在上面调用,这里仅记录日志
+            if (App.DEBUG) console.log('[SSE] Heartbeat processed');
             continue;
           }
           // 图片生成:尽早展示专属"生成中"进度卡。tool_start 为主信号,
