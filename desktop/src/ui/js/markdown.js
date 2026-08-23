@@ -164,7 +164,7 @@
         flushList();
         const level = line.match(/^#{1,6}/)[0].length;
         html += `<h${level}>${renderInline(line.replace(/^#{1,6}\s+/, ''))}</h${level}>`;
-      } else if (/^\s*[-*+)\s+/.test(line)) {
+      } else if (/^\s*[-*+]\s+/.test(line)) {
         listType = 'ul';
         listBuf.push(line.replace(/^\s*[-*+)\s+/, ''));
       } else if (/^\s*\d+[.)]\s+/.test(line)) {
