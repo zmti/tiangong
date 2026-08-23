@@ -117,6 +117,41 @@ function killStaleBackends() {
   } catch (_) { /* 没有残留进程 */ }
 }
 
+// 找到当前正监听指定 TCP 端口的进程 PID(跨平台用 netstat -ano 解析)
+function getPidListeningOnPort(port) {
+  try {
+    const out = execFileSync('netstat', ['-ano', '-p', 'tcp'], {
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).toString();
+    for (const line of out.split(/\r?\n/)) {
+      const m = line.trim().match(/^TCP\s+\S+:(\d+)\s+\S+\s+LISTENING\s+(\d+)/i);
+      if (m && parseInt(m[1], 10) === port) {
+        return parseInt(m[2], 10);
+      }
+    }
+  } catch (_) { /* netstat 不可用 */ }
+  return null;
+}
+
+// 强杀占用指定端口的进程(含子进程树),无论它是 agent-backend.exe 还是
+// 其它进程(如开发期残留的 python.exe 源码后端)。仅按端口释放,不动其它端口。
+// 返回是否真的杀掉了某个进程。
+async function freeBackendPort(port) {
+  const pid = getPidListeningOnPort(port);
+  if (!pid) return false;
+  try {
+    execFileSync('taskkill', ['/pid', String(pid), '/F', '/T'], {
+      windowsHide: true,
+      stdio: 'ignore',
+    });
+    console.log(`[backend] 已释放端口 ${port} 占用进程 pid=${pid}`);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 // 等待端口释放(进程被杀后 TIME_WAIT/句柄释放需要片刻)
 async function waitForPortFree(timeoutMs = 8000) {
   const start = Date.now();
@@ -128,18 +163,35 @@ async function waitForPortFree(timeoutMs = 8000) {
 }
 
 function startBackend() {
-  const exe = getBackendExecutable();
-  if (!exe) {
-    console.error('未找到后端 agent-backend.exe,请先打包 Python 后端');
-    return false;
-  }
+  // 优先使用项目 .venv 的 Python 后端（开发阶段），避免 PyInstaller 打包问题
+  const projectRoot = path.join(__dirname, '..', '..');
+  const pythonExe = path.join(projectRoot, '.venv', 'Scripts', 'python.exe');
+  const mainPy = path.join(projectRoot, 'app', 'main.py');
 
-  const args = ['--port', String(BACKEND_PORT), '--host', '127.0.0.1'];
-  backendProcess = spawn(exe, args, {
-    cwd: path.dirname(exe),
-    windowsHide: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  if (fs.existsSync(pythonExe) && fs.existsSync(mainPy)) {
+    // 使用 Python 源码后端
+    const args = ['-m', 'uvicorn', 'app.main:app', '--host', '127.0.0.1', '--port', String(BACKEND_PORT)];
+    console.log('[backend] 使用 Python 源码后端:', pythonExe);
+    backendProcess = spawn(pythonExe, args, {
+      cwd: projectRoot,
+      windowsHide: false,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } else {
+    // 回退到预编译 exe
+    const exe = getBackendExecutable();
+    if (!exe) {
+      console.error('未找到后端程序 (Python 或 exe)，请先打包 Python 后端');
+      return false;
+    }
+    console.log('[backend] 使用预编译后端:', exe);
+    const args = ['--port', String(BACKEND_PORT), '--host', '127.0.0.1'];
+    backendProcess = spawn(exe, args, {
+      cwd: path.dirname(exe),
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  }
 
   backendProcess.stdout.on('data', (d) => console.log('[backend]', d.toString().trim()));
   backendProcess.stderr.on('data', (d) => console.error('[backend-err]', d.toString().trim()));
@@ -324,6 +376,10 @@ app.whenReady().then(async () => {
     console.log('[backend] 检测到兼容后端已在运行,直接复用');
   } else {
     if (alreadyUp) {
+      // 端口被占用但不是兼容的新版(可能是旧版残留或开发期 python.exe 源码后端):
+      // 先按端口强杀占用进程(进程名未必是 agent-backend.exe,故不能只靠 killStaleBackends),
+      // 再兜底清理同名旧 exe,最后等待端口释放。
+      await freeBackendPort(BACKEND_PORT);
       killStaleBackends();
       await waitForPortFree();
     }
