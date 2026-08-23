@@ -164,7 +164,16 @@ async function waitForPortFree(timeoutMs = 8000) {
 
 function startBackend() {
   // 优先使用项目 .venv 的 Python 后端（开发阶段），避免 PyInstaller 打包问题
-  const projectRoot = path.join(__dirname, '..', '..');
+  // 注意：打包后 __dirname 指向 asar 包内路径，需要使用 app.getPath('exe') 获取可执行文件路径
+  const { app } = require('electron');
+  let projectRoot;
+  if (app.isPackaged) {
+    // 打包模式：从可执行文件所在目录向上查找项目根目录
+    projectRoot = path.join(path.dirname(app.getPath('exe')), '..');
+  } else {
+    // 开发模式：从源码目录向上查找
+    projectRoot = path.join(__dirname, '..', '..');
+  }
   const pythonExe = path.join(projectRoot, '.venv', 'Scripts', 'python.exe');
   const mainPy = path.join(projectRoot, 'app', 'main.py');
 
