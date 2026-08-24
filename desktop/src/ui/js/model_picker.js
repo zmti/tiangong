@@ -4,10 +4,13 @@
  * - provider/model 选择只存在 App.ModelPicker._state 一份,localStorage 仅作持久化副本;
  * - 按钮徽标显示当前模型,点击展开浮层:搜索 + 按提供商分组的模型清单,
  *   点击提供商标题行 = 用该提供商默认模型;未配置的提供商灰显不可选;
- * - 旧版分散键 agent_provider / agent_model_<pid> 首次启动自动迁移。
+ * - 支持多种存储键名的自动迁移:
+ *     App.Storage (新): model_provider / model_name
+ *     App.Storage._custom: model_state
+ *     localStorage 旧键: agent_model_state / agent_provider / agent_model_<pid>
  */
 App.ModelPicker = (() => {
-  const STORE_KEY = 'model_state';
+  const CUSTOM_KEY = 'model_state';
 
   let _state = { provider: '', model: '' };
   let _btn = null;
@@ -15,23 +18,33 @@ App.ModelPicker = (() => {
   /* ---------- 状态 ---------- */
   function load() {
     try {
-      // 优先从统一存储加载
+      // 1. 优先从 App.Storage._custom (model_state 整体对象)
       if (App.Storage) {
-        const saved = App.Storage.getCustom(STORE_KEY);
+        const saved = App.Storage.getCustom(CUSTOM_KEY);
         if (saved && typeof saved === 'object') {
           _state.provider = typeof saved.provider === 'string' ? saved.provider : '';
           _state.model = typeof saved.model === 'string' ? saved.model : '';
           return;
         }
-        // 迁移旧键
-        const prov = App.Storage.get('provider');
-        if (prov) {
-          const model = App.Storage.getCustom(`model_${prov}`) || '';
-          _state = { provider: prov, model };
+        // 2. 从统一存储直接键加载
+        const prov = App.Storage.get('model_provider') || '';
+        const model = App.Storage.get('model_name') || '';
+        if (prov || model) {
+          _state = { provider: prov, model: model };
+          return;
+        }
+        // 3. 迁移旧键: agent_provider + agent_model_<pid>
+        const provOld = App.Storage.get('provider');
+        if (provOld) {
+          const modelOld = App.Storage.getCustom(`model_${provOld}`) || '';
+          _state = { provider: provOld, model: modelOld };
+          // 写入新键
+          App.Storage.set('model_provider', provOld);
+          App.Storage.set('model_name', modelOld);
           return;
         }
       }
-      // 降级到 localStorage
+      // 4. 降级到 localStorage
       const raw = localStorage.getItem('agent_model_state');
       if (raw) {
         const saved = JSON.parse(raw);
@@ -41,10 +54,12 @@ App.ModelPicker = (() => {
           return;
         }
       }
-      // 迁移旧键:agent_provider + agent_model_<providerId>
+      // 5. 迁移旧 localStorage 键: agent_provider + agent_model_<providerId>
       const prov = localStorage.getItem('agent_provider') || '';
       const model = prov ? (localStorage.getItem(`agent_model_${prov}`) || '') : '';
-      if (prov) _state = { provider: prov, model };
+      if (prov || model) {
+        _state = { provider: prov, model: model };
+      }
     } catch (_) { /* 忽略 */ }
     save();
   }
@@ -52,7 +67,9 @@ App.ModelPicker = (() => {
   function save() {
     try {
       if (App.Storage) {
-        App.Storage.setCustom(STORE_KEY, _state);
+        App.Storage.setCustom(CUSTOM_KEY, _state);
+        App.Storage.set('model_provider', _state.provider);
+        App.Storage.set('model_name', _state.model);
         if (_state.provider) {
           App.Storage.set('provider', _state.provider);
           App.Storage.setCustom(`model_${_state.provider}`, _state.model);

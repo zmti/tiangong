@@ -122,7 +122,7 @@ App.Session.autoRename = async function (userText) {
   try {
     const title = App.Session.autoTitleFromMessage(userText);
     if (title === '新会话') return; // 跳过空内容
-    await App.api('/v1/chat/rename', {
+    await App.apiJSON('/v1/chat/rename', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ session_id: App.sessionId, title }),
@@ -200,20 +200,22 @@ App.Session.buildSearchItem = function (r) {
 App.Session.renderList = async function () {
   const listEl = App.els.sessionList;
   try {
-    const res = await App.api('/v1/chat/sessions');
-    if (!res.success || !Array.isArray(res.data)) {
-      listEl.innerHTML = '<div class="empty-hint">暂无会话</div>';
-      return;
+    const res = await App.apiJSON('/v1/chat/sessions');
+    if (!res.success) {
+      listEl.innerHTML = '<div class="empty-hint">加载失败</div>';
+      App.Session._listCache = { ids: [], ts: Date.now() };
+      return [];
     }
-    const sessions = res.data;
+    const sessions = res.data?.sessions || [];
     const pins = App.Session.loadPins();
     const query = (App.els.sessionSearch.value || '').trim().toLowerCase();
-    const filtered = sessions.filter(s => 
+    const filtered = sessions.filter(s =>
       !query || (s.title || '').toLowerCase().includes(query)
     );
     if (!filtered.length) {
       listEl.innerHTML = '<div class="empty-hint">暂无会话</div>';
-      return;
+      App.Session._listCache = { ids: [], ts: Date.now() };
+      return [];
     }
     // 按置顶和时间排序
     const sorted = [...filtered].sort((a, b) => {
@@ -222,13 +224,13 @@ App.Session.renderList = async function () {
       if (ap !== bp) return ap - bp;
       return (b.updated_at || 0) - (a.updated_at || 0);
     });
-    
+
     listEl.innerHTML = sorted.map(s => {
       const isPinned = pins.has(s.id);
       const isActive = s.id === App.sessionId;
       const timeStr = App.Session.formatTime(s.updated_at);
       return `
-        <div class="session-item ${isActive ? 'active' : ''} ${isPinned ? 'pinned' : ''}" 
+        <div class="session-item ${isActive ? 'active' : ''} ${isPinned ? 'pinned' : ''}"
              data-id="${s.id}" data-title="${App.escapeHtml(s.title || '未命名')}">
           <div class="s-title">${App.escapeHtml(s.title || '新会话')}</div>
           <div class="s-meta">
@@ -239,7 +241,7 @@ App.Session.renderList = async function () {
         </div>
       `;
     }).join('');
-    
+
     listEl.querySelectorAll('.session-item').forEach(el => {
       el.addEventListener('click', () => App.Session.select(el.dataset.id));
       el.querySelector('.s-pin')?.addEventListener('click', (e) => {
@@ -249,12 +251,17 @@ App.Session.renderList = async function () {
       // 双击重命名
       el.querySelector('.s-title')?.addEventListener('dblclick', (e) => {
         e.stopPropagation();
-        App.Session.enterRename(sessions.find(s => s.id === el.dataset.id), el);
+        App.Session.enterRename(sorted.find(s => s.id === el.dataset.id), el);
       });
     });
+
+    const ids = sorted.map(s => s.id);
+    App.Session._listCache = { ids, ts: Date.now() };
+    return ids;
   } catch (err) {
     listEl.innerHTML = '<div class="empty-hint">加载失败</div>';
     console.error('[Session] 加载失败:', err);
+    return [];
   }
 };
 
@@ -560,34 +567,20 @@ App.Session.select = async function (id) {
   App.els.input.focus();
 };
 
-/* 创建会话(API调用) */
+/* 创建会话(后端无 POST /v1/chat/sessions,本地创建) */
 App.Session.create = async function () {
-  try {
-    const res = await App.api('/v1/chat/sessions', { method: 'POST' });
-    if (res.success && res.data?.id) {
-      App.sessionId = res.data.id;
-      if (App.Storage) {
-        App.Storage.set('last_session', res.data.id);
-      }
-      App.Session.saveSessionId(res.data.id);
-      App.Session.renderList();
-      App.Session.clearMessages();
-      if (App.els.sessionLabel) App.els.sessionLabel.textContent = '新会话';
-      if (App.els.input) App.els.input.focus();
-    }
-  } catch (err) {
-    console.error('[Session] 创建失败:', err);
-  }
+  // 直接本地创建,无需网络请求
+  App.Session.newSession();
 };
 
-/* 删除会话 */
+/* 删除会话(后端无 DELETE /v1/chat/sessions/{id},用 clear 替代) */
 App.Session.deleteSession = async function (id) {
   if (id === App.sessionId) {
     console.warn('[Session] 不能删除当前会话');
     return;
   }
   try {
-    await App.api(`/v1/chat/sessions/${id}`, { method: 'DELETE' });
+    await App.apiJSON(`/v1/chat/clear?session_id=${encodeURIComponent(id)}`, { method: 'POST' });
     App.Session.renderList();
   } catch (err) {
     console.error('[Session] 删除失败:', err);
