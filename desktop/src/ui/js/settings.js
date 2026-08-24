@@ -28,7 +28,7 @@ App.Settings.applyTheme = function (theme) {
     }
   }
   // 同步设置页的 toggle 开关状态
-  const themeToggle = document.getElementById('themeToggle');
+  const themeToggle = App.els.themeToggle || document.getElementById('themeToggle');
   if (themeToggle) {
     themeToggle.classList.toggle('on', theme === 'dark');
   }

@@ -1,7 +1,7 @@
 /* 提示词库模块:本地持久化 / 面板渲染 / 点击填充 / 输入框 / 快捷唤起 */
 App.Prompts = {};
 
-const PROMPT_STORAGE_KEY = 'agent_prompts';
+const PROMPT_STORAGE_KEY = 'prompts';
 
 const PROMPT_DEFAULTS = [
   { title: '代码审查', text: '请对以下代码进行审查,指出潜在 bug、安全隐患和可读性问题,并给出改进建议。' },
@@ -13,14 +13,26 @@ const PROMPT_DEFAULTS = [
 
 App.Prompts.load = function () {
   try {
-    const raw = localStorage.getItem(PROMPT_STORAGE_KEY);
-    if (raw) return JSON.parse(raw);
+    // 优先从统一存储加载
+    if (App.Storage) {
+      const raw = App.Storage.getCustom(PROMPT_STORAGE_KEY);
+      if (raw && Array.isArray(raw)) return raw;
+    }
+    // 降级到 localStorage
+    const stored = localStorage.getItem('agent_prompts');
+    if (stored) return JSON.parse(stored);
   } catch (_) { /* 忽略 */ }
   return PROMPT_DEFAULTS.slice();
 };
 
 App.Prompts.save = function (list) {
-  try { localStorage.setItem(PROMPT_STORAGE_KEY, JSON.stringify(list)); } catch (_) { /* 忽略 */ }
+  try {
+    if (App.Storage) {
+      App.Storage.setCustom(PROMPT_STORAGE_KEY, list);
+    } else {
+      localStorage.setItem('agent_prompts', JSON.stringify(list));
+    }
+  } catch (_) { /* 忽略 */ }
 };
 
 App.Prompts.render = function () {
@@ -48,49 +60,43 @@ App.Prompts.render = function () {
     del.title = '删除该提示词';
     del.addEventListener('click', (e) => {
       e.stopPropagation();
-      App.Prompts.remove(p.title);
+      const idx = items.indexOf(p);
+      if (idx >= 0) {
+        items.splice(idx, 1);
+        App.Prompts.save(items);
+        App.Prompts.render();
+      }
     });
     item.appendChild(title);
     item.appendChild(text);
     item.appendChild(del);
-    item.addEventListener('click', () => App.Prompts.insert(p.text));
+    item.addEventListener('click', () => {
+      if (App.els.input) {
+        App.els.input.value = p.text;
+        App.els.input.focus();
+      }
+    });
     listEl.appendChild(item);
   }
 };
 
-App.Prompts.add = function () {
-  const title = (App.els.promptTitleInput.value || '').trim();
-  const text = (App.els.promptTextInput.value || '').trim();
-  if (!title || !text) { App.toast('请填写标题和内容', 'err'); return; }
+App.Prompts.add = function (title, text) {
+  if (!title || !text) return;
   const items = App.Prompts.load();
-  if (items.some((p) => p.title === title)) { App.toast(`已存在同名提示词「${title}」`, 'err'); return; }
-  items.push({ title, text });
-  App.Prompts.save(items);
-  App.els.promptTitleInput.value = '';
-  App.els.promptTextInput.value = '';
-  App.Prompts.render();
-  App.toast('提示词已保存', 'ok');
-};
-
-App.Prompts.remove = function (title) {
-  const items = App.Prompts.load().filter((p) => p.title !== title);
+  items.unshift({ title, text });
   App.Prompts.save(items);
   App.Prompts.render();
 };
 
-/* 点击提示词 → 填入输入框(追加到末尾) */
-App.Prompts.insert = function (text) {
-  const input = App.els.input;
-  if (!input) return;
-  const cur = input.value.trim();
-  input.value = cur ? cur + '\n\n' + text : text;
-  input.focus();
+App.Prompts.clear = function () {
+  if (App.Prompts.load().length === 0) return;
+  App.Prompts.save([]);
+  App.Prompts.render();
 };
 
-/* 输入框 / 快捷指令:匹配当前输入返回候选提示词 */
-App.Prompts.candidates = function (query) {
-  const q = (query || '').trim().toLowerCase();
-  return App.Prompts.load().filter((p) =>
-    p.title.toLowerCase().includes(q) || p.text.toLowerCase().includes(q)
-  );
-};
+/* 初始化 */
+document.addEventListener('DOMContentLoaded', () => {
+  if (App.els.promptList) {
+    App.Prompts.render();
+  }
+});
