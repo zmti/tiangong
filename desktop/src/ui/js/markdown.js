@@ -102,10 +102,12 @@
     return highlightCode(lang, code);
   }
 
-  // Markdown 渲染
-  function renderMarkdown(md) {
+// Markdown 渲染
+function renderMarkdown(md) {
     if (!md) return '';
-    const cleaned = String(md).replace(/<thinking[^>]*>[\s\S]*?<\/thinking>/gi, '').trim();
+    const text = String(md);
+    if (!text.trim()) return '';
+    const cleaned = text.replace(/<thinking[^>]*>[\s\S]*?<\/thinking>/gi, '').trim();
     const lines = cleaned.replace(/\r\n/g, '\n').split('\n');
     let html = '';
     let inCode = false;
