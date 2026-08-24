@@ -4,6 +4,39 @@ App.Session = {};
 /* 会话列表缓存:5s 内不重复请求 */
 App.Session._listCache = { ids: null, ts: 0 };
 
+/* 会话侧边栏折叠状态 */
+App.Session._collapsed = false;
+
+/* 会话侧边栏折叠/展开 */
+App.Session.toggleCollapse = function () {
+  App.Session._collapsed = !App.Session._collapsed;
+  const panel = document.getElementById('sessionPanel');
+  const btn = document.getElementById('collapseBtn');
+  const reopen = document.getElementById('sessionReopen');
+  if (panel) panel.classList.toggle('collapsed', App.Session._collapsed);
+  if (btn) btn.textContent = App.Session._collapsed ? '⏵' : '⏴';
+  if (reopen) reopen.style.display = App.Session._collapsed ? '' : 'none';
+  if (App.Storage) App.Storage.set('session_panel_collapsed', App.Session._collapsed);
+};
+
+App.Session.loadCollapse = function () {
+  try {
+    if (App.Storage) {
+      App.Session._collapsed = !!App.Storage.get('session_panel_collapsed');
+    } else {
+      App.Session._collapsed = localStorage.getItem('agent_session_collapsed') === '1';
+    }
+  } catch (_) {}
+  if (App.Session._collapsed) {
+    const panel = document.getElementById('sessionPanel');
+    const btn = document.getElementById('collapseBtn');
+    const reopen = document.getElementById('sessionReopen');
+    if (panel) panel.classList.add('collapsed');
+    if (btn) btn.textContent = '⏵';
+    if (reopen) reopen.style.display = '';
+  }
+};
+
 /* 置顶会话 - 使用统一存储 */
 App.Session.loadPins = function () {
   if (App.Storage) {
@@ -116,10 +149,10 @@ App.Session.search = async function () {
   // 全文搜索:遍历所有会话内容,返回命中标题与片段
   const listEl = App.els.sessionList;
   try {
-    const res = await App.api(`/v1/chat/search?q=${encodeURIComponent(query)}`);
-    if (!res.success) { 
-      listEl.innerHTML = '<div class="session-empty">搜索失败</div>'; 
-      return; 
+    const res = await App.apiJSON(`/v1/chat/search?q=${encodeURIComponent(query)}`);
+    if (!res.success) {
+      listEl.innerHTML = '<div class="session-empty">搜索失败</div>';
+      return;
     }
     const data = res.data;
     listEl.innerHTML = '';
@@ -263,12 +296,12 @@ App.Session.enterRename = function (s, btn) {
 /* 重命名会话 */
 App.Session.rename = async function (id, title) {
   try {
-    const res = await App.api('/v1/chat/rename', {
+    const res = await App.apiJSON('/v1/chat/rename', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ session_id: id, title }),
     });
-    if (!res.success) throw new Error(`HTTP ${res.status}`);
+    if (!res.success) throw new Error(res.detail || `HTTP ${res.status}`);
     if (id === App.sessionId) App.els.sessionLabel.textContent = title;
   } catch (e) {
     if (App.toast) App.toast(`重命名失败: ${e.message}`, 'err');
@@ -278,12 +311,12 @@ App.Session.rename = async function (id, title) {
 
 /* 删除会话 */
 App.Session.remove = async function (id) {
-  const ok = await (App.confirm 
+  const ok = await (App.confirm
     ? App.confirm(`确定删除会话「${id}」的全部记录吗?此操作不可恢复。`, { danger: true, okText: '删除' })
     : true);
   if (!ok) return;
   try {
-    await App.api(`/v1/chat/clear?session_id=${encodeURIComponent(id)}`, { method: 'POST' });
+    await App.apiJSON(`/v1/chat/clear?session_id=${encodeURIComponent(id)}`, { method: 'POST' });
     if (id === App.sessionId) {
       App.Session.newSession();
     } else {
@@ -367,8 +400,8 @@ App.Session.select = async function (id) {
   const msgs = App.els.messages;
   msgs.innerHTML = '';
   try {
-    const res = await App.api(`/v1/chat/history?session_id=${encodeURIComponent(id)}`);
-    if (!res.success) throw new Error(`HTTP ${res.status}`);
+    const res = await App.apiJSON(`/v1/chat/history?session_id=${encodeURIComponent(id)}`);
+    if (!res.success) throw new Error(res.detail || `HTTP ${res.status}`);
     const data = res.data;
     // 批量构建 HTML 再一次性插入
     const fragments = [];
@@ -573,8 +606,8 @@ App.Session.clearMessages = function () {
 /* 导出会话为 Markdown */
 App.Session.exportCurrent = async function () {
   try {
-    const res = await App.api(`/v1/chat/export?session_id=${encodeURIComponent(App.sessionId)}&format=md`);
-    if (!res.success) throw new Error(`HTTP ${res.status}`);
+    const res = await App.apiJSON(`/v1/chat/export?session_id=${encodeURIComponent(App.sessionId)}&format=md`);
+    if (!res.success) throw new Error(res.detail || `HTTP ${res.status}`);
     const data = res.data;
     const blob = new Blob([data.content || ''], { type: 'text/markdown;charset=utf-8' });
     const url = URL.createObjectURL(blob);
