@@ -498,6 +498,13 @@ async def clear_history(session_id: str = Query("default")) -> dict:
     return {"session_id": session_id, "cleared": True}
 
 
+@router.delete("/chat/session/{session_id:path}")
+async def delete_session(session_id: str) -> dict:
+    """删除整个会话记录。"""
+    ok = await _store().delete(session_id)
+    return {"session_id": session_id, "deleted": ok}
+
+
 class RenameRequest(BaseModel):
     session_id: str = Field(..., description="会话 ID")
     title: str = Field("", description="自定义会话名(空串清除,回到自动标题)")

@@ -182,9 +182,12 @@
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
         _audioEl = new Audio(url);
-        _audioEl.play();
+        _audioEl.play().catch(() => {});
         _audioEl.onended = () => { URL.revokeObjectURL(url); _audioEl = null; };
         _audioEl.onerror = () => { URL.revokeObjectURL(url); _audioEl = null; };
+        // 页面卸载时释放 URL
+        const cleanup = () => { if (_audioEl) { URL.revokeObjectURL(url); _audioEl = null; } };
+        window.addEventListener('beforeunload', cleanup, { once: true });
         return;
       } catch (e) {
         lastErr = e.message;

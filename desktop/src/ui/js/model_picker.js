@@ -43,6 +43,13 @@ App.ModelPicker = (() => {
           App.Storage.set('model_name', modelOld);
           return;
         }
+        // 3b. 从新统一存储直接键（已由 storage.js 迁移填入）
+        const provNew = App.Storage.get('model_provider') || '';
+        const modelNew = App.Storage.get('model_name') || '';
+        if (provNew || modelNew) {
+          _state = { provider: provNew, model: modelNew };
+          return;
+        }
       }
       // 4. 降级到 localStorage
       const raw = localStorage.getItem('agent_model_state');
@@ -76,6 +83,8 @@ App.ModelPicker = (() => {
         }
       } else {
         localStorage.setItem('agent_model_state', JSON.stringify(_state));
+        localStorage.setItem('agent_provider', _state.provider);
+        if (_state.provider) localStorage.setItem(`agent_model_${_state.provider}`, _state.model);
       }
     } catch (_) { /* 忽略 */ }
   }
@@ -102,10 +111,20 @@ App.ModelPicker = (() => {
   }
 
   function summary() {
-    if (!_state.provider) return '默认模型';
+    if (!_state.provider) {
+      // 未选择模型时,尝试显示后端当前配置的默认模型
+      const active = App.Settings._activeProvider || '';
+      const activeModel = App.Settings._activeModel || '';
+      if (active) {
+        return activeModel
+          ? `${providerName(active)} · ${activeModel}`
+          : `${providerName(active)} · 默认`;
+      }
+      return '默认模型';
+    }
     return _state.model
       ? `${providerName(_state.provider)} · ${_state.model}`
-      : `${providerName(_state.provider)} · 默认`;
+      : `${_state.provider} · 默认`;
   }
 
   const _listeners = [];
@@ -164,7 +183,8 @@ App.ModelPicker = (() => {
     list.innerHTML = filtered.map((p) => {
       const configured = isConfigured(p.id);
       const selected = _state.provider === p.id;
-      const defaultModel = p.models && p.models[0];
+      // 兼容后端返回的 default_model 或 models[0]
+      const defaultModel = p.default_model || (p.models && p.models[0]) || '';
       const label = configured
         ? `${p.name}${defaultModel ? ' · ' + defaultModel : ''}`
         : `${p.name} (未配置)`;
@@ -176,7 +196,8 @@ App.ModelPicker = (() => {
         const pid = el.dataset.prov;
         if (!isConfigured(pid)) return;
         const p = providers.find((x) => x.id === pid);
-        const model = p && p.models && p.models[0];
+        // 兼容后端返回的 default_model 或 models[0]
+        const model = p.default_model || (p.models && p.models[0]) || '';
         set(pid, model || '');
         closePop();
       });
@@ -198,7 +219,7 @@ App.ModelPicker = (() => {
     });
   }
 
-  return { load, save, get, set, clear, init, isOpen, closePop };
+  return { load, save, get, set, clear, init, isOpen, closePop, refreshBadge };
 })();
 
 /* 初始化 */

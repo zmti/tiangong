@@ -7,81 +7,6 @@ App.Chat.modeParams = function () {
   return { mode: (App.els.modeSelect && App.els.modeSelect.value) || 'auto' };
 };
 
-/* 图片生成进度 UI:tool_start 触发"生成中"卡片,tool 结果到达后就地展示图片
- *
- * 定位策略(解决图片错位问题):
- *   把卡片插入到当前答案气泡(answerDiv)后面,而不是消息列表末尾。
- *   这样无论卡片先于/晚于文字回答创建,图片始终出现在回答正文的下方。 */
-App._imgGenCard = null;
-App.showImageGenerating = function () {
-  if (App._imgGenCard) return;
-  const wrap = document.createElement('div');
-  wrap.className = 'msg bot';
-  const avatar = makeAvatar('bot');
-  const body = document.createElement('div');
-  body.className = 'msg-body';
-  body.innerHTML = '<div class="img-gen-bubble">'
-    + '<svg class="img-gen-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">'
-    + '  <rect x="3" y="3" width="18" height="18" rx="3" ry="3"></rect>'
-    + '  <circle cx="8.5" cy="8.5" r="1.5"></circle>'
-    + '  <path d="M21 15l-5-5L5 21"></path>'
-    + '</svg>'
-    + '<span class="img-gen-status">'
-    + '  <span class="dot"></span>'
-    + '  <span class="txt">AI 正在作画<span class="txt-dots"></span></span>'
-    + '</span>'
-    + '</div>';
-  wrap.appendChild(avatar);
-  wrap.appendChild(body);
-  // 插入到当前答案气泡后面(若有),否则追加到末尾
-  const anchor = App._answerWrap;
-  if (anchor && anchor.parentNode === App.els.messages) {
-    App.els.messages.insertBefore(wrap, anchor.nextSibling);
-  } else {
-    App.els.messages.appendChild(wrap);
-  }
-  App._imgGenCard = wrap;
-  App.els.messages.scrollTop = App.els.messages.scrollHeight;
-  // 点号动画:JS 驱动,避免 CSS content 动画不支持的问题
-  App._dotsInterval = setInterval(() => {
-    const dots = wrap.querySelector('.txt-dots');
-    if (!dots) return;
-    const count = (parseInt(dots.dataset.count || 0) + 1) % 4;
-    dots.dataset.count = count;
-    dots.textContent = '.'.repeat(count);
-  }, 500);
-};
-App.finishImageGenerating = function (resultStr) {
-  if (!App._imgGenCard) return;
-  clearInterval(App._dotsInterval);
-  App._dotsInterval = null;
-  const bubble = App._imgGenCard.querySelector('.img-gen-bubble');
-  const url = App.parseImageUrl(resultStr);
-  if (url) {
-    bubble.innerHTML = '<img class="img-gen-result" src="' + App.escapeHtml(url) + '" alt="生成结果">';
-  } else {
-    // 图片生成失败:显示错误信息而非静默删除
-    const isErr = String(resultStr).includes('ConnectionResetError') ||
-                  String(resultStr).includes('error') ||
-                  String(resultStr).includes('失败');
-    if (isErr) {
-      bubble.innerHTML = '<div class="img-gen-error">'
-        + '<svg class="img-gen-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>'
-        + '<span class="img-gen-status">图片生成失败: ' + escapeHtml((resultStr || '').slice(0, 100)) + '</span>'
-        + '</div>';
-      App._imgGenCard.classList.add('img-gen-error');
-    } else {
-      App._imgGenCard.remove();
-    }
-  }
-  App._imgGenCard = null;
-};
-App.clearImageGenerating = function () {
-  clearInterval(App._dotsInterval);
-  App._dotsInterval = null;
-  if (App._imgGenCard) { App._imgGenCard.remove(); App._imgGenCard = null; }
-};
-
 App.Chat.send = async function () {
   // 已选图片时,发送即执行图片识别
   if (App.selectedImageFile) {
@@ -175,6 +100,7 @@ function _startGroup() {
     App._currentGroup = null;
   }
   if (App.Group && App.Group.start) App.Group.start();
+  if (App.ExecTrace && App.ExecTrace.start) App.ExecTrace.start();
 }
 
 /* 结束工具分组:根据是否有答案/工具展示最终摘要 */
@@ -187,6 +113,10 @@ function _finishGroup(answerText) {
 
 /* 核心发送逻辑 */
 App.Chat.doSend = async function (text, opts = {}) {
+  // 没有当前会话时自动创建
+  if (!App.sessionId || !App.sessionId.startsWith('desktop-')) {
+    App.Session.newSession();
+  }
   const input = App.els.input;
   input.value = '';
   if (App.syncComposer) App.syncComposer();
@@ -286,8 +216,9 @@ App.Chat.doSend = async function (text, opts = {}) {
       try {
         html = App.renderMarkdown(md);
       } catch (renderErr) {
-        console.error('[renderMarkdown] ERROR:', renderErr);
-        html = '<p>' + md + '</p>';  // fallback: show raw text
+        console.error('[renderMarkdown] scheduleRender ERROR:', renderErr);
+        // fallback: 必须 escape,防止原始 JSON/HTML 含 < 被解析为元素或泄露事件内容
+        html = '<p style="white-space:pre-wrap;word-break:break-word;">' + App.escapeHtml(md) + '</p>';
       }
       // 整段重渲染:保证跨切片边界的代码块/列表/表格等块级结构被正确解析
       answerDiv.innerHTML = html;
@@ -565,10 +496,6 @@ try {
               if (waitMsg) waitMsg.remove();
             }
             if (!answerDiv) {
-              // 先移除打字指示器(与上面的 if 块可能重复,但幂等)
-              const msgs = App.els.messages;
-              const waitMsg = Array.from(msgs.children).reverse().find(n => n.id === 'typing' || (n.classList.contains('msg') && n.classList.contains('bot') && n.textContent.trim() === '正在思考中...'));
-              if (waitMsg) waitMsg.remove();
               // 创建可见的空 bot 消息(先显示容器,后续增量追加内容)
               answerDiv = App.appendMessage('', 'bot');
               // 空文本时 wrapper 默认 display:none,这里解除隐藏以便流式内容可见
@@ -592,7 +519,16 @@ try {
             App.clearImageGenerating();
             cleanupStream();
             if (typingShown) App.removeTyping();
-            if (answerDiv) { answerDiv.innerHTML = App.renderMarkdown(App._mdBuf || ''); }
+            if (answerDiv) {
+              const md = App._mdBuf || '';
+              let h = '';
+              try { h = App.renderMarkdown(md); }
+              catch (e) {
+                console.error('[error handler renderMarkdown ERROR:', e);
+                h = '<p style="white-space:pre-wrap;">' + App.escapeHtml(md) + '</p>';
+              }
+              answerDiv.innerHTML = h;
+            }
             App.ExecTrace.finish(answerDiv ? (answerDiv.textContent || '') : null);
             // 同一次请求里后端可能对同一失败发多条相同 error(多阶段各自上报),只提示一次
             const errMsg = evt.message || '发生错误';
@@ -614,9 +550,21 @@ try {
                 finalHtml = App.renderMarkdown(finalMd);
               } catch (renderErr) {
                 console.error('[renderMarkdown] done handler ERROR:', renderErr);
-                finalHtml = '<p>' + finalMd + '</p>';  // fallback
+                finalHtml = '<p>' + App.escapeHtml(finalMd) + '</p>';  // fallback: 转义后再包裹,避免原始 JSON/脚本被当作 markdown 渲染
               }
               answerDiv.innerHTML = finalHtml;
+            }
+            // ── 从 done 事件的 steps 中补全执行轨迹(后端聚合结果,兜底未增量上报的步骤) ──
+            if (evt.steps && Array.isArray(evt.steps) && evt.steps.length > 0) {
+              for (const step of evt.steps) {
+                if (!step || typeof step !== 'object') continue;
+                const sName = step.name || step.tool || (typeof step === 'string' ? step : '步骤');
+                const sArgs = step.arguments || step.args || '';
+                let sStatus = step.status || (step.result !== undefined ? 'done' : 'running');
+                if (sStatus === 'failed' || sStatus === 'error') sStatus = 'fail';
+                else if (sStatus !== 'running' && sStatus !== 'fail') sStatus = 'done';
+                App.ExecTrace.addStep(sName, sArgs, sStatus);
+              }
             }
             // 关闭分组并传入最终答案文本
             _finishGroup(answerDiv ? (answerDiv.textContent || '') : null);
@@ -630,16 +578,130 @@ try {
                 // 记录中断集合,批准后自动续跑
                 App.Confirmation.trackInterrupt({ run_id: intr.run_id, interrupt: intr });
               }
-            } else if (!receivedTokens) {
-              // 没有收到任何 token 且没有 interrupt:后端可能返回了空响应
+            } else if (!receivedTokens && (!evt.steps || !Array.isArray(evt.steps) || evt.steps.length === 0)) {
+              // 没有 token,也没有 steps,也没有 interrupt:后端返回了完全空的响应
               App.refreshWelcomePage();
               App.appendMessage('未收到响应,请重试', 'error');
             }
+          } else {
+            // 兜底:未识别的事件类型 → 仅日志,绝不允许原始事件字符串进入聊天内容或 mdBuf
+            if (App.DEBUG) console.log('[SSE] unhandled event type:', evt.type, 'keys:', Object.keys(evt));
           }
         } catch (e) {
-          console.warn('parse sse error', e);
-          console.warn('  buffer content:', buffer.substring(-500));
+          // JSON 解析或事件分发失败:仅日志,绝不把原始 buffer/line 追加到聊天 UI 或 mdBuf
+          console.warn('[SSE] 解析事件失败:', e && e.message ? e.message : e);
+          // 只记录末尾 500 字符,避免超长日志污染控制台(substring 负数按 0 处理,改用 slice)
+          const tail = buffer.length > 500 ? '...' + buffer.slice(-500) : buffer;
+          console.warn('  相关片段:', tail);
         }
+      }
+    }
+
+    // ── 流关闭后:处理未以 \n\n 结尾的残余事件(部分代理/上游会省略最后一个分隔符) ──
+    // 典型场景:后端 StreamingResponse 直接关闭连接前未输出尾部 \n\n,最后一个 done/error 事件被遗漏
+    if (buffer && buffer.trim()) {
+      try {
+        buffer += '\n\n';  // 人为补齐分隔符,保证 split 能切出最后一条
+        const tailParts = buffer.split('\n\n');
+        buffer = '';
+        for (const part of tailParts) {
+          const line = part.trim();
+          if (!line) continue;
+          // 解析:接受 'data: {json}' 或裸 '{json}' 两种(极少数不规范 SSE 会省略 data: 前缀)
+          let jsonStr = line;
+          if (jsonStr.startsWith('data: ')) {
+            jsonStr = jsonStr.slice(6);
+          } else if (!jsonStr.startsWith('{') && !jsonStr.startsWith('[')) {
+            continue;  // SSE comment / id / event 字段,跳过
+          }
+          let evt;
+          try { evt = JSON.parse(jsonStr); }
+          catch (parseErr) {
+            // 非 JSON 残余 → 丢弃,不泄露到 UI
+            if (App.DEBUG) console.log('[SSE flush] 丢弃非 JSON 残余:', jsonStr.substring(0, 100));
+            continue;
+          }
+          if (!evt || typeof evt !== 'object' || !evt.type) continue;
+          receivedAnyEvent = true;
+          // 残余数据的分发:仅处理影响最终状态的关键事件
+          // 中间事件(tool_start/plan/thinking/orchestration 等)流结束后补处理已无意义
+          if (evt.type === 'done' && !done) {
+            done = true;
+            App.clearImageGenerating();
+            cleanupStream();
+            if (typingShown) App.removeTyping();
+            if (answerDiv) {
+              const finalMd = App._mdBuf || '';
+              let finalHtml = '';
+              try { finalHtml = App.renderMarkdown(finalMd); }
+              catch (e) {
+                console.error('[SSE flush done renderMarkdown ERROR:', e);
+                finalHtml = '<p>' + App.escapeHtml(finalMd) + '</p>';
+              }
+              answerDiv.innerHTML = finalHtml;
+            }
+            // 补全执行轨迹
+            if (evt.steps && Array.isArray(evt.steps) && evt.steps.length > 0) {
+              for (const step of evt.steps) {
+                if (!step || typeof step !== 'object') continue;
+                const sName = step.name || step.tool || '步骤';
+                const sArgs = step.arguments || step.args || '';
+                let sStatus = step.status || (step.result !== undefined ? 'done' : 'running');
+                if (sStatus === 'failed' || sStatus === 'error') sStatus = 'fail';
+                else if (sStatus !== 'running' && sStatus !== 'fail') sStatus = 'done';
+                App.ExecTrace.addStep(sName, sArgs, sStatus);
+              }
+            }
+            _finishGroup(answerDiv ? (answerDiv.textContent || '') : null);
+            App.ExecTrace.finish(answerDiv ? (answerDiv.textContent || '') : null);
+            const intr = evt.interrupt;
+            if (intr && intr.type === 'confirmation' && intr.requests) {
+              if (App.Confirmation && App.Confirmation.show) {
+                App.Confirmation.show(intr.requests, intr.run_id);
+                App.Confirmation.trackInterrupt({ run_id: intr.run_id, interrupt: intr });
+              }
+            } else if (!receivedTokens && (!evt.steps || !Array.isArray(evt.steps) || evt.steps.length === 0)) {
+              App.refreshWelcomePage();
+              App.appendMessage('未收到响应,请重试', 'error');
+            }
+          } else if (evt.type === 'error' && !done && !isError) {
+            done = true; isError = true;
+            App.clearImageGenerating(); cleanupStream();
+            if (typingShown) App.removeTyping();
+            if (answerDiv) {
+              const md = App._mdBuf || '';
+              let h = '';
+              try { h = App.renderMarkdown(md); }
+              catch (e) {
+                console.error('[flush error renderMarkdown ERROR:', e);
+                h = '<p style="white-space:pre-wrap;">' + App.escapeHtml(md) + '</p>';
+              }
+              answerDiv.innerHTML = h;
+            }
+            App.ExecTrace.finish(answerDiv ? (answerDiv.textContent || '') : null);
+            const errMsg = evt.message || '发生错误';
+            if (errMsg !== lastErrMsg) { lastErrMsg = errMsg; App.appendMessage(errMsg, 'error'); }
+            _finishGroup();
+          } else if (evt.type === 'token') {
+            // 残余 token 片段:执行最少必要的追加与渲染(不在此处创建 answerDiv,避免残留)
+            if (answerDiv) {
+              receivedTokens = true;
+              const { text, thinking } = processTokenChunk(evt.content || '');
+              if (thinking) {
+                const thinkText = App.stripThinkingTags ? App.stripThinkingTags(thinking) : thinking;
+                App.appendThinking(thinkText);
+              }
+              if (text) { App._mdBuf += text; scheduleRender(); }
+            }
+          } else if (evt.type === 'heartbeat') {
+            // no-op
+          } else if (!done) {
+            if (App.DEBUG) console.log('[SSE flush] 跳过残余中间事件:', evt.type);
+          }
+        }
+      } catch (flushErr) {
+        console.warn('[SSE flush] 残余处理异常:', flushErr && flushErr.message ? flushErr.message : flushErr);
+        buffer = '';
       }
     }
 
@@ -674,11 +736,11 @@ try {
         App.els.messages.scrollTop = App.els.messages.scrollHeight;
         pill.remove();
       });
-      document.body.appendChild(pill);
-      setTimeout(() => pill.style.opacity = '1', 100);
       // 移除现有的 pill (防止重复)
       const old = document.getElementById('scroll-pill');
-      if (old && old !== pill) old.remove();
+      if (old) old.remove();
+      document.body.appendChild(pill);
+      setTimeout(() => pill.style.opacity = '1', 100);
     }
 
     // 流被异常中断:直接显示错误,不再回退非流式接口
@@ -786,14 +848,8 @@ App.Chat.recognizeImage = async function (file) {
   fd.append('session_id', App.sessionId);
   // 与聊天一致:使用左下角模型选择器的当前选择(留空回退后端全局配置)
   const pickBase = App.ModelPicker ? App.ModelPicker.get() : { provider: '', model: '' };
-  const body = {
-    file,
-    prompt: '请描述这张图片的内容',
-    session_id: App.sessionId,
-    provider: pickBase.provider || null,
-    model: pickBase.model || null,
-    ...App.Chat.modeParams(),
-  };
+  fd.append('provider', pickBase.provider || '');
+  fd.append('model', pickBase.model || '');
   App.appendMessage(`🖼 识别图片: ${file.name}`, 'user');
   App.showTyping();
   App.Chat.setStreaming(true);
@@ -804,8 +860,7 @@ App.Chat.recognizeImage = async function (file) {
     if (data.error) {
       App.appendMessage(`❌ ${data.error}`, 'error');
     } else if (data.answer) {
-      const div = App.appendMessage(data.answer, 'bot');
-      div.innerHTML = App.renderMarkdown(data.answer);
+      App.appendMessage(data.answer, 'bot');
     } else {
       App.appendMessage('未能识别图片内容', 'bot');
     }

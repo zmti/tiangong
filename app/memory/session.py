@@ -135,7 +135,18 @@ class SessionStore:
         return messages
 
     async def clear(self, session_id: str) -> None:
-        self._backend.delete("sessions", "id = ?", (session_id,))
+        """清空会话消息但保留会话记录。"""
+        self._backend.update(
+            "sessions",
+            {"messages": json.dumps([], ensure_ascii=False), "updated_at": time.time()},
+            "id = ?",
+            (session_id,),
+        )
+
+    async def delete(self, session_id: str) -> bool:
+        """删除整个会话记录。"""
+        n = self._backend.delete("sessions", "id = ?", (session_id,))
+        return n > 0
 
     async def _extract_content(self, m: dict) -> str:
         """从新旧兼容的消息结构中提取可检索的文本内容。"""

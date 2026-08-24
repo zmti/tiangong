@@ -79,6 +79,12 @@ class RedisSessionStore:
     async def clear(self, session_id: str) -> None:
         await asyncio.to_thread(self._client.delete, self._key(session_id))
 
+    async def delete(self, session_id: str) -> bool:
+        """删除整个会话记录。"""
+        key = self._key(session_id)
+        n = await asyncio.to_thread(self._client.delete, key)
+        return n > 0
+
     async def _extract_content_redis(self, m: dict) -> str:
         """从新旧兼容的消息结构中提取可检索的文本内容(Redis 专用)。"""
         c = m.get("content")

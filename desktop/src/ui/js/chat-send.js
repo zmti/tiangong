@@ -23,7 +23,6 @@ App.Chat.send = async function () {
   if (!text || App.streaming) return;
   App.lastUserText = text;
   App._lastUserWrap = null;
-  App._lastUserWrap = null;
   await App.Chat.doSend(text);
 };
 

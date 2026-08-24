@@ -581,6 +581,7 @@
     safe('Prompts', () => App.Prompts.render());
     // 先加载 provider/model 数据,再初始化选择器与协作模式(两者 popover 均依赖 provider 缓存)
     await safe('loadProviders', () => App.Settings.loadProviders());
+    safe('renderProviderAdmin', () => App.Settings.renderProviderAdmin());
     safe('ModelPicker', () => App.ModelPicker.init());
     safe('Mode', () => App.Mode.init());
     await safe('restoreLast', () => App.Session.restoreLast(ids));

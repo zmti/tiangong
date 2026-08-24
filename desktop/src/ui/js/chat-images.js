@@ -6,7 +6,7 @@ App.showImageGenerating = function () {
   if (App._imgGenCard) return;
   const wrap = document.createElement('div');
   wrap.className = 'msg bot';
-  const avatar = makeAvatar('bot');
+  const avatar = App.makeAvatar('bot');
   const body = document.createElement('div');
   body.className = 'msg-body';
   body.innerHTML = '<div class="img-gen-bubble">'
@@ -57,7 +57,7 @@ App.finishImageGenerating = function (resultStr) {
     if (isErr) {
       bubble.innerHTML = '<div class="img-gen-error">'
         + '<svg class="img-gen-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>'
-        + '<span class="img-gen-status">图片生成失败: ' + escapeHtml((resultStr || '').slice(0, 100)) + '</span>'
+        + '<span class="img-gen-status">图片生成失败: ' + App.escapeHtml((resultStr || '').slice(0, 100)) + '</span>'
         + '</div>';
       App._imgGenCard.classList.add('img-gen-error');
     } else {

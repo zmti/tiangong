@@ -1,4 +1,4 @@
-﻿/* =============================================
+/* =============================================
    智能体助手 — Windows 11 Fluent Design UI
    设计原则: Mica 背景、色调提升(非阴影)、4px 网格、Segoe UI Variable
    ============================================= */
@@ -3371,6 +3371,8 @@ body.exec-panel-open .exec-panel {
 }
 .prov-ops button.danger:hover { border-color: var(--err); color: var(--err); background: var(--err-soft); }
 .prov-add { align-self: flex-start; }
+.prov-section-title { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; padding: 4px 0 0; }
+.prov-sep { height: 1px; background: var(--border); margin: 2px 0; }
 .prov-form {
   display: flex;
   flex-direction: column;

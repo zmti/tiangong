@@ -10,10 +10,10 @@ App.Session._collapsed = false;
 /* 会话侧边栏折叠/展开 */
 App.Session.toggleCollapse = function () {
   App.Session._collapsed = !App.Session._collapsed;
+  document.body.classList.toggle('session-collapsed', App.Session._collapsed);
   const panel = document.getElementById('sessionPanel');
   const btn = document.getElementById('collapseBtn');
   const reopen = document.getElementById('sessionReopen');
-  if (panel) panel.classList.toggle('collapsed', App.Session._collapsed);
   if (btn) btn.textContent = App.Session._collapsed ? '⏵' : '⏴';
   if (reopen) reopen.style.display = App.Session._collapsed ? '' : 'none';
   if (App.Storage) App.Storage.set('session_panel_collapsed', App.Session._collapsed);
@@ -28,10 +28,9 @@ App.Session.loadCollapse = function () {
     }
   } catch (_) {}
   if (App.Session._collapsed) {
-    const panel = document.getElementById('sessionPanel');
+    document.body.classList.add('session-collapsed');
     const btn = document.getElementById('collapseBtn');
     const reopen = document.getElementById('sessionReopen');
-    if (panel) panel.classList.add('collapsed');
     if (btn) btn.textContent = '⏵';
     if (reopen) reopen.style.display = '';
   }
@@ -134,7 +133,7 @@ App.Session.autoRename = async function (userText) {
       const t = item.querySelector('.s-title'); 
       if (t) t.textContent = title; 
     }
-    App.els.sessionLabel.textContent = title;
+    if (App.els.sessionLabel) App.els.sessionLabel.textContent = title;
     App.Session._listCache = { ids: null, ts: 0 };
   } catch (_) { /* 忽略命名失败,不影响体验 */ }
 };
@@ -201,11 +200,13 @@ App.Session.renderList = async function () {
   const listEl = App.els.sessionList;
   try {
     const res = await App.apiJSON('/v1/chat/sessions');
+    console.log('[Session] renderList res:', res);
     if (!res.success) {
       listEl.innerHTML = '<div class="empty-hint">加载失败</div>';
       App.Session._listCache = { ids: [], ts: Date.now() };
       return [];
     }
+    console.log('[Session] sessions raw data:', JSON.stringify(res.data).slice(0, 200));
     const sessions = res.data?.sessions || [];
     const pins = App.Session.loadPins();
     const query = (App.els.sessionSearch.value || '').trim().toLowerCase();
@@ -291,13 +292,13 @@ App.Session.enterRename = function (s, btn) {
   };
   input.dataset.orig = input.value;
 
-  input.addEventListener('keydown', async (e) => {
+  input.addEventListener('keydown', (e) => {
     if (e.isComposing || e.keyCode === 229) return;
     e.stopPropagation();
-    if (e.key === 'Enter') { e.preventDefault(); await finish(true); }
-    else if (e.key === 'Escape') { await finish(false); }
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    else if (e.key === 'Escape') { finish(false); }
   });
-  input.addEventListener('blur', () => { finish(true); });
+  input.addEventListener('blur', () => finish(true));
 };
 
 /* 重命名会话 */
@@ -338,13 +339,12 @@ App.Session.remove = async function (id) {
 /* 清空当前会话的对话内容(保留会话本身) */
 App.Session.clearCurrent = async function () {
   if (!App.sessionId) return;
-  const ok = await (App.confirm 
+  const ok = await (App.confirm
     ? App.confirm('确定清空当前会话的对话内容吗?', { danger: true, okText: '清空' })
     : true);
   if (!ok) return;
   try {
-    const res = await App.apiJSON(`/v1/chat/clear?session_id=${encodeURIComponent(App.sessionId)}`, { method: 'POST' });
-    if (!res.success) throw new Error(res.detail || `HTTP ${res.status}`);
+    // 只清空内存中的消息，不删除会话记录
     App.els.messages.innerHTML = '';
     App._planCard = null;
     if (App._currentGroup) { App._currentGroup.wrap.remove(); App._currentGroup = null; }
@@ -573,18 +573,17 @@ App.Session.create = async function () {
   App.Session.newSession();
 };
 
-/* 删除会话(后端无 DELETE /v1/chat/sessions/{id},用 clear 替代) */
+/* 删除会话(调用后端 DELETE /v1/chat/session/{session_id}) */
 App.Session.deleteSession = async function (id) {
   if (id === App.sessionId) {
     console.warn('[Session] 不能删除当前会话');
     return;
   }
   try {
-    await App.apiJSON(`/v1/chat/clear?session_id=${encodeURIComponent(id)}`, { method: 'POST' });
-    App.Session.renderList();
-  } catch (err) {
-    console.error('[Session] 删除失败:', err);
-  }
+    await App.apiJSON(`/v1/chat/session/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  } catch (_) { /* 忽略删除失败 */ }
+  App.Session._listCache = { ids: null, ts: 0 };
+  App.Session.renderList();
 };
 
 /* 清空消息(简化版) */

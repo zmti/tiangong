@@ -17,14 +17,12 @@
     model_provider: { type: 'string', default: '' },
     model_name: { type: 'string', default: '' },
 
-    // 协作模式（迁移自 mode.js）
-   协作模式: { type: 'object', default: {} },
-
     // 自定义扩展
     _custom: { type: 'object', default: {} },
   };
 
   let _data = {};
+  const _listeners = {};
 
   // ========== 内部工具 ==========
   function getDefault(key) {
@@ -52,6 +50,7 @@
       { from: 'agent_theme', to: 'theme', transform: v => v },
       { from: 'agent_mode', to: 'mode', transform: v => v },
       { from: 'agent_provider', to: 'model_provider', transform: v => v },
+      { from: 'agent_session_collapsed', to: 'session_panel_collapsed', transform: v => v === '1' },
     ];
 
     const raw = localStorage.getItem(STORE_KEY);
@@ -64,6 +63,30 @@
         localStorage.removeItem(from);
       }
     });
+
+    // 迁移模型状态：旧格式 agent_model_<providerId> → model_name
+    const prov = localStorage.getItem('agent_provider');
+    if (prov) {
+      const modelKey = `agent_model_${prov}`;
+      const modelVal = localStorage.getItem(modelKey);
+      if (modelVal !== null) {
+        _data.model_name = modelVal;
+        localStorage.removeItem(modelKey);
+      }
+    }
+
+    // 迁移 agent_model_state（旧整体格式）
+    const rawModelState = localStorage.getItem('agent_model_state');
+    if (rawModelState) {
+      try {
+        const saved = JSON.parse(rawModelState);
+        if (saved && typeof saved === 'object') {
+          _data.model_provider = typeof saved.provider === 'string' ? saved.provider : _data.model_provider;
+          _data.model_name = typeof saved.model === 'string' ? saved.model : _data.model_name;
+        }
+      } catch (_) {}
+      localStorage.removeItem('agent_model_state');
+    }
 
     save();
   }
@@ -116,6 +139,13 @@
     }
     _data[key] = value;
     save();
+    // 触发监听器
+    const listeners = _listeners[key];
+    if (listeners && listeners.length) {
+      listeners.forEach(cb => {
+        try { cb(value); } catch (_) { /* 忽略监听器错误 */ }
+      });
+    }
   }
 
   function remove(key) {
@@ -124,13 +154,13 @@
   }
 
   function subscribe(key, callback) {
-    const origSet = set;
-    const wrappedSet = (k, v) => {
-      origSet(k, v);
-      if (k === key) callback(v);
-    };
+    const listeners = _listeners[key] || (_listeners[key] = []);
+    listeners.push(callback);
     // 返回取消订阅函数
-    return () => {};
+    return () => {
+      const idx = listeners.indexOf(callback);
+      if (idx !== -1) listeners.splice(idx, 1);
+    };
   }
 
   function getCustom(key) {

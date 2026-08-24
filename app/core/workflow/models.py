@@ -115,9 +115,9 @@ class Workflow:
             # 检查条件
             if edge.condition:
                 try:
-                    if not eval(edge.condition, {"__builtins__": {}}, context):
+                    if not safe_eval(edge.condition, context):
                         continue
-                except Exception as e:
+                except (UnsafeExpressionError, ValueError) as e:
                     logger.warning(f"条件评估失败: {e}")
                     continue
             

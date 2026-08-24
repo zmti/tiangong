@@ -39,7 +39,7 @@
       return;
     }
     const g = App._currentGroup;
-    const ok = success !== true;
+    const ok = success === true;
     g.tools.push({ name, args, result, ok, time: Date.now() });
     const icon = getIcon(name);
     g.head.innerHTML = `<span class="rg-pulse">${icon}</span><span class="rg-label">${name} ${ok ? '✓' : '✗'}</span>`;

@@ -61,13 +61,6 @@ App.Settings.refreshBackend = async function () {
   return ok;
 };
 
-App.Settings.setStatus = function (ok) {
-  const dot = App.els.statusDot;
-  const txt = App.els.statusText;
-  if (dot) dot.className = ok ? 'status-dot connected' : 'status-dot disconnected';
-  if (txt) txt.textContent = ok ? '已连接' : '未连接';
-};
-
 /* ---------- 主模型选择器辅助(loadModels / provider 缓存) ---------- */
 
 // 缓存已加载的模型数据 { providerId -> [{id, name, speed, quality}] }
@@ -77,8 +70,16 @@ App._modelsCache = {};
 App.Settings.loadProviders = async function () {
   try {
     const res = await App.apiJSON('/v1/providers');
+    console.log('[Settings] loadProviders res:', res);
     if (!res.success) return;
     App.Settings._providers = res.data?.providers || [];
+    // 存储后端当前激活的 provider 和其默认模型
+    App.Settings._activeProvider = res.data?.active || '';
+    const activeProv = App.Settings._providers.find(p => p.id === App.Settings._activeProvider);
+    App.Settings._activeModel = activeProv?.default_model || '';
+    console.log('[Settings] providers loaded:', App.Settings._providers.length, 'active:', App.Settings._activeProvider, 'model:', App.Settings._activeModel);
+    // 刷新模型选择器徽标(使用后端激活模型信息)
+    if (App.ModelPicker) App.ModelPicker.refreshBadge && App.ModelPicker.refreshBadge();
   } catch (_) { /* 忽略 */ }
 };
 
@@ -122,6 +123,44 @@ App.Settings.renderProviderAdmin = async function () {
     } catch (_) { /* 忽略 */ }
 
   box.textContent = '';
+
+  // 先渲染已配置的内置提供商(从 loadProviders 缓存中取)
+  const builtIn = (App.Settings._providers || []).filter((p) => p.configured);
+  if (builtIn.length) {
+    const header = document.createElement('div');
+    header.className = 'prov-section-title';
+    header.textContent = '内置提供商';
+    box.appendChild(header);
+    builtIn.forEach((p) => {
+      const row = document.createElement('div');
+      row.className = 'prov-item';
+      const info = document.createElement('div');
+      info.className = 'prov-info';
+      const name = document.createElement('b');
+      name.textContent = p.name;
+      const meta = document.createElement('span');
+      meta.className = 'muted';
+      const models = p.models || [];
+      meta.textContent = p.default_model || (models[0] || '未设默认模型');
+      info.append(name, meta);
+      const ops = document.createElement('div');
+      ops.className = 'prov-ops';
+      const useBtn = document.createElement('button');
+      useBtn.type = 'button';
+      useBtn.textContent = '使用';
+      useBtn.addEventListener('click', () => {
+        if (App.ModelPicker) App.ModelPicker.set(p.id, p.default_model || (models[0] || ''));
+      });
+      ops.appendChild(useBtn);
+      row.append(info, ops);
+      box.appendChild(row);
+    });
+    const sep = document.createElement('div');
+    sep.className = 'prov-sep';
+    box.appendChild(sep);
+  }
+
+  // 渲染自定义提供商
   App.Settings._provCustoms.forEach((p) => {
     const row = document.createElement('div');
     row.className = 'prov-item';
@@ -167,8 +206,8 @@ App.Settings.renderProviderAdmin = async function () {
 };
 
 App.Settings.refreshProvidersUI = async function () {
-  await App.Settings.renderProviderAdmin();
   await App.Settings.loadProviders();
+  await App.Settings.renderProviderAdmin();
   App._modelsCache = {};
 };
 

@@ -49,12 +49,7 @@
   App.setStatus = function (ok, text) {
     const dot = App.els.statusDot;
     const txt = App.els.statusText;
-    if (ok) {
-      dot.className = 'status-dot ok';
-      txt.textContent = '已连接';
-    } else {
-      dot.className = 'status-dot err';
-      txt.textContent = text || '未连接';
-    }
+    if (dot) dot.className = ok ? 'status-dot ok' : 'status-dot err';
+    if (txt) txt.textContent = ok ? '已连接' : (text || '未连接');
   };
 })();

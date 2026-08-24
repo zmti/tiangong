@@ -4,14 +4,14 @@ App.Attach = {};
 App.Attach.currentIds = new Set();
 
 App.Attach.init = function () {
-  App.els.attachBtn.addEventListener('click', () => App.els.attachInput.click());
-  App.els.attachInput.addEventListener('change', () => {
+  if (App.els.attachBtn) App.els.attachBtn.addEventListener('click', () => App.els.attachInput.click());
+  if (App.els.attachInput) App.els.attachInput.addEventListener('change', () => {
     if (App.els.attachInput.files && App.els.attachInput.files.length) {
       App.Attach.upload(App.els.attachInput.files);
     }
     App.els.attachInput.value = '';
   });
-  App.els.attachClearBtn.addEventListener('click', () => App.Attach.clearAll());
+  if (App.els.attachClearBtn) App.els.attachClearBtn.addEventListener('click', () => App.Attach.clearAll());
 };
 
 App.Attach.upload = async function (files) {
