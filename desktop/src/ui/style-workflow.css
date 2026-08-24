@@ -30,10 +30,10 @@
 
 .wf-designer {
   flex: 1;
-  min-height: 300px;
+  min-height: 400px;
   border: none;
   border-radius: 0;
-  background: var(--bg-soft);
+  background: var(--bg);
   overflow: hidden;
   position: relative;
 }
@@ -111,20 +111,29 @@
   margin-bottom: 8px;
 }
 
-/* SVG node styles */
+/* SVG node styles - 增强视觉对比 */
 .wf-svg .node-rect {
   rx: 8;
   ry: 8;
   fill: var(--bg-elev);
-  stroke: var(--border);
+  stroke: var(--accent);
   stroke-width: 2;
   cursor: move;
-  transition: stroke 0.15s;
+  transition: stroke 0.15s, fill 0.15s;
+  filter: drop-shadow(0 2px 4px rgba(0, 0, 0, 0.3));
 }
 
 .wf-svg .node-rect:hover,
 .wf-svg .node-rect.selected {
-  stroke: var(--accent);
+  stroke: var(--primary);
+  stroke-width: 3;
+  fill: var(--bg-hover);
+}
+
+.wf-svg .node-rect.entry-node {
+  stroke: var(--ok);
+  stroke-width: 3;
+  fill: var(--ok-soft);
 }
 
 .wf-svg .node-text {
@@ -134,15 +143,62 @@
   text-anchor: middle;
   dominant-baseline: middle;
   pointer-events: none;
+  font-weight: 500;
 }
 
+/* 节点类型颜色 */
+.wf-svg .node-type-start .node-rect {
+  stroke: var(--ok);
+  fill: var(--ok-soft);
+}
+
+.wf-svg .node-type-end .node-rect {
+  stroke: var(--warn);
+  fill: var(--warn-soft);
+}
+
+.wf-svg .node-type-agent .node-rect {
+  stroke: var(--primary);
+  fill: var(--primary-soft);
+}
+
+.wf-svg .node-type-tool .node-rect {
+  stroke: var(--accent);
+  fill: var(--accent-soft);
+}
+
+/* 边样式 */
 .wf-svg .edge-line {
   stroke: var(--accent);
   stroke-width: 2;
   fill: none;
+  opacity: 0.8;
 }
 
 .wf-svg .edge-line:hover {
   stroke: var(--primary);
   stroke-width: 3;
+  opacity: 1;
+}
+
+/* 箭头标记 */
+.wf-svg #arrowhead polygon {
+  fill: var(--accent);
+}
+
+.wf-svg #arrowhead:hover polygon {
+  fill: var(--primary);
+}
+
+/* 网格背景 */
+.wf-svg .grid {
+  stroke: var(--border);
+  stroke-width: 0.5;
+  opacity: 0.3;
+}
+
+/* 拖拽时的样式 */
+.wf-svg .node-rect.dragging {
+  opacity: 0.8;
+  stroke: var(--primary);
 }
