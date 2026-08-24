@@ -46,10 +46,19 @@ class RedisSessionStore:
             created = float((await asyncio.to_thread(self._client.hget, key, "created_at")) or now)
         return {"id": session_id, "messages": messages, "created_at": created, "updated_at": now}
 
-    async def add_message(self, session_id: str, role: str, content: str):
+    async def add_message(self, session_id: str, role: str, kind: str = "text", content: Optional[str] = None, meta: Optional[dict] = None):
         session = await self.get_or_create(session_id)
         messages = list(session["messages"])
-        messages.append({"role": role, "content": content})
+        # 结构化消息: {id, role, kind, content, meta}
+        msg = {
+            "id": str(time.time()) + str(id(self)),
+            "role": role,
+            "kind": kind,
+            "content": content or "",
+        }
+        if meta:
+            msg["meta"] = meta
+        messages.append(msg)
         if len(messages) > self._max_messages:
             messages = messages[-self._max_messages:]
         key = self._key(session_id)
@@ -70,6 +79,20 @@ class RedisSessionStore:
     async def clear(self, session_id: str) -> None:
         await asyncio.to_thread(self._client.delete, self._key(session_id))
 
+    async def _extract_content_redis(self, m: dict) -> str:
+        """从新旧兼容的消息结构中提取可检索的文本内容(Redis 专用)。"""
+        c = m.get("content")
+        if isinstance(c, str):
+            return c
+        if isinstance(c, dict):
+            # tool kind content 可能是 {name, arguments, result} 结构，转文字
+            args = c.get("arguments", "")
+            result = c.get("result", "")
+            if args and result:
+                return f"{args} -> {result}"
+            return str(c)
+        return ""
+
     async def search(self, q: str, limit: int = 20) -> list[dict]:
         """在全部会话消息中做大小写不敏感全文检索,返回命中片段。"""
         q = q.strip()
@@ -83,7 +106,7 @@ class RedisSessionStore:
             title = s.get("title") or ""
             snippets: list[dict] = []
             for i, m in enumerate(msgs):
-                content = str(m.get("content", ""))
+                content = await self._extract_content_redis(m)
                 if low_q not in content.lower():
                     continue
                 if not title:
@@ -94,6 +117,7 @@ class RedisSessionStore:
                 snippets.append({
                     "index": i,
                     "role": m.get("role", ""),
+                    "kind": m.get("kind", ""),
                     "snippet": f"...{content[start:end]}...",
                 })
             if snippets:

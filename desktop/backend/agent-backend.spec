@@ -5,8 +5,10 @@ from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
 
-# Use venv's Python, not system/miniconda
-venv_site = r'E:\dev\agent-service\.venv\Lib\site-packages'
+# 动态检测当前 Python 解释器的 site-packages 路径
+import sys
+venv_site = os.path.join(os.path.dirname(sys.executable), '..', 'Lib', 'site-packages')
+venv_site = os.path.normpath(venv_site)
 
 def _collect_dir(src):
     out = []

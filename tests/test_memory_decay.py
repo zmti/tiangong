@@ -69,14 +69,10 @@ def test_memory_store_integration():
 
     # 手动设置一个很旧的时间戳(100倍TTL)
     old_ts = now - 360000  # 100小时
-    with store._lock:
-        conn = store._connect()
-        conn.execute(
-            "UPDATE memories SET created_at=?, updated_at=? WHERE id=?",
-            (old_ts, old_ts, mid),
-        )
-        conn.commit()
-        store._close(conn)
+    store._backend.execute(
+        "UPDATE memories SET created_at=?, updated_at=? WHERE id=?",
+        (old_ts, old_ts, mid),
+    )
 
     # 100倍TTL后分数应低于阈值
     assert decay.should_evict(old_ts, old_ts, hit_count=0) is True

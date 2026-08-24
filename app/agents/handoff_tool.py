@@ -4,17 +4,18 @@
 - delegate_task:通用子智能体(自拟指令/白名单)
 - handoff_to_role:按团队角色(researcher/coder/...)委派,系统提示与工具子集由角色决定
 - list_roles:查看团队里有哪些可用角色
-- typed_handoff:使用结构化 AgentMessage 协议的委派(支持并发 + 等待)
 """
 from __future__ import annotations
 
-import uuid
+import logging
 from typing import Optional
 
 from pydantic import Field
 
 from app.agents.roles import ensure_default_roles, get_role_registry
 from app.tools.registry import tool
+
+logger = logging.getLogger(__name__)
 
 
 def get_team():
@@ -51,11 +52,17 @@ async def handoff_to_role(
     ),
 ) -> dict:
     """把任务交接给指定角色执行。"""
+    import datetime
+
+    from app.config import settings as _cfg
     from app.core.agent import Agent
     from app.core.llm import LLMClient
     from app.core.telemetry import _current_run_id
-    from app.runtime.state import AgentState
-    from app.tools.delegation_tool import _delegate_depth, _delegate_parent, get_delegate_context
+    from app.tools.delegation_tool import (
+        _delegate_depth as _depth_var,
+        enforce_output_contract,
+        get_delegate_context,
+    )
 
     team = get_team()
     role_def = team.get(role)
@@ -95,18 +102,12 @@ async def handoff_to_role(
         sub._active_tools = list(role_def.tools)
         sub._schemas_cache = None
     # 角色子智能体同样收紧上下文预算,强制独立聚焦
-    from app.config import settings as _cfg
-
     sub.context_budget = _cfg.agent_subagent_context_budget
     sub.token_budget = _cfg.agent_subagent_token_budget
 
     prompt = instruction
     if context and context.strip():
         prompt += f"\n\n【背景资料】\n{context}"
-
-    import datetime
-
-    from app.tools.delegation_tool import _delegate_depth as _depth_var
 
     token = _depth_var.set(_depth_var.get() + 1)
     try:
@@ -124,7 +125,7 @@ async def handoff_to_role(
         from app.core.persistent_agent import get_agent_store
         store = get_agent_store()
         agent_state = store.create(
-            parent_run_id=get_delegate_context().run_id if parent else "",
+            parent_run_id=_current_run_id() or "",
             session_id=parent.session_id if parent else "",
             role=role,
             task=instruction,
@@ -136,10 +137,10 @@ async def handoff_to_role(
             {"role": "user", "content": instruction},
             {"role": "assistant", "content": result.answer or ""},
         ]
-        agent_state.tool_calls = [{"name": s.get("tool"), "args": s.get("args", {})} for s in tool_steps]
+        agent_state.tool_calls = [{"name": s.get("name"), "args": s.get("arguments", {})} for s in tool_steps]
         agent_state.intermediate_results = []
         for ts in tool_steps:
-            result_str = ts.get("result", "") or ts.get("args", {})
+            result_str = ts.get("result", "") or ts.get("arguments", {})
             agent_state.intermediate_results.append(str(result_str)[:500])
         agent_state.current_step = len(tool_steps)
         if result.answer:
@@ -161,23 +162,8 @@ async def handoff_to_role(
         "duration_s": duration,
         "note": "角色子智能体在独立上下文中执行,以上为结果摘要",
     }
-    # A 修复: 结构化消息协议 — 将结果包装为 AgentMessage
-    if _cfg.agent_typed_messages_enabled:
-        from app.agents.message_protocol import AgentMessage, get_task_queue
-        msg = AgentMessage(
-            sender="main", receiver=role,
-            task_id=f"task_{uuid.uuid4().hex[:8]}",
-            content=instruction,
-            status="done",
-            result=result.answer,
-        )
-        base["typed_message"] = msg.to_dict()
-        get_task_queue().send(msg)
-        get_task_queue().complete(msg.task_id, result=result.answer)
     # 输出契约:抽取符合 Schema 的结构化结果;不满足则标记失败由主智能体处理
     if expect:
-        from app.tools.delegation_tool import enforce_output_contract
-
         ok, data, err = await enforce_output_contract(llm, result.answer, expect)
         if not ok:
             return {
@@ -190,78 +176,3 @@ async def handoff_to_role(
             }
         base["answer_structured"] = data
     return base
-
-
-@tool(
-    "typed_handoff",
-    "使用结构化消息协议委派任务给子 Agent(支持并发等待)。"
-    "返回 AgentMessage 对象,可通过 task_id 等待结果。"
-    "适合需要精确控制委派流程的场景,相比 handoff_to_role 更轻量。",
-    timeout=600,
-)
-async def typed_handoff(
-    role: str = Field(description="角色名(可选,留空则使用 main 角色)"),
-    instruction: str = Field(description="任务指令"),
-    context: str = Field("", description="背景资料"),
-    expect: str = Field("", description="期望输出的 JSON Schema 字符串"),
-) -> dict:
-    """结构化委派:返回 AgentMessage 及异步结果等待能力。"""
-    from app.agents.message_protocol import AgentMessage, get_task_queue
-    import uuid as _uuid
-
-    task_id = f"task_{_uuid.uuid4().hex[:8]}"
-    msg = AgentMessage(
-        sender="main", receiver=role or "sub_agent",
-        task_id=task_id, content=instruction,
-        expect_schema=expect,
-    )
-    queue = get_task_queue()
-    queue.send(msg)
-
-    # 异步启动子 Agent
-    import asyncio
-    import datetime
-
-    from app.core.agent import Agent
-    from app.core.llm import LLMClient
-
-    async def _run_sub():
-        try:
-            llm = LLMClient()
-            sub = Agent(llm=llm, session_id="", max_steps=10)
-            prompt = instruction
-            if context:
-                prompt += f"\n\n【背景】\n{context}"
-            result = await sub.run(prompt, history=[])
-            queue.complete(task_id, result=result.answer, error="" if result.error else "")
-        except Exception as e:
-            queue.complete(task_id, error=str(e))
-
-    asyncio.create_task(_run_sub())
-
-    return {
-        "status": "sent",
-        "message": msg.to_dict(),
-        "note": "任务已提交,通过 get_task_result 等待结果",
-    }
-
-
-@tool(
-    "get_task_result",
-    "查询已完成任务的结果(通过 typed_handoff 提交的任务)。",
-    timeout=5,
-)
-def get_task_result(task_id: str = Field(..., description="任务 ID,来自 typed_handoff 返回的 message.task_id")) -> dict:
-    """查询任务结果。"""
-    from app.agents.message_protocol import get_task_queue
-    msg = get_task_queue().get(task_id)
-    if msg is None:
-        return {"error": f"未找到任务: {task_id}"}
-    return {
-        "task_id": task_id,
-        "status": msg.status.value,
-        "result": msg.result,
-        "error": msg.error,
-        "created_at": msg.created_at,
-        "completed_at": msg.completed_at,
-    }

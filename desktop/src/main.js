@@ -56,7 +56,7 @@ function readBackendApiKey() {
   const devEnv = path.join(projectRoot, '.env');
   const candidates = [devEnv];
   // 生产模式:从 exe 同目录 .env 读取
-  const exe = getBackendExecutable();
+  const exe = getBackendExecutable(true);
   if (exe) candidates.push(path.join(path.dirname(exe), '.env'));
   for (const envFile of candidates) {
     try {
@@ -70,7 +70,7 @@ function readBackendApiKey() {
   return '';
 }
 
-function getBackendExecutable() {
+function getBackendExecutable(silent = false) {
   // 同时兼容 onedir(dist/backend/agent-backend/)与 onefile(单 exe)两种布局
   const candidates = [];
   if (process.resourcesPath) {
@@ -82,6 +82,7 @@ function getBackendExecutable() {
   for (const c of candidates) {
     if (fs.existsSync(c)) return c;
   }
+  if (silent) return null;
   // 未找到:记录全部候选路径,便于定位是哪份副本缺后端
   const list = candidates.map((c) => `  - ${c}`).join('\n');
   console.error(`未找到后端 agent-backend.exe,请先打包 Python 后端。已检查:\n${list}`);

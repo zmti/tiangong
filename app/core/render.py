@@ -63,6 +63,9 @@ class RenderResult:
 # ── Markdown 渲染 ──────────────────────────────────────────────────
 def render_markdown_to_html(text: str) -> str:
     """将 Markdown 转换为 HTML。"""
+    if not text or not text.strip():
+        return ""
+
     if not _MARKDOWN_AVAILABLE:
         return _fallback_markdown_to_html(text)
 

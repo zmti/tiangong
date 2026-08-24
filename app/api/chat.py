@@ -668,21 +668,27 @@ async def list_models(provider: str | None = None) -> dict:
     if provider:
         provider = provider.lower()
         if provider.startswith("custom-"):
-            from app.core.provider_registry import get_custom
+            from app.core.provider_registry import get_custom, list_models as registry_list_models
 
             entry = get_custom(provider)
             if entry is None:
                 raise HTTPException(status_code=404, detail=f"自定义提供商不存在: {provider}")
-            models = [
-                {"id": m, "name": m, "speed": "", "quality": ""}
-                for m in entry.get("models", [])
-            ]
-            default = entry.get("model", "")
-            if default and default not in [m["id"] for m in models]:
-                models.insert(0, {"id": default, "name": default, "speed": "", "quality": ""})
-            return {"provider": provider, "configured": True, "models": models}
+            models = registry_list_models(provider)
+            default = entry.get("default_model") or entry.get("model") or ""
+            return {"provider": provider, "configured": True, "default": default, "models": models}
         if provider in _PROVIDER_DEFAULT_MODELS:
-            models = _PROVIDER_DEFAULT_MODELS[provider]
+            models = list(_PROVIDER_DEFAULT_MODELS[provider])
+            # 合并"内置厂商扩展模型"(用户在设置页追加,无需改代码)
+            from app.core.provider_registry import list_builtin_ext_models
+
+            for ext in list_builtin_ext_models(provider):
+                models.append({
+                    "id": ext.get("id"),
+                    "name": ext.get("name") or ext.get("id"),
+                    "speed": "",
+                    "quality": "",
+                    "context": ext.get("context"),
+                })
             # 检查是否配置了 API key
             configured = False
             if provider == "deepseek":
@@ -697,14 +703,24 @@ async def list_models(provider: str | None = None) -> dict:
             elif provider == "ollama":
                 configured = True  # 本地模型，不需要 API key
 
+            default_model = (
+                settings.deepseek_model if provider == "deepseek"
+                else settings.qwen_model if provider == "qwen"
+                else settings.openai_compat_model if provider == "compat"
+                else settings.ollama_model if provider == "ollama"
+                else "gpt-4o-mini"
+            )
+            for m in models:
+                m["default"] = (m.get("id") == default_model)
             return {
                 "provider": provider,
                 "configured": configured,
+                "default": default_model,
                 "models": models,
             }
         raise HTTPException(status_code=400, detail=f"未知的 provider: {provider}")
 
-    # 返回当前配置的 provider 和默认模型
+    # 返回当前配置的 provider 的模型列表
     current_provider = settings.agent_llm_provider.lower()
     default_model = None
     if current_provider == "deepseek":
@@ -718,9 +734,40 @@ async def list_models(provider: str | None = None) -> dict:
     elif current_provider == "ollama":
         default_model = settings.ollama_model
 
+    # 构建当前 provider 的模型列表
+    models = []
+    if current_provider == "deepseek":
+        models = list(_PROVIDER_DEFAULT_MODELS["deepseek"])
+    elif current_provider == "qwen":
+        models = list(_PROVIDER_DEFAULT_MODELS["qwen"])
+    elif current_provider == "openai":
+        models = list(_PROVIDER_DEFAULT_MODELS["openai"])
+    elif current_provider == "compat":
+        models = list(_PROVIDER_DEFAULT_MODELS["compat"])
+    elif current_provider == "ollama":
+        models = list(_PROVIDER_DEFAULT_MODELS["ollama"])
+
+    # 合并"内置厂商扩展模型"
+    from app.core.provider_registry import list_builtin_ext_models
+
+    for ext in list_builtin_ext_models(current_provider):
+        models.append({
+            "id": ext.get("id"),
+            "name": ext.get("name") or ext.get("id"),
+            "speed": "",
+            "quality": "",
+            "context": ext.get("context"),
+            "default": False,
+        })
+
+    # 标记默认模型
+    for m in models:
+        m["default"] = (m.get("id") == default_model)
+
     return {
         "provider": current_provider,
-        "model": default_model,
+        "models": models,
+        "default": default_model,
         "available_providers": [
             {"id": p["id"], "name": p["name"], "providers": p["providers"]}
             for p in _PROVIDER_GROUPS
@@ -762,7 +809,7 @@ async def list_providers() -> dict:
             })
 
     # 自定义 OpenAI 兼容提供商(设置-模型服务中配置)
-    from app.core.provider_registry import list_custom
+    from app.core.provider_registry import list_custom, list_models as registry_list_models
 
     for c in list_custom():
         providers.append({
@@ -770,7 +817,8 @@ async def list_providers() -> dict:
             "name": c["name"],
             "group": "custom",
             "configured": True,
-            "default_model": c.get("model", ""),
+            "default_model": c.get("default_model") or c.get("model", ""),
+            "model_count": len(registry_list_models(c["id"])),
         })
 
     # 获取当前激活的 provider

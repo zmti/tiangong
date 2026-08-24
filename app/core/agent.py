@@ -1755,7 +1755,7 @@ class Agent:
             return
         if getattr(self.llm, "provider", "") == "mock":
             return
-        from app.core.router import build_routed_llm
+        from app.core.smart_router import build_routed_llm
 
         routed = build_routed_llm(user_input)
         if routed is not None:

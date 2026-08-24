@@ -150,6 +150,8 @@ class Settings(BaseSettings):
     agent_max_tools: int = 0
 
     # ---- LLM 调用可靠性(重试 + 故障转移) ----
+    # 单次 LLM API 调用超时(秒);超时触发重试+故障转移,避免永久挂起
+    agent_llm_timeout: int = 60
     # LLM 调用失败(网络/限流/5xx 等瞬态错误)自动重试次数;0 = 不重试
     agent_llm_retries: int = 2
     # 重试基础延迟(秒),按 2^n 指数退避
@@ -426,11 +428,7 @@ class Settings(BaseSettings):
     # 结构化输出校验失败时的最大重试次数
     agent_structured_output_max_retries: int = 3
 
-    # ---- 多智能体消息协议 ----
-    # 开启后,handoff 和 delegation 使用结构化 AgentMessage 而非纯文本
-    agent_typed_messages_enabled: bool = True
-    # 子 Agent 之间最大并发委派数
-    agent_max_concurrent_delegates: int = 5
+    # ---- 多智能体委派 ----
     # 子智能体最大委派深度(0=主 Agent,1=直接子 Agent,2=孙 Agent)
     agent_delegate_max_depth: int = 2
     # 子智能体执行超时(秒)

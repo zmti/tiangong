@@ -184,6 +184,7 @@ async def select_tools_enhanced(
     query_vec = _get_embedding(user_input)
     if query_vec is not None:
         try:
+            from app.rag.embeddings import get_embedder, run_embed
             from app.rag.store import cosine_similarity
             scored = []
             for tool in registry.list():
@@ -218,8 +219,7 @@ async def select_tools_enhanced(
 
     # 3. 第三级:LLM 路由(兜底)
     try:
-        from app.core.router import select_tools as _llm_select
-        names = await _llm_select(llm, user_input, registry, max_tools)
+        names = await select_tools(llm, user_input, registry, max_tools)
         if names:
             _record_routing_success(user_input, names, 0.5)
             return names, 0.5, "llm_fallback"
@@ -263,3 +263,197 @@ def _get_routing_history_stats() -> dict:
     stats = _get_routing_stats()
     recent = _ROUTING_HISTORY[-20:] if _ROUTING_HISTORY else []
     return {**stats, "recent_history": recent}
+
+
+# ── 模型路由(从 router.py 迁移) ──────────────────────────────────────
+# 合并 router.py 的 classify_task 和 build_routed_llm 到 smart_router
+
+# 命中即判为复杂任务
+_COMPLEX_KEYWORDS = (
+    "分析", "计算", "比较", "对比", "汇总", "整理", "编写", "脚本", "数据库",
+    "查询", "报表", "报告", "图表", "预测", "规划",
+    "代码", "程序", "函数", "类", "接口", "API", "后端", "前端", "算法",
+    "正则", "Excel", "CSV", "表格", "公式",
+    "下载", "上传", "搜索", "邮件", "网页", "目录",
+)
+# 命中即判为简单任务
+_SIMPLE_KEYWORDS = (
+    "你好", "您好", "hi", "hello", "谢谢", "你是谁", "在吗", "早安", "晚安",
+    "再见", "测试", "test", "随便", "哈哈", "嗯", "哦",
+)
+
+
+def classify_task(message: str) -> str:
+    """返回 'simple' 或 'complex'。"""
+    msg = (message or "").strip()
+    if not msg:
+        return "complex"
+    lower = msg.lower()
+    is_simple_kw = any(k.lower() in lower for k in _SIMPLE_KEYWORDS)
+    is_complex_kw = any(k in lower for k in _COMPLEX_KEYWORDS)
+    if is_complex_kw:
+        return "complex"
+    if is_simple_kw:
+        return "simple"
+    if len(msg) <= 20:
+        return "simple"
+    if len(msg) > 50 and any(c in msg for c in ("?", "？", "http", "```")):
+        return "complex"
+    return "simple"
+
+
+def build_routed_llm(message: str, fallback=None):
+    """按任务复杂度返回对应 LLM;路由未启用或无对应配置时返回 fallback。"""
+    if not settings.agent_routing_enabled:
+        return fallback
+
+    from app.core.llm import LLMClient
+
+    task = classify_task(message)
+    if task == "simple" and settings.router_fast_provider:
+        return LLMClient(settings.router_fast_provider, model=settings.router_fast_model or None)
+    if task == "complex" and settings.router_strong_provider:
+        return LLMClient(settings.router_strong_provider, model=settings.router_strong_model or None)
+    return fallback
+
+
+def build_tool_router_index(registry) -> str:
+    """把注册器里的工具压缩成路由器可读的一行索引。"""
+    lines = []
+    for t in registry.list():
+        desc = (t.description or "").strip().replace("\n", " ")
+        if len(desc) > 80:
+            desc = desc[:80] + "…"
+        lines.append(f"- {t.name} [{get_category(t.name)}]: {desc}")
+    return "\n".join(lines)
+
+
+TOOL_ROUTER_PROMPT = """你是工具路由器。根据用户请求,从工具列表中选择最相关、执行任务最可能用到的工具。
+
+要求:
+1. 选择 1 到 {max_tools} 个工具;宁可少而准,不要贪多。
+2. 只选确定相关的工具;不确定的一律不选。
+3. 如果任务是寒暄/纯问答,返回空数组 {{"tools": []}},主循环会直接回答。
+4. 记忆工具(memory_*),规划工具(set_plan/update_plan)已常驻,不需要选择。
+
+工具列表(名称 [分类]: 描述):
+{index}
+
+只输出 JSON,格式为: {{"tools": ["工具名", ...], "reason": "一句话说明"}}
+"""
+
+
+def _parse_tool_list(text: str):
+    """从 LLM 输出中解析工具名数组。"""
+    if not text:
+        return None
+    for candidate in (text, text.strip()):
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(data, dict) and isinstance(data.get("tools"), list):
+            return [str(t) for t in data["tools"] if str(t).strip()]
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    end = start
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    if end > start:
+        try:
+            data = json.loads(text[start : end + 1])
+            if isinstance(data, dict) and isinstance(data.get("tools"), list):
+                return [str(t) for t in data["tools"] if str(t).strip()]
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+async def select_tools(
+    llm,
+    user_input: str,
+    registry,
+    max_tools=None,
+):
+    """用 LLM 从全量工具中预选相关工具子集(从 router.py 迁移)。"""
+    from app.core.llm import LLMError
+
+    max_tools = max_tools or settings.agent_tool_router_max_tools
+    index = build_tool_router_index(registry)
+    if not index.strip():
+        return []
+    prompt = [
+        {"role": "system", "content": TOOL_ROUTER_PROMPT.format(max_tools=max_tools, index=index)},
+        {"role": "user", "content": user_input},
+    ]
+    try:
+        if hasattr(llm, "chat_json"):
+            data = await llm.chat_json(prompt, temperature=0.1)
+            if isinstance(data, dict) and isinstance(data.get("tools"), list):
+                selected = [str(t) for t in data["tools"] if str(t).strip()]
+            else:
+                selected = []
+        else:
+            resp = await llm.chat(prompt, temperature=0.1)
+            parsed = _parse_tool_list(resp)
+            selected = parsed or []
+    except LLMError:
+        selected = []
+    except Exception:
+        selected = []
+
+    if not selected:
+        selected = select_tools_by_embedding(user_input, registry, max_tools)
+
+    known = {t.name for t in registry.list()}
+    valid = []
+    for name in selected:
+        name = name.strip()
+        if name in known and name not in SYSTEM_TOOLS and name not in valid:
+            valid.append(name)
+    return valid[:max_tools]
+
+
+def select_tools_by_embedding(
+    user_input: str,
+    registry,
+    max_tools: int = 10,
+    min_similarity: float = 0.15,
+) -> list[str]:
+    """基于 embedding 相似度的工具预选(从 router.py 迁移)。"""
+    try:
+        from app.rag.embeddings import get_embedder, run_embed
+        from app.rag.store import cosine_similarity
+    except Exception:
+        return []
+
+    try:
+        query_vec = run_embed(get_embedder(), [user_input])[0]
+    except Exception:
+        return []
+
+    scored = []
+    for tool in registry.list():
+        if tool.name in SYSTEM_TOOLS or not tool.enabled:
+            continue
+        desc = (tool.description or "").strip()
+        if not desc:
+            continue
+        try:
+            tool_vec = run_embed(get_embedder(), [desc])[0]
+            sim = cosine_similarity(query_vec, tool_vec)
+            if sim >= min_similarity:
+                scored.append((sim, tool.name))
+        except Exception:
+            continue
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [name for _, name in scored[:max_tools]]

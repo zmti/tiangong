@@ -137,7 +137,7 @@ class SessionStore:
     async def clear(self, session_id: str) -> None:
         self._backend.delete("sessions", "id = ?", (session_id,))
 
-    async def _extract_content(m: dict) -> str:
+    async def _extract_content(self, m: dict) -> str:
         """从新旧兼容的消息结构中提取可检索的文本内容。"""
         # 旧结构: {"role": "...", "content": "..."}
         # 新结构: {"role": "...", "kind": "...", "content": "..."} 或 tool kind 的 content 可能是 dict
@@ -149,7 +149,7 @@ class SessionStore:
             return str(c.get("content", c.get("result", "")))
         return ""
 
-async def search(self, q: str, limit: int = 20) -> list[dict]:
+    async def search(self, q: str, limit: int = 20) -> list[dict]:
         """在全部会话消息中做大小写不敏感全文检索,返回命中片段。"""
         q = q.strip()
         if not q:
@@ -162,7 +162,7 @@ async def search(self, q: str, limit: int = 20) -> list[dict]:
             order_by="updated_at DESC",
             limit=500
         )
-        
+
         out: list[dict] = []
         for row in rows:
             try:

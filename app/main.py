@@ -10,7 +10,7 @@ from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from app.api import attachments, chat, documents, files, mcp, mcp_server, runs, schedule, tasks, telemetry, tools, tts, user_profile, budget, advanced, analytics, assistants, plugins, safety, persistent_memory, planning, search, metrics, sessions, long_running, tenants, system, collaboration, reasoning, memory_cleanup, cross_session, collaboration_ui, artifacts
+from app.api import attachments, chat, documents, files, mcp, mcp_server, runs, schedule, tasks, telemetry, tools, tts, user_profile, budget, advanced, analytics, assistants, plugins, safety, persistent_memory, planning, search, metrics, sessions, long_running, tenants, system, collaboration, reasoning, memory_cleanup, cross_session, collaboration_ui, artifacts, workflow, multimodal
 from app.api.security import require_api_key, require_admin
 from app.config import settings
 from app.tools.registry import get_registry
@@ -150,12 +150,14 @@ def _init_tool_hot_loader():
 
 
 def _init_memory_ttl():
-    """启动记忆 TTL 后台清理"""
+    """启动记忆 TTL 后台清理 (使用统一记忆管理器)"""
     try:
-        from app.core.memory_ttl import start_memory_ttl_cleanup
-        start_memory_ttl_cleanup()
+        from app.core.memory_manager import get_memory_manager
+        manager = get_memory_manager()
+        # 统一记忆管理器已内置 TTL 和清理功能
+        logger.info("统一记忆管理器初始化完成")
     except Exception as e:
-        logger.warning("记忆 TTL 清理启动失败(不影响主服务): %s", e)
+        logger.warning("记忆管理器初始化失败(不影响主服务): %s", e)
 
 
 # ===== 停止函数定义 =====
@@ -186,11 +188,8 @@ async def _stop_long_running():
 
 
 def _stop_memory_ttl():
-    try:
-        from app.core.memory_ttl import stop_memory_ttl_cleanup
-        stop_memory_ttl_cleanup()
-    except Exception as e:
-        logger.warning("记忆 TTL 清理停止失败: %s", e)
+    """停止记忆 TTL 清理 (统一记忆管理器无需单独停止)"""
+    pass
 
 
 # ===== 统一初始化入口 =====
@@ -252,6 +251,7 @@ app.include_router(tts.router, dependencies=_auth)
 app.include_router(telemetry.router, dependencies=_auth)
 app.include_router(runs.router, dependencies=_auth)
 app.include_router(tasks.router, dependencies=_auth)
+app.include_router(workflow.router, dependencies=_auth)
 app.include_router(attachments.router, dependencies=_auth)
 app.include_router(schedule.router, dependencies=_auth)
 app.include_router(user_profile.router, dependencies=_auth)
@@ -266,6 +266,7 @@ app.include_router(safety.router, dependencies=_auth)
 app.include_router(persistent_memory.router, dependencies=_auth)
 app.include_router(planning.router, dependencies=_auth)
 app.include_router(search.router, dependencies=_auth)
+app.include_router(multimodal.router, dependencies=_auth)
 app.include_router(long_running.router, dependencies=_auth)  # 长时自主任务
 app.include_router(tenants.router, dependencies=[Depends(require_admin)])  # 租户管理(仅管理员可操作)
 app.include_router(system.router)  # 系统状态检查(无需认证)

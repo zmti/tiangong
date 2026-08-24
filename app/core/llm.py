@@ -100,13 +100,20 @@ class LLMClient:
     def __init__(self, provider: Optional[str] = None, model: Optional[str] = None):
         explicit = (provider or "").strip()
         raw = (explicit or settings.agent_llm_provider).lower()
-        # 兼容历史整串格式 "provider:model"(旧版前端拼接)
-        if explicit and ":" in raw and raw not in PROVIDER_ALIASES and not raw.startswith("custom-"):
-            head, tail = raw.split(":", 1)
-            if head.lower() in PROVIDER_ALIASES:
-                raw = head.lower()
-                if not model:
-                    model = tail
+        # 兼容历史整串格式 "provider:model" 与 "provider/model"(旧版前端/助手拼接)
+        if explicit and (":" in explicit or "/" in explicit):
+            from app.core.model_ref import parse_model_ref
+
+            head, tail = parse_model_ref(explicit)
+            if head and tail:
+                if head.startswith("custom-"):
+                    raw = head
+                    if not model:
+                        model = tail
+                elif head in PROVIDER_ALIASES:
+                    raw = head
+                    if not model:
+                        model = tail
         self._custom: Optional[dict] = None
         if raw.startswith("custom-"):
             from app.core.provider_registry import get_custom

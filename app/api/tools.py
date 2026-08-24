@@ -94,6 +94,7 @@ class ProviderUpsert(BaseModel):
     base_url: str
     api_key: str = ""
     model: str = ""
+    models: list[dict] | None = None  # 该厂商下的完整模型列表(探测或手动维护)
 
 
 class ProviderTest(BaseModel):
@@ -102,10 +103,16 @@ class ProviderTest(BaseModel):
     id: str | None = None  # 编辑时 Key 留空表示沿用旧值
 
 
+class ModelUpsert(BaseModel):
+    id: str
+    name: str = ""
+    context: int | None = None
+
+
 @router.get("/providers/custom")
 async def list_custom_providers() -> dict:
     """自定义提供商列表(Key 掩码,不回传明文)。"""
-    from app.core.provider_registry import list_custom, mask_key
+    from app.core.provider_registry import list_custom, mask_key, list_models as registry_list_models
 
     items = []
     for c in list_custom():
@@ -115,7 +122,9 @@ async def list_custom_providers() -> dict:
             "base_url": c.get("base_url", ""),
             "model": c.get("model", ""),
             "api_key_masked": mask_key(c.get("api_key", "")),
-            "models": c.get("models", []),
+            # 使用 list_models 兜底:models 为空但配置了默认 model 时,仍返回该模型,
+            # 避免编辑表单/厂商列表把已有模型误判为"0 个模型"
+            "models": registry_list_models(c["id"]),
         })
     return {"providers": items}
 
@@ -131,6 +140,7 @@ async def save_custom_provider(req: ProviderUpsert) -> dict:
             base_url=req.base_url,
             api_key=req.api_key,
             model=req.model,
+            models=req.models,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -142,6 +152,48 @@ async def delete_custom_provider(pid: str) -> dict:
     from app.core.provider_registry import delete_custom
 
     return {"ok": delete_custom(pid)}
+
+
+@router.get("/providers/custom/{pid}/models")
+async def list_custom_models(pid: str) -> dict:
+    from app.core.provider_registry import get_custom, list_models
+
+    if not get_custom(pid):
+        raise HTTPException(status_code=404, detail=f"自定义提供商不存在: {pid}")
+    return {"provider": pid, "models": list_models(pid)}
+
+
+@router.post("/providers/custom/{pid}/models")
+async def add_custom_model(pid: str, req: ModelUpsert) -> dict:
+    from app.core.provider_registry import add_model
+
+    try:
+        entry = add_model(pid, req.id, req.name, req.context)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True, "entry": entry}
+
+
+@router.delete("/providers/custom/{pid}/models/{mid}")
+async def remove_custom_model(pid: str, mid: str) -> dict:
+    from app.core.provider_registry import remove_model
+
+    try:
+        entry = remove_model(pid, mid)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True, "entry": entry}
+
+
+@router.post("/providers/custom/{pid}/models/{mid}/default")
+async def set_custom_default_model(pid: str, mid: str) -> dict:
+    from app.core.provider_registry import set_default_model
+
+    try:
+        entry = set_default_model(pid, mid)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True, "entry": entry}
 
 
 @router.post("/providers/custom/test")
@@ -164,12 +216,37 @@ async def test_custom_provider(req: ProviderTest) -> dict:
             resp = await client.get(f"{base}/models", headers=headers)
         if resp.status_code == 200:
             data = resp.json().get("data", []) or []
-            models = [m.get("id", "") for m in data if isinstance(m, dict) and m.get("id")]
+            models = [
+                {"id": m.get("id", ""), "name": m.get("id", "")}
+                for m in data if isinstance(m, dict) and m.get("id")
+            ]
             return {"ok": True, "models": models}
         return {"ok": False, "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
     except Exception as exc:
         msg = str(exc) or repr(exc) or type(exc).__name__
         return {"ok": False, "error": msg[:300]}
+
+
+@router.post("/providers/builtin/{pid}/models")
+async def add_builtin_ext_model(pid: str, req: ModelUpsert) -> dict:
+    from app.core.provider_registry import add_builtin_model, BUILTIN_PROVIDERS
+
+    if pid not in BUILTIN_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"未知内置厂商: {pid}")
+    try:
+        result = add_builtin_model(pid, req.id, req.name, req.context)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True, "result": result}
+
+
+@router.delete("/providers/builtin/{pid}/models/{mid}")
+async def remove_builtin_ext_model(pid: str, mid: str) -> dict:
+    from app.core.provider_registry import remove_builtin_model, BUILTIN_PROVIDERS
+
+    if pid not in BUILTIN_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"未知内置厂商: {pid}")
+    return {"ok": remove_builtin_model(pid, mid)}
 
 
 class TodoCreate(BaseModel):

@@ -111,8 +111,6 @@ EVAL_CASES: list[dict] = [
     {"id": "multi_step_sum", "category": "multi_agent", "user_input": "先计算 1+2+3+4+5 的和,再把结果乘以 2,返回最终值", "expect_tool": "calculate", "expect_keyword": "30", "tool_after": "calculate"},
     {"id": "delegate_research", "category": "multi_agent", "user_input": "委派 coder 角色写一个计算阶乘的函数", "expect_tool": "delegate_task", "expect_keyword": None},
     {"id": "delegate_parallel", "category": "multi_agent", "user_input": "同时让两个角色分别计算 2+3 和 4*5", "expect_tool": "delegate_parallel", "expect_keyword": None},
-    {"id": "typed_handoff", "category": "multi_agent", "user_input": "用结构化委派让 analyst 分析一段数据", "expect_tool": "typed_handoff", "expect_keyword": None},
-    {"id": "get_task_result", "category": "multi_agent", "user_input": "查询之前委派任务的结果", "expect_tool": "get_task_result", "expect_keyword": None},
     {"id": "handoff_with_expect", "category": "multi_agent", "user_input": "让 coder 写一个素数判断函数,期望返回 JSON Schema 格式", "expect_tool": "handoff_to_role", "expect_keyword": None},
     {"id": "handoff_depth_limit", "category": "multi_agent", "user_input": "递归委派 3 层深度任务(测试深度限制)", "expect_tool": "handoff_to_role", "expect_keyword": None},
     {"id": "multi_agent_collab", "category": "multi_agent", "user_input": "让 researcher 调研然后让 coder 实现,最后让 reviewer 审查", "expect_tool": "handoff_to_role", "expect_keyword": None},
