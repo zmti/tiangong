@@ -11,13 +11,18 @@
     selectedImageFile: null,
   };
 
-  // 初始化状态管理
-  if (App.State) {
-    App.State.migrate();
-    App.State.load();
+  // 初始化 DOM 元素缓存
+  if (App.Elements) {
+    App.els = App.Elements.init();
+  }
+
+  // 初始化存储管理
+  if (App.Storage) {
+    App.Storage.migrate();
+    App.Storage.load();
     // 同步到全局状态
-    App.sessionId = App.State.get('session_id');
-    App.theme = App.State.get('theme');
+    App.sessionId = App.Storage.get('last_session');
+    App.theme = App.Storage.get('theme');
   }
 
   // 设置主题

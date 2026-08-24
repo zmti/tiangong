@@ -1,8 +1,6 @@
-/* 统一状态管理:替代散落的 localStorage 操作 */
+/* 统一状态管理:基于 App.Storage 替代散落的 localStorage 操作 */
 (function () {
-  const STORE_PREFIX = 'agent_';
-  
-  // 状态定义与默认值
+  // 状态定义
   const STATE_SCHEMA = {
     session_id: 'desktop-' + Date.now().toString(36),
     theme: 'light',
@@ -11,57 +9,53 @@
     provider: '',
     pinned_sessions: [],
     last_session: '',
-    // ... 可扩展
   };
 
-  let _state = {};
-  let _listeners = [];
-
+  // 初始化时从统一存储加载
   function load() {
-    try {
-      const raw = localStorage.getItem(STORE_PREFIX + 'state_v2');
-      if (raw) {
-        _state = { ...STATE_SCHEMA, ...JSON.parse(raw) };
-        return;
-      }
-    } catch (e) { /* 损坏数据按默认处理 */ }
-    _state = { ...STATE_SCHEMA };
-    save();
-  }
-
-  function save() {
-    try {
-      localStorage.setItem(STORE_PREFIX + 'state_v2', JSON.stringify(_state));
-      _listeners.forEach(fn => fn(_state));
-    } catch (_) {}
-  }
-
-  function get(key) {
-    return _state[key] !== undefined ? _state[key] : STATE_SCHEMA[key];
-  }
-
-  function set(key, value) {
-    _state[key] = value;
-    save();
-  }
-
-  function subscribe(fn) {
-    _listeners.push(fn);
-    return () => { _listeners = _listeners.filter(f => f !== fn); };
-  }
-
-  // 兼容旧版键迁移
-  function migrate() {
-    const keys = ['session_id', 'theme', 'mode', 'model', 'provider', 'pinned_sessions', 'last_session'];
-    keys.forEach(key => {
-      const oldKey = STORE_PREFIX + key;
-      if (!localStorage.getItem(STORE_PREFIX + 'state_v2') && localStorage.getItem(oldKey)) {
-        set(key, localStorage.getItem(oldKey));
-        localStorage.removeItem(oldKey);
+    if (!App.Storage) return;
+    
+    Object.keys(STATE_SCHEMA).forEach(key => {
+      const val = App.Storage.get(key);
+      if (val !== undefined) {
+        STATE_SCHEMA[key] = val;
       }
     });
   }
 
+  function save() {
+    if (!App.Storage) return;
+    Object.keys(STATE_SCHEMA).forEach(key => {
+      App.Storage.set(key, STATE_SCHEMA[key]);
+    });
+  }
+
+  function get(key) {
+    if (!App.Storage) return STATE_SCHEMA[key];
+    return App.Storage.get(key);
+  }
+
+  function set(key, value) {
+    STATE_SCHEMA[key] = value;
+    save();
+  }
+
+  // 兼容旧代码的直接 localStorage 访问
+  function getLegacy(key) {
+    try {
+      const raw = localStorage.getItem(key);
+      return raw ? JSON.parse(raw) : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function setLegacy(key, value) {
+    try {
+      localStorage.setItem(key, JSON.stringify(value));
+    } catch (_) {}
+  }
+
   window.App = window.App || {};
-  App.State = { load, save, get, set, subscribe, migrate };
+  App.State = { load, save, get, set, getLegacy, setLegacy };
 })();
