@@ -8,9 +8,9 @@ App.KB.refresh = async function () {
 App.KB.renderStats = async function () {
   const el = App.els.docStats;
   try {
-    const res = await App.api('/v1/documents/stats');
-    if (!res.ok) { el.innerHTML = '知识库: 不可用'; return; }
-    const d = await res.json();
+    const res = await App.apiJSON('/v1/documents/stats');
+    if (!res.success) { el.innerHTML = '知识库: 不可用'; return; }
+    const d = res.data;
     el.innerHTML = `📄 文档 <b>${d.documents || 0}</b> · 片段 <b>${d.chunks || 0}</b>`;
   } catch (_) {
     el.textContent = '知识库: 加载失败';
@@ -20,9 +20,9 @@ App.KB.renderStats = async function () {
 App.KB.renderDocs = async function () {
   const listEl = App.els.docList;
   try {
-    const res = await App.api('/v1/documents/stats');
-    if (!res.ok) { listEl.innerHTML = ''; return; }
-    const d = await res.json();
+    const res = await App.apiJSON('/v1/documents/stats');
+    if (!res.success) { listEl.innerHTML = ''; return; }
+    const d = res.data;
     const sources = d.by_source || {};
     const names = Object.keys(sources).sort();
     listEl.innerHTML = '';
@@ -95,13 +95,13 @@ App.KB.upload = async function (files) {
 App.KB.deleteDoc = async function (source) {
   if (!(await App.confirm(`确定从知识库删除「${source}」吗?`, { danger: true, okText: '删除' }))) return;
   try {
-    const res = await App.api(`/v1/documents?source=${encodeURIComponent(source)}`, { method: 'DELETE' });
-    const d = await res.json();
-    if (res.ok) {
+    const res = await App.apiJSON(`/v1/documents?source=${encodeURIComponent(source)}`, { method: 'DELETE' });
+    if (res.success) {
+      const d = res.data || {};
       App.toast(`已删除「${source}」(${d.deleted_chunks || 0} 片段)`, 'ok');
       App.KB.refresh();
     } else {
-      App.toast(`删除失败: ${d.detail || d.error || res.status}`, 'err');
+      App.toast(`删除失败: ${res.detail || res.status}`, 'err');
     }
   } catch (e) {
     App.toast(`删除失败: ${e.message}`, 'err');
@@ -111,9 +111,9 @@ App.KB.deleteDoc = async function (source) {
 App.KB.clearAll = async function () {
   if (!(await App.confirm('确定清空整个知识库吗?此操作不可恢复。', { danger: true, okText: '清空' }))) return;
   try {
-    const res = await App.api('/v1/documents/all', { method: 'DELETE' });
-    const d = await res.json();
-    if (res.ok) {
+    const res = await App.apiJSON('/v1/documents/all', { method: 'DELETE' });
+    if (res.success) {
+      const d = res.data || {};
       App.toast(`知识库已清空(${d.chunks || 0} 片段)`, 'ok');
       App.KB.refresh();
     } else {

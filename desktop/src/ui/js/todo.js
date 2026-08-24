@@ -6,9 +6,9 @@ App.Todo.load = async function () {
   const filter = (document.getElementById('todoFilter') || {}).value || 'all';
   if (!listEl) return;
   try {
-    const res = await App.api(`/v1/todos?only_pending=${filter === 'pending'}`);
-    if (!res.ok) { listEl.innerHTML = '<div class="session-empty">加载失败</div>'; return; }
-    const data = await res.json();
+    const res = await App.apiJSON(`/v1/todos?only_pending=${filter === 'pending'}`);
+    if (!res.success) { listEl.innerHTML = '<div class="session-empty">加载失败</div>'; return; }
+    const data = res.data;
     const todos = data.todos || [];
     listEl.innerHTML = '';
     if (!todos.length) {
@@ -32,7 +32,7 @@ App.Todo.buildItem = function (t) {
   check.textContent = t.done ? '✅' : '○';
   check.title = '切换完成状态';
   check.addEventListener('click', async () => {
-    await App.api('/v1/todos/toggle', {
+    await App.apiJSON('/v1/todos/toggle', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: t.id }),
     });
     App.Todo.load();
@@ -64,7 +64,7 @@ App.Todo.buildItem = function (t) {
   del.addEventListener('click', async () => {
     if (!(await App.confirm(`确定删除待办「${t.title}」吗?`, { danger: true, okText: '删除' }))) return;
     try {
-      await App.api('/v1/todos/delete', {
+      await App.apiJSON('/v1/todos/delete', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: t.id }),
       });
       App.toast('待办已删除', 'ok');
@@ -89,7 +89,7 @@ App.Todo.add = async function () {
   const dueRaw = (dueInput && dueInput.value) || '';
   input.value = '';
   try {
-    const res = await App.api('/v1/todos', {
+    const res = await App.apiJSON('/v1/todos', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         title,
@@ -97,7 +97,7 @@ App.Todo.add = async function () {
         due_at: dueRaw,
       }),
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.success) throw new Error(res.detail || `HTTP ${res.status}`);
     App.toast('待办已添加', 'ok');
   } catch (e) {
     App.toast(`添加失败: ${e.message}`, 'err');

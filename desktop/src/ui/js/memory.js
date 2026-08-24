@@ -9,9 +9,9 @@ App.Memory.renderStats = async function () {
   const el = App.els.memoryStats;
   if (!el) return;
   try {
-    const res = await App.api('/v1/memory');
-    if (!res.ok) { el.innerHTML = '记忆: 不可用'; return; }
-    const d = await res.json();
+    const res = await App.apiJSON('/v1/memory');
+    if (!res.success) { el.innerHTML = '记忆: 不可用'; return; }
+    const d = res.data;
     const s = d.stats || {};
     el.innerHTML = `🧠 记忆 <b>${s.total || 0}</b> · 手动 <b>${s.manual || 0}</b> · 自动 <b>${s.auto || 0}</b> · 命中 <b>${s.hits || 0}</b>`;
   } catch (_) {
@@ -23,9 +23,9 @@ App.Memory.renderList = async function () {
   const listEl = App.els.memoryList;
   if (!listEl) return;
   try {
-    const res = await App.api('/v1/memory');
-    if (!res.ok) { listEl.innerHTML = '<div class="session-empty">记忆加载失败</div>'; return; }
-    const d = await res.json();
+    const res = await App.apiJSON('/v1/memory');
+    if (!res.success) { listEl.innerHTML = '<div class="session-empty">记忆加载失败</div>'; return; }
+    const d = res.data;
     let mems = d.memories || [];
     const kw = (document.getElementById('memorySearch') || {}).value || '';
     const scope = (document.getElementById('memoryScope') || {}).value || 'all';
@@ -111,13 +111,12 @@ App.Memory.buildItem = function (m) {
 App.Memory.deleteOne = async function (id) {
   if (!(await App.confirm('确定删除这条记忆吗?', { danger: true, okText: '删除' }))) return;
   try {
-    const res = await App.api(`/v1/memory/${encodeURIComponent(id)}`, { method: 'DELETE' });
-    if (res.ok) {
+    const res = await App.apiJSON(`/v1/memory/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (res.success) {
       App.toast('已删除一条记忆', 'ok');
       App.Memory.refresh();
     } else {
-      const d = await res.json();
-      App.toast(`删除失败: ${d.detail || res.status}`, 'err');
+      App.toast(`删除失败: ${res.detail || res.status}`, 'err');
     }
   } catch (e) {
     App.toast(`删除失败: ${e.message}`, 'err');
@@ -127,9 +126,9 @@ App.Memory.deleteOne = async function (id) {
 App.Memory.clearAll = async function () {
   if (!(await App.confirm('确定清空全部长期记忆吗?此操作不可恢复。', { danger: true, okText: '清空' }))) return;
   try {
-    const res = await App.api('/v1/memory/clear', { method: 'POST' });
-    const d = await res.json();
-    if (res.ok) {
+    const res = await App.apiJSON('/v1/memory/clear', { method: 'POST' });
+    if (res.success) {
+      const d = res.data || {};
       App.toast(`已清空长期记忆(${d.deleted || 0} 条)`, 'ok');
       App.Memory.refresh();
     } else {
@@ -149,17 +148,16 @@ App.Memory.add = async function () {
   input.value = '';
   App.els.memoryKwInput.value = '';
   try {
-    const res = await App.api('/v1/memory', {
+    const res = await App.apiJSON('/v1/memory', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content, keywords }),
     });
-    const d = await res.json();
-    if (res.ok) {
+    if (res.success) {
       App.toast('已保存新记忆', 'ok');
       App.Memory.refresh();
     } else {
-      App.toast(`保存失败: ${d.detail || res.status}`, 'err');
+      App.toast(`保存失败: ${res.detail || res.status}`, 'err');
     }
   } catch (e) {
     App.toast(`保存失败: ${e.message}`, 'err');

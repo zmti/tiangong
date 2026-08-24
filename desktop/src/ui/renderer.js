@@ -568,6 +568,8 @@
 
   async function loadAllData() {
     App._dataLoaded = true;
+    // 恢复会话侧边栏折叠状态
+    if (App.Session) App.Session.loadCollapse();
     // 各步骤相互隔离:单点异常不再中断后续组件初始化(避免"部分组件不显示")
     const safe = async (label, fn) => {
       try { return await fn(); } catch (e) { console.error(`[init] ${label} 失败:`, e); }

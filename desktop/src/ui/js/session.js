@@ -343,8 +343,8 @@ App.Session.clearCurrent = async function () {
     : true);
   if (!ok) return;
   try {
-    const res = await App.api(`/v1/chat/clear?session_id=${encodeURIComponent(App.sessionId)}`, { method: 'POST' });
-    if (!res.success) throw new Error(`HTTP ${res.status}`);
+    const res = await App.apiJSON(`/v1/chat/clear?session_id=${encodeURIComponent(App.sessionId)}`, { method: 'POST' });
+    if (!res.success) throw new Error(res.detail || `HTTP ${res.status}`);
     App.els.messages.innerHTML = '';
     App._planCard = null;
     if (App._currentGroup) { App._currentGroup.wrap.remove(); App._currentGroup = null; }

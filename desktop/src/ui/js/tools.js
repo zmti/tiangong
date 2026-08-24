@@ -4,9 +4,9 @@ App.Tools = {};
 App.Tools.load = async function () {
   const grid = App.els.toolGrid;
   try {
-    const res = await App.api('/v1/tools');
-    if (!res.ok) { grid.innerHTML = '<div class="session-empty">工具加载失败</div>'; return; }
-    const data = await res.json();
+    const res = await App.apiJSON('/v1/tools');
+    if (!res.success) { grid.innerHTML = '<div class="session-empty">工具加载失败</div>'; return; }
+    const data = res.data;
     const tools = data.tools || [];
     grid.innerHTML = '';
     if (!tools.length) {

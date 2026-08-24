@@ -76,10 +76,9 @@ App._modelsCache = {};
 // 加载所有可用 provider 列表并缓存(协作模式 popover 也从缓存读取)
 App.Settings.loadProviders = async function () {
   try {
-    const res = await App.api('/v1/providers');
-    if (!res.ok) return;
-    const data = await res.json();
-    App.Settings._providers = data.providers || [];
+    const res = await App.apiJSON('/v1/providers');
+    if (!res.success) return;
+    App.Settings._providers = res.data?.providers || [];
   } catch (_) { /* 忽略 */ }
 };
 
@@ -87,9 +86,9 @@ App.Settings.loadProviders = async function () {
 App.Settings.loadModels = async function (providerId, selectEl) {
   if (!providerId || !selectEl) return;
   try {
-    const res = await App.api(`/v1/models?provider=${encodeURIComponent(providerId)}`);
-    if (!res.ok) { selectEl.innerHTML = '<option value="">加载失败</option>'; return; }
-    const data = await res.json();
+    const res = await App.apiJSON(`/v1/models?provider=${encodeURIComponent(providerId)}`);
+    if (!res.success) { selectEl.innerHTML = '<option value="">加载失败</option>'; return; }
+    const data = res.data;
     selectEl.innerHTML = '<option value="">选择模型</option>';
     (data.models || []).forEach((m) => {
       const opt = document.createElement('option');
@@ -118,9 +117,9 @@ App.Settings.renderProviderAdmin = async function () {
   const box = document.getElementById('providerAdmin');
   if (!box) return;
   try {
-    const res = await App.api('/v1/providers/custom');
-    if (res.ok) App.Settings._provCustoms = (await res.json()).providers || [];
-  } catch (_) { /* 忽略 */ }
+      const res = await App.apiJSON('/v1/providers/custom');
+      if (res.success) App.Settings._provCustoms = (res.data?.providers) || [];
+    } catch (_) { /* 忽略 */ }
 
   box.textContent = '';
   App.Settings._provCustoms.forEach((p) => {
@@ -147,7 +146,7 @@ App.Settings.renderProviderAdmin = async function () {
     delBtn.textContent = '删除';
     delBtn.addEventListener('click', async () => {
       if (!window.confirm(`删除提供商「${p.name}」?正在使用它的会话将回退到全局配置。`)) return;
-      try { await App.api('/v1/providers/custom/' + encodeURIComponent(p.id), { method: 'DELETE' }); } catch (_) { /* 忽略 */ }
+      try { await App.apiJSON('/v1/providers/custom/' + encodeURIComponent(p.id), { method: 'DELETE' }); } catch (_) { /* 忽略 */ }
       App.Settings.refreshProvidersUI();
     });
     ops.append(editBtn, delBtn);
@@ -248,17 +247,22 @@ App.Settings._openProvForm = function (p) {
     status.textContent = '请求中…';
     status.className = 'prov-status muted';
     try {
-      const res = await App.api('/v1/providers/custom/test', {
+      const res = await App.apiJSON('/v1/providers/custom/test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ base_url: base, api_key: keyIn.value.trim(), id: p ? p.id : null }),
       });
-      if (res.status === 404) {
+      if (!res.success && res.status === 404) {
         status.textContent = '失败:' + provStaleHint();
         status.className = 'prov-status err';
         return null;
       }
-      const data = await res.json();
+      if (!res.success) {
+        status.textContent = '失败:' + (res.detail || '未知错误');
+        status.className = 'prov-status err';
+        return null;
+      }
+      const data = res.data;
       if (!data.ok) {
         status.textContent = '失败:' + (data.error || '未知错误');
         status.className = 'prov-status err';
@@ -300,7 +304,7 @@ App.Settings._openProvForm = function (p) {
     if (!name) { status.textContent = '请填写名称'; status.className = 'prov-status err'; return; }
     if (!base) { status.textContent = '请填写 Base URL'; status.className = 'prov-status err'; return; }
     try {
-      const res = await App.api('/v1/providers/custom', {
+      const res = await App.apiJSON('/v1/providers/custom', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -311,11 +315,10 @@ App.Settings._openProvForm = function (p) {
           model: modelIn.value.trim(),
         }),
       });
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
+      if (!res.success) {
         status.textContent = res.status === 404
           ? '保存失败:' + provStaleHint()
-          : '保存失败:' + (data.detail || res.status);
+          : '保存失败:' + (res.detail || res.status);
         status.className = 'prov-status err';
         return;
       }
