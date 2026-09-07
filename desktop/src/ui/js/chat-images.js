@@ -7,9 +7,9 @@ App.showImageGenerating = function () {
   const wrap = document.createElement('div');
   wrap.className = 'msg bot';
   const avatar = App.makeAvatar('bot');
-  const body = document.createElement('div');
-  body.className = 'msg-body';
-  body.innerHTML = '<div class="img-gen-bubble">'
+  const content = document.createElement('div');
+  content.className = 'msg-content';
+  content.innerHTML = '<div class="img-gen-bubble">'
     + '<svg class="img-gen-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">'
     + '  <rect x="3" y="3" width="18" height="18" rx="3" ry="3"></rect>'
     + '  <circle cx="8.5" cy="8.5" r="1.5"></circle>'
@@ -21,7 +21,7 @@ App.showImageGenerating = function () {
     + '</span>'
     + '</div>';
   wrap.appendChild(avatar);
-  wrap.appendChild(body);
+  wrap.appendChild(content);
   // 插入到当前答案气泡后面(若有),否则追加到末尾
   const anchor = App._answerWrap;
   if (anchor && anchor.parentNode === App.els.messages) {

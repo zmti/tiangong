@@ -155,7 +155,8 @@ def extract_text(content: bytes, filename: str) -> str:
     name = filename.lower()
     try:
         # 文本文件: 自动检测编码解码
-        if name.endswith(TEXT_EXTENSIONS):
+        # str.endswith 只接受 tuple(frozenset 会抛 TypeError),必须转换
+        if name.endswith(tuple(TEXT_EXTENSIONS)):
             return _detect_and_decode(content)
         if name.endswith(".pdf"):
             return _extract_pdf(content)

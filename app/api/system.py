@@ -17,7 +17,11 @@ async def health_check() -> dict:
     has_embedding_api = bool(settings.embedding_api_base_url or settings.openai_compat_base_url)
 
     llm_provider = settings.agent_llm_provider.lower()
-    llm_model = getattr(settings, f"{llm_provider}_model", "") or settings.agent_llm_provider
+    # compat 对应的配置字段是 openai_compat_*，需要特殊处理
+    if llm_provider == "compat":
+        llm_model = settings.openai_compat_model
+    else:
+        llm_model = getattr(settings, f"{llm_provider}_model", "") or settings.agent_llm_provider
     supports_vision = model_supports_vision(llm_model)
 
     features = {

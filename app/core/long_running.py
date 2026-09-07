@@ -235,7 +235,7 @@ class LongRunningTaskManager:
         if self._running:
             return
         self._running = True
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         self._loop_task = loop.create_task(self._run_loop())
         logger.info("长时任务后台循环已启动")
 

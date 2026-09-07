@@ -61,11 +61,120 @@ def estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> flo
 class Tracer:
     """进程内 trace 缓冲 + JSONL 落盘 + 可选 OTLP 导出。线程安全,失败静默。"""
 
-    def __init__(self, max_buffer: int = 1000):
+    def __init__(self, max_buffer: int = 1000, retention_days: float = 7.0):
         self._lock = threading.Lock()
         self._buffer: list[dict] = []
         self._max_buffer = max_buffer
+        self._retention_days = retention_days
         self._otlp = self._init_otlp()
+        self._last_cleanup = time.time()
+        self._cleanup_interval = 3600  # 每小时清理一次
+        self._cleanup_task = None
+
+    def start_background_cleanup(self) -> None:
+        """启动后台清理任务。"""
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+            self._cleanup_task = loop.create_task(self._cleanup_loop())
+            logger.info("Telemetry 后台清理已启动 (retention=%d天, interval=1小时)", int(self._retention_days))
+        except RuntimeError:
+            logger.debug("没有运行中的事件循环，跳过后台清理任务创建")
+
+    def stop_background_cleanup(self) -> None:
+        """停止后台清理任务。"""
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            try:
+                asyncio.get_running_loop().run_until_complete(self._cleanup_task)
+            except RuntimeError:
+                pass
+            self._cleanup_task = None
+            logger.info("Telemetry 后台清理已停止")
+
+    async def _cleanup_loop(self) -> None:
+        """后台清理循环。"""
+        while True:
+            try:
+                await asyncio.sleep(self._cleanup_interval)
+                await self.cleanup_old_events()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("Telemetry 清理任务出错: %s", e)
+
+    async def cleanup_old_events(self) -> int:
+        """清理过期的事件记录。
+        
+        Returns:
+            清理的事件数量
+        """
+        cutoff = time.time() - (self._retention_days * 86400)
+        
+        with self._lock:
+            original_count = len(self._buffer)
+            self._buffer = [e for e in self._buffer if e.get("ts", 0) > cutoff]
+            cleaned = original_count - len(self._buffer)
+        
+        # 清理过期的 JSONL 文件
+        cleaned_files = await self._cleanup_old_files(cutoff)
+        
+        if cleaned > 0 or cleaned_files > 0:
+            logger.info("Telemetry 清理完成: 内存 %d 条, 文件 %d 个", cleaned, cleaned_files)
+        
+        return cleaned + cleaned_files
+
+    async def _cleanup_old_files(self, cutoff: float) -> int:
+        """清理过期的 JSONL 文件。
+        
+        Returns:
+            清理的文件数量
+        """
+        import os as _os
+        base = _os.path.join(settings.resolved_data_dir, "traces")
+        if not _os.path.exists(base):
+            return 0
+        
+        cleaned = 0
+        try:
+            for filename in _os.listdir(base):
+                if not filename.endswith('.jsonl'):
+                    continue
+                filepath = _os.path.join(base, filename)
+                # 文件名格式: yyyy-mm-dd.jsonl
+                try:
+                    file_date_str = filename.replace('.jsonl', '')
+                    file_date = time.mktime(time.strptime(file_date_str, '%Y-%m-%d'))
+                    if file_date < cutoff:
+                        _os.remove(filepath)
+                        cleaned += 1
+                        logger.debug("已删除过期 trace 文件: %s", filename)
+                except ValueError:
+                    continue
+        except Exception as e:
+            logger.warning("清理 trace 文件时出错: %s", e)
+        
+        return cleaned
+
+    def record(self, event: dict) -> None:
+        if not settings.agent_tracing_enabled:
+            return
+        event = dict(event)
+        event.setdefault("ts", time.time())
+        event.setdefault("run_id", _current_run_id.get())
+        with self._lock:
+            self._buffer.append(event)
+            if len(self._buffer) > self._max_buffer:
+                self._buffer = self._buffer[-self._max_buffer:]
+            try:
+                self._append_file(event)
+            except Exception:  # noqa: BLE001  写盘失败不影响主流程
+                pass
+        if self._otlp is not None:
+            try:
+                self._export_otlp(event)
+            except Exception:  # noqa: BLE001  OTLP 失败静默
+                pass
 
     @staticmethod
     def _init_otlp():
@@ -274,3 +383,8 @@ class Tracer:
 
 
 tracer = Tracer()
+
+
+async def cleanup_traces() -> int:
+    """清理过期的 trace 记录（供管理接口调用）。"""
+    return await tracer.cleanup_old_events()

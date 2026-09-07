@@ -56,15 +56,19 @@ def get_safety_engine():
     return None
 
 def check_input(text):
-    """检查输入安全性"""
-    from app.core.guardrails import check_injection, check_sensitive_paths, check_secrets
+    """检查输入安全性。任一校验器失败立即返回拦截结果；校验器异常时记录警告并视为通过（避免误拦截）。"""
+    from app.core.guardrails import GuardrailResult, check_injection, check_leaked_secrets, check_sensitive_paths
+    import logging
+    logger = logging.getLogger(__name__)
     results = []
-    for checker in [check_injection, check_sensitive_paths, check_secrets]:
+    for checker in [check_injection, check_sensitive_paths, check_leaked_secrets]:
         try:
             result = checker(text)
             results.append(result)
             if not result.ok:
+                logger.warning("输入安全拦截: %s", result.reason)
                 return SafetyCheckResult(result)
-        except:
-            pass
+        except Exception as e:
+            # 校验器内部异常不影响主流程,记录警告后放行
+            logger.warning("安全校验器 %s 异常,降级放行: %s", checker.__name__, e)
     return SafetyCheckResult(GuardrailResult(name="safety", ok=True))

@@ -32,6 +32,19 @@ def _blocked_reason(command: str) -> str:
     classification = _classify_command(command)
     if classification == "blocked":
         return f"命令包含危险操作已被拦截: {command.strip()[:100]}"
+    # 额外检查: 禁止 shell 元字符组合(防止通过参数注入)
+    # 虽然 _build_argv 使用列表传递，但检查命令内容可提前拦截
+    dangerous_meta = [';', '&&', '||', '|', '`', '$(', '${']
+    low = command.strip().lower()
+    for meta in dangerous_meta:
+        # 排除合法用途(如管道在 ls | grep 中是合法的)
+        if meta in ('|', '&&', '||') and 'echo' in low or 'printf' in low:
+            continue
+        if meta in low:
+            # 检查是否在引号内(简单启发式)
+            parts = command.split(meta)
+            if len(parts) > 2:  # 多个分隔符说明是注入尝试
+                return f"命令包含危险字符 '{meta}' 被拦截"
     return ""
 
 

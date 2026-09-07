@@ -34,8 +34,36 @@ class WorkflowDB:
             self._conn = sqlite3.connect(self.db_path)
             self._conn.row_factory = sqlite3.Row
             self._create_tables()
+            self._migrate_tables()
             logger.info(f"工作流数据库已连接: {self.db_path}")
         return self._conn
+
+    def _migrate_tables(self):
+        """迁移表结构，添加新字段。"""
+        conn = self.connect()
+
+        # 检查并添加 error_mode 列
+        try:
+            conn.execute("ALTER TABLE workflows ADD COLUMN error_mode TEXT DEFAULT 'fail_fast'")
+            logger.info("已添加 error_mode 列到 workflows 表")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
+
+        # 检查并添加 session_id 列
+        try:
+            conn.execute("ALTER TABLE workflow_runs ADD COLUMN session_id TEXT DEFAULT ''")
+            logger.info("已添加 session_id 列到 workflow_runs 表")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
+
+        # 添加索引
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_workflow_runs_session_id ON workflow_runs(session_id)")
+            logger.info("已创建 session_id 索引")
+        except sqlite3.OperationalError:
+            pass  # 索引已存在
+
+        conn.commit()
     
     def close(self):
         """关闭数据库连接。"""
@@ -58,6 +86,7 @@ class WorkflowDB:
                 entry_node TEXT,
                 output_schema TEXT,
                 metadata TEXT DEFAULT '{}',
+                error_mode TEXT DEFAULT 'fail_fast',
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             )
@@ -67,6 +96,7 @@ class WorkflowDB:
                 id TEXT PRIMARY KEY,
                 workflow_id TEXT NOT NULL,
                 status TEXT DEFAULT 'running',
+                session_id TEXT DEFAULT '',
                 context TEXT DEFAULT '{}',
                 variables TEXT DEFAULT '{}',
                 node_states TEXT DEFAULT '{}',
@@ -80,6 +110,7 @@ class WorkflowDB:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_workflow_runs_workflow_id ON workflow_runs(workflow_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_workflow_runs_status ON workflow_runs(status)")
+        # session_id 索引在 _migrate_tables 中创建(兼容旧数据库)
         conn.commit()
         logger.info("工作流表创建完成")
     
@@ -89,7 +120,7 @@ class WorkflowDB:
         """保存工作流。"""
         conn = self.connect()
         now = time.time()
-        
+
         # 序列化节点和边
         nodes_json = json.dumps([
             {
@@ -106,6 +137,13 @@ class WorkflowDB:
                 "script_code": n.script_code,
                 "timeout": n.timeout,
                 "branches": n.branches,
+                # 新字段
+                "error_strategy": n.error_strategy.value if hasattr(n.error_strategy, 'value') else str(n.error_strategy),
+                "retry_count": n.retry_count,
+                "retry_delay": n.retry_delay,
+                "fallback_node_id": n.fallback_node_id,
+                "loop_mode": n.loop_mode.value if hasattr(n.loop_mode, 'value') else str(n.loop_mode),
+                "subgraph_ids": n.subgraph_ids,
             }
             for n in workflow.nodes.values()
         ])
@@ -122,9 +160,9 @@ class WorkflowDB:
         
         # 插入或更新
         conn.execute("""
-            INSERT OR REPLACE INTO workflows 
-            (id, name, description, version, nodes, edges, entry_node, output_schema, metadata, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO workflows
+            (id, name, description, version, nodes, edges, entry_node, output_schema, metadata, error_mode, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             workflow.id,
             workflow.name,
@@ -135,6 +173,7 @@ class WorkflowDB:
             workflow.entry_node,
             json.dumps(workflow.output_schema) if workflow.output_schema else None,
             json.dumps(workflow.metadata),
+            workflow.error_mode,
             workflow.created_at,
             workflow.updated_at,
         ))
@@ -186,6 +225,22 @@ class WorkflowDB:
             
             nodes = {}
             for n in nodes_data:
+                # 解析错误策略
+                error_strategy_str = n.get("error_strategy", "fail_fast")
+                try:
+                    from app.core.workflow.models import ErrorStrategy
+                    error_strategy = ErrorStrategy(error_strategy_str)
+                except ValueError:
+                    error_strategy = ErrorStrategy.FAIL_FAST
+
+                # 解析循环模式
+                loop_mode_str = n.get("loop_mode", "sequential")
+                try:
+                    from app.core.workflow.models import LoopMode
+                    loop_mode = LoopMode(loop_mode_str)
+                except ValueError:
+                    loop_mode = LoopMode.SEQUENTIAL
+
                 node = WorkflowNode(
                     id=n["id"],
                     type=NodeType(n["type"]),
@@ -200,6 +255,13 @@ class WorkflowDB:
                     script_code=n.get("script_code"),
                     timeout=n.get("timeout", 60),
                     branches=n.get("branches", {}),
+                    # 新字段
+                    error_strategy=error_strategy,
+                    retry_count=n.get("retry_count", 0),
+                    retry_delay=n.get("retry_delay", 0.5),
+                    fallback_node_id=n.get("fallback_node_id"),
+                    loop_mode=loop_mode,
+                    subgraph_ids=n.get("subgraph_ids", []),
                 )
                 nodes[node.id] = node
             
@@ -225,6 +287,7 @@ class WorkflowDB:
                 edges=edges,
                 entry_node=row["entry_node"],
                 output_schema=output_schema,
+                error_mode=row["error_mode"] or "fail_fast",
                 created_at=row["created_at"],
                 updated_at=row["updated_at"],
                 metadata=metadata,
@@ -240,23 +303,24 @@ class WorkflowDB:
     def save_run(self, run: WorkflowRun) -> str:
         """保存运行记录。"""
         conn = self.connect()
-        
+
         conn.execute("""
             INSERT OR REPLACE INTO workflow_runs
-            (id, workflow_id, status, context, variables, node_states, history, error, started_at, finished_at, output)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, workflow_id, status, session_id, context, variables, node_states, history, error, started_at, finished_at, output)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             run.run_id,
             run.workflow_id,
             run.status,
+            run.session_id,
             json.dumps(run.context),
-            json.dumps(run.variables),
+            json.dumps(run.variables, default=str),
             json.dumps(run.node_states),
             json.dumps(run.history),
             run.error,
             run.started_at,
             run.finished_at,
-            json.dumps(run.output) if run.output else None,
+            json.dumps(run.output, default=str) if run.output else None,
         ))
         conn.commit()
         return run.run_id

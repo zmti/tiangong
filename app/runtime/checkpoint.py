@@ -7,10 +7,10 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
-import threading
 import time
 from typing import Optional
 
@@ -19,7 +19,9 @@ from app.core.storage_backend import StorageBackend, get_storage_backend
 
 logger = logging.getLogger(__name__)
 
-_DB_LOCK = threading.Lock()
+# 使用 asyncio.Lock 替代 threading.Lock，避免阻塞事件循环
+# SQLite backend 内部已使用 threading.RLock，此处只需保护 checkpoint 操作本身的原子性
+_DB_LOCK = asyncio.Lock()
 
 
 class CheckpointManager:
@@ -41,10 +43,26 @@ class CheckpointManager:
             os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
             self._backend = get_storage_backend(db_path=db_path)
         
-        self._init_db()
+        # 初始化数据库需要在事件循环中运行
+        import asyncio
+        try:
+            asyncio.get_running_loop()
+            # 有运行中的事件循环，使用 create_task
+            asyncio.create_task(self._init_db_async())
+        except RuntimeError:
+            # 没有运行中的事件循环，同步初始化
+            self._init_db_sync()
 
-    def _init_db(self) -> None:
-        with _DB_LOCK:
+    def _init_db_sync(self) -> None:
+        """同步初始化数据库(用于启动阶段)。"""
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(self._init_db_async())
+        finally:
+            loop.close()
+
+    async def _init_db_async(self) -> None:
+        async with _DB_LOCK:
             schema = {
                 "checkpoints": [
                     {"name": "run_id", "type": "TEXT", "constraints": "PRIMARY KEY"},
@@ -79,8 +97,13 @@ class CheckpointManager:
 
     # ---- 写 ----
 
-    def save(self, state: AgentState) -> str:
+    async def save(self, state: AgentState) -> str:
         """保存/更新一次运行的状态快照。返回 run_id。"""
+        async with _DB_LOCK:
+            return await self._save_locked(state)
+
+    async def _save_locked(self, state: AgentState) -> str:
+        """实际保存逻辑(需已持有 _DB_LOCK)。"""
         now = time.time()
         payload = state.to_json()
 
@@ -149,16 +172,16 @@ class CheckpointManager:
         
         return state.run_id
 
-    def delete(self, run_id: str) -> bool:
-        with _DB_LOCK:
+    async def delete(self, run_id: str) -> bool:
+        async with _DB_LOCK:
             self._backend.delete("checkpoints", "run_id = ?", (run_id,))
             self._backend.delete("checkpoint_versions", "run_id = ?", (run_id,))
             return True
 
     # ---- 读 ----
 
-    def load(self, run_id: str) -> Optional[AgentState]:
-        with _DB_LOCK:
+    async def load(self, run_id: str) -> Optional[AgentState]:
+        async with _DB_LOCK:
             rows = self._backend.select(
                 "checkpoints",
                 "run_id = ?",
@@ -173,15 +196,15 @@ class CheckpointManager:
         except (json.JSONDecodeError, TypeError, ValueError):
             return None
 
-    def exists(self, run_id: str) -> bool:
-        with _DB_LOCK:
+    async def exists(self, run_id: str) -> bool:
+        async with _DB_LOCK:
             return self._backend.exists("checkpoints", "run_id = ?", (run_id,))
 
     # ---- 时间旅行(按版本加载 / 分支回滚) ----
 
-    def versions(self, run_id: str) -> list[dict]:
+    async def versions(self, run_id: str) -> list[dict]:
         """列出某次运行的全部历史版本(时间旅行视图)。"""
-        with _DB_LOCK:
+        async with _DB_LOCK:
             rows = self._backend.select(
                 "checkpoint_versions",
                 "run_id = ?",
@@ -193,9 +216,9 @@ class CheckpointManager:
             for r in rows
         ]
 
-    def load_version(self, run_id: str, version: int) -> Optional[AgentState]:
+    async def load_version(self, run_id: str, version: int) -> Optional[AgentState]:
         """加载指定历史版本的运行状态(用于时间旅行/分支回滚)。"""
-        with _DB_LOCK:
+        async with _DB_LOCK:
             rows = self._backend.select(
                 "checkpoint_versions",
                 "run_id = ? AND version = ?",
@@ -210,13 +233,13 @@ class CheckpointManager:
         except (json.JSONDecodeError, TypeError, ValueError):
             return None
 
-    def rollback(self, run_id: str, version: int) -> Optional[AgentState]:
+    async def rollback(self, run_id: str, version: int) -> Optional[AgentState]:
         """把最新指针回滚到历史版本(时间旅行分支起点)。"""
-        st = self.load_version(run_id, version)
+        st = await self.load_version(run_id, version)
         if st is None:
             return None
         
-        with _DB_LOCK:
+        async with _DB_LOCK:
             now = time.time()
             self._backend.upsert(
                 "checkpoints",
@@ -235,7 +258,7 @@ class CheckpointManager:
         
         return st
 
-    def list(self, limit: int = 100, offset: int = 0, status: Optional[str] = None,
+    async def list(self, limit: int = 100, offset: int = 0, status: Optional[str] = None,
              session_id: Optional[str] = None, tenant_id: Optional[str] = None) -> list[dict]:
         conditions = []
         params = []
@@ -251,7 +274,7 @@ class CheckpointManager:
 
         where = " AND ".join(conditions) if conditions else ""
         
-        with _DB_LOCK:
+        async with _DB_LOCK:
             rows = self._backend.select(
                 "checkpoints",
                 where,
@@ -282,12 +305,12 @@ class CheckpointManager:
             out.append(base)
         return out
 
-    def count(self) -> int:
-        with _DB_LOCK:
+    async def count(self) -> int:
+        async with _DB_LOCK:
             return self._backend.count("checkpoints")
 
-    def clear(self, status: Optional[str] = None) -> int:
-        with _DB_LOCK:
+    async def clear(self, status: Optional[str] = None) -> int:
+        async with _DB_LOCK:
             if status:
                 rows = self._backend.select(
                     "checkpoints", "status = ?", (status,), columns=["run_id"]
@@ -306,7 +329,7 @@ class CheckpointManager:
                 self._backend.delete("checkpoint_versions", "1 = 1")
             return 1
 
-    def cleanup_expired(self, ttl_days: float = 7.0) -> int:
+    async def cleanup_expired(self, ttl_days: float = 7.0) -> int:
         """清理超过 TTL 的已完成/已取消 checkpoint。
 
         只清理 status 为 done/failed/cancelled 且 updated_at 超过 ttl_days 天的记录。
@@ -314,7 +337,7 @@ class CheckpointManager:
         """
         import time as _time
         cutoff = _time.time() - ttl_days * 86400
-        with _DB_LOCK:
+        async with _DB_LOCK:
             # 先查出过期记录
             rows = self._backend.select(
                 "checkpoints",

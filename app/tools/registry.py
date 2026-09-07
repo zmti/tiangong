@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import inspect
 import json
 from functools import wraps
@@ -109,24 +110,31 @@ class ToolRegistry:
     def __init__(self):
         self._tools: dict[str, Tool] = {}
         self._imported = False
+        # 使用 asyncio.Lock 保护工具注册操作
+        self._lock = threading.RLock()
 
     def register(self, tool: Tool) -> None:
-        self._tools[tool.name] = tool
+        with self._lock:
+            self._tools[tool.name] = tool
 
     def get(self, name: str) -> Optional[Tool]:
         return self._tools.get(name)
 
-    def list(self, enabled_only: bool = True) -> list[Tool]:
-        tools = list(self._tools.values())
-        if enabled_only:
-            tools = [t for t in tools if t.enabled]
-        return tools
+    def list_sync(self, enabled_only: bool = True) -> list[Tool]:
+        # 同步版本，使用 RLock 代替 asyncio.Lock
+        with self._lock:
+            tools = list(self._tools.values())
+            if enabled_only:
+                tools = [t for t in tools if t.enabled]
+            return tools
 
     def to_openai_schemas(self) -> list[dict]:
-        return [t.to_openai_schema() for t in self.list()]
+        tools = self.list_sync()
+        return [t.to_openai_schema() for t in tools]
 
     def unregister(self, name: str) -> None:
-        self._tools.pop(name, None)
+        with self._lock:
+            self._tools.pop(name, None)
 
 
 def _build_params_model(func: Callable) -> tuple[Optional[type[BaseModel]], dict]:
@@ -176,7 +184,8 @@ def tool(name: Optional[str] = None, description: str = "", timeout: float = 30.
             enabled=enabled,
             terminal=terminal,
         )
-        default_registry.register(t)
+        # 使用同步注册，因为装饰器在模块导入时调用
+        default_registry._tools[t.name] = t
         return t
 
     # 用法一: @tool
@@ -232,6 +241,7 @@ def get_registry() -> ToolRegistry:
         from app.tools import multimodal_tool  # noqa: F401  # 注册增强多模态工具(analyze_image_v2/transcribe_audio/synthesize_speech/cross_modal_reason)
         from app.tools import document_tool  # noqa: F401  # 注册文档深度解析工具(parse_document/document_summary)
         from app.tools import computer_use  # noqa: F401  # 注册 Computer Use 视觉驾驶工具
+        from app.tools import workflow_tool  # noqa: F401  # 注册工作流工具(run_workflow/list_workflows/get_workflow)
         from app.agents import handoff_tool  # noqa: F401  # 注册角色委派/团队工具(list_roles/handoff_to_role)
         from app.rag import documents  # noqa: F401  # 注册 rag_search 工具
 

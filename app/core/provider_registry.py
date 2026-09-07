@@ -50,10 +50,13 @@ def _load() -> Dict[str, Any]:
 
 
 def _save() -> None:
+    global _CACHE
     with _LOCK:
         p = _path()
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(_load(), ensure_ascii=False, indent=2), "utf-8")
+        p.write_text(json.dumps(_CACHE, ensure_ascii=False, indent=2), "utf-8")
+        # 写入成功后刷新缓存,确保后续读取拿到最新数据
+        _CACHE = None
 
 
 def normalize_base_url(url: str) -> str:
@@ -288,6 +291,24 @@ def remove_builtin_model(provider: str, model_id: str) -> bool:
 
 def list_builtin_ext_models(provider: str) -> List[dict]:
     return get_builtin_ext().get(provider, []) or []
+
+
+def set_builtin_default_model(provider: str, model_id: str) -> dict:
+    """设置内置厂商的默认模型。"""
+    if provider not in BUILTIN_PROVIDERS:
+        raise ValueError(f"未知内置厂商: {provider}")
+    from app.api.chat import _PROVIDER_DEFAULT_MODELS
+    all_models = [m.get("id") for m in _PROVIDER_DEFAULT_MODELS.get(provider, [])]
+    ext_models = [m.get("id") for m in list_builtin_ext_models(provider)]
+    if model_id not in all_models and model_id not in ext_models:
+        raise ValueError("模型不存在")
+    ext = get_builtin_ext()
+    if provider not in ext:
+        ext[provider] = []
+    for m in ext[provider]:
+        m["default"] = (m.get("id") == model_id)
+    _save()
+    return {"provider": provider, "model_id": model_id}
 
 
 def invalidate() -> None:

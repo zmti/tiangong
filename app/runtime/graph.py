@@ -123,6 +123,8 @@ class Graph:
         max_node_iters: int = 0,
         checkpoint_every_node: bool = True,
         cancel_check: Optional[Callable[[], bool]] = None,
+        batch_checkpoint: bool = True,  # 启用批量写入
+        batch_flush_interval: float = 2.0,  # 批量刷新间隔
     ):
         self.name = name
         self.checkpoint = checkpoint  # CheckpointManager 或 None
@@ -130,13 +132,16 @@ class Graph:
         self.max_node_iters = max_node_iters  # 绝对节点数上限(0=关闭),兜底防死循环
         self.checkpoint_every_node = checkpoint_every_node
         self._cancel_check = cancel_check  # 可选: 取消检查回调 (返回 True 表示已取消)
-
+        self._batch_checkpoint = batch_checkpoint
+        self._batch_flush_interval = batch_flush_interval
+        self._batch_manager = None  # BatchCheckpointManager 实例
+        # 流式运行时的实时事件转发器(arun_stream 挂载,节点内 emit 立即调用)
+        self._stream_hook: Optional[Callable[[dict], None]] = None
+        # 节点和边(必须在 _stream_hook 之后初始化,因为 add_node/add_edge 可能访问)
         self._nodes: dict[str, Node] = {}
         self._edges: dict[str, str] = {}  # a -> b(静态边)
         self._conditional: dict[str, RouterFunc] = {}  # a -> fn(state) -> next
         self._entry: Optional[str] = None
-        # 流式运行时的实时事件转发器(arun_stream 挂载,节点内 emit 立即调用)
-        self._stream_hook: Optional[Callable[[dict], None]] = None
 
     # ---- 构建 ----
 
@@ -162,12 +167,22 @@ class Graph:
 
     # ---- 运行 ----
 
-    def _checkpoint(self, state: AgentState) -> None:
-        if self.checkpoint is not None:
-            try:
-                self.checkpoint.save(state)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("checkpoint save failed for run %s: %s", state.run_id, exc)
+    async def _checkpoint(self, state: AgentState) -> None:
+        if self.checkpoint is None:
+            return
+        try:
+            # 如果启用了批量写入，使用批量管理器
+            if self._batch_checkpoint and self._batch_manager is None:
+                from app.runtime.batch_checkpoint import get_batch_checkpoint_manager
+                self._batch_manager = await get_batch_checkpoint_manager(self.checkpoint)
+                await self._batch_manager.start()
+            
+            if self._batch_manager is not None:
+                await self._batch_manager.save(state)
+            else:
+                await self.checkpoint.save(state)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("checkpoint save failed for run %s: %s", state.run_id, exc)
 
     def interrupt(self, state: AgentState, value) -> None:
         """节点内主动暂停图执行(LangGraph interrupt 语义)。
@@ -205,7 +220,7 @@ class Graph:
         if self._cancel_check and self._cancel_check():
             state.status = "cancelled"
             state.node = END
-            self._checkpoint(state)
+            await self._checkpoint(state)
             return [], True
         node_name = state.node or self._entry
         if node_name in (None, END):
@@ -228,7 +243,7 @@ class Graph:
             state._on_event = prev_hook
             state.status = "interrupted"
             state.node = node_name
-            self._checkpoint(state)
+            await self._checkpoint(state)
             events = list(state.events)
             state.events = []
             return events, True
@@ -237,7 +252,7 @@ class Graph:
             state.status = "failed"
             state.error = str(e)[:500]
             state.node = END
-            self._checkpoint(state)
+            await self._checkpoint(state)
             events = list(state.events)
             state.events = []
             return events, True
@@ -247,20 +262,20 @@ class Graph:
         # 动态扇出:节点返回 Send 列表时,先并行执行各分支再继续
         if isinstance(ret, list) and any(isinstance(r, Send) for r in ret):
             state.node = node_name
-            self._checkpoint(state)
+            await self._checkpoint(state)
             await self._apply_send(state, ret)
         state.node = nxt if nxt not in (None, END) else END
 
         # 逐节点 checkpoint(记录"下一个节点"作为恢复起点)
         if self.checkpoint_every_node or nxt in (None, END):
-            self._checkpoint(state)
+            await self._checkpoint(state)
 
         events = list(state.events)
         state.events = []
         finished = nxt in (None, END)
         if finished:
             state.status = "done"
-            self._checkpoint(state)
+            await self._checkpoint(state)
         return events, finished
 
     async def _apply_send(self, state: AgentState, ret: Any) -> None:
@@ -315,7 +330,7 @@ class Graph:
             if self._cancel_check and self._cancel_check():
                 state.status = "cancelled"
                 state.node = END
-                self._checkpoint(state)
+                await self._checkpoint(state)
                 return state, all_events
             events, finished = await self.astep(state)
             all_events.extend(events)
@@ -328,7 +343,7 @@ class Graph:
                 state.status = "done"
                 state.node = END
                 state.error = f"图节点执行超过上限(max_iters={self.max_iters}, max_node_iters={self.max_node_iters})"
-                self._checkpoint(state)
+                await self._checkpoint(state)
                 return state, all_events
 
     async def arun_stream(self, state: AgentState):
@@ -354,7 +369,7 @@ class Graph:
                     if self._cancel_check and self._cancel_check():
                         state.status = "cancelled"
                         state.node = END
-                        self._checkpoint(state)
+                        await self._checkpoint(state)
                         return
                     _events, finished = await self.astep(state)
                     if finished:
@@ -364,7 +379,7 @@ class Graph:
                         state.status = "done"
                         state.node = END
                         state.error = f"图节点执行超过上限(max_iters={self.max_iters}, max_node_iters={self.max_node_iters})"
-                        self._checkpoint(state)
+                        await self._checkpoint(state)
                         return
             finally:
                 await q.put(None)  # 哨兵:通知消费方流入结束
@@ -380,7 +395,7 @@ class Graph:
                 if self._cancel_check and self._cancel_check():
                     state.status = "cancelled"
                     state.node = END
-                    self._checkpoint(state)
+                    await self._checkpoint(state)
                     break
                 yield evt
         finally:
@@ -394,6 +409,14 @@ class Graph:
             except Exception:
                 # 后台泵的异常保持向外抛出,与旧实现的失败语义一致(调用方可感知)
                 raise
+            finally:
+                # 清理批量 checkpoint 管理器,防止后台任务泄漏
+                if self._batch_manager is not None:
+                    try:
+                        await self._batch_manager.stop()
+                    except Exception:
+                        pass
+                    self._batch_manager = None
 
     async def aresume(self, state: AgentState, value=None, new_input: Optional[str] = None):
         """从中断处恢复运行(LangGraph Command(resume=...) 语义)。

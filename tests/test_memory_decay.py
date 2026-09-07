@@ -6,7 +6,19 @@ import uuid
 import pytest
 
 from app.config import settings
+from app.core.storage_backend import reset_storage_backend
 from app.memory.decay import MemoryCluster, MemoryDecay
+
+
+def run(coro):
+    import asyncio
+    return asyncio.run(coro)
+
+
+def _reset_ltm():
+    import app.memory.ltm as ltm_mod
+    ltm_mod._instance = None
+    reset_storage_backend()
 
 
 @pytest.fixture
@@ -50,6 +62,7 @@ def test_cluster_find_similar_no_vector():
 
 
 def test_memory_store_integration():
+    _reset_ltm()
     from app.memory.ltm import MemoryStore
 
     db_path = os.path.join(
@@ -61,7 +74,7 @@ def test_memory_store_integration():
     mid = uuid.uuid4().hex
     now = time.time()
     store.save("这是一条测试记忆", keywords=["测试"], memory_id=mid)
-    mem = store.get(mid)
+    mem = run(store.get(mid))
     created_at = mem["created_at"]
 
     # 刚存入不应被清除(分数高于阈值)
@@ -78,7 +91,7 @@ def test_memory_store_integration():
     assert decay.should_evict(old_ts, old_ts, hit_count=0) is True
 
     try:
-        store.delete(mid)
+        run(store.delete(mid))
     except Exception:
         pass
     try:

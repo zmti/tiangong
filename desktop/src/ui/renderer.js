@@ -19,7 +19,6 @@
     previewImg: $('previewImg'),
     previewName: $('previewName'),
     previewCancel: $('previewCancel'),
-    sessionList: $('sessionList'),
     sessionSearch: $('sessionSearch'),
     sessionLabel: $('sessionLabel'),
     statusDot: $('statusDot'),
@@ -64,7 +63,7 @@
     promptList: $('promptList'),
     toolGrid: $('toolGrid'),
     themeToggle: $('themeToggle'),
-    themeBtn: $('themeBtn'),
+    themeBtn: $('themeToggle'),
     backendUrlText: $('backendUrlText'),
     backendStatusText: $('backendStatusText'),
     todoList: $('todoList'),
@@ -79,15 +78,31 @@
     lbCopy: $('lbCopy'),
   };
 
-  /* ---------- 面板切换 ---------- */
+  /* ---------- 侧边栏折叠/展开 ---------- */
+  App._sidebarExpanded = true;
+  const sidebarToggle = document.getElementById('sidebarToggle');
+  if (sidebarToggle) {
+    sidebarToggle.addEventListener('click', () => {
+      App._sidebarExpanded = !App._sidebarExpanded;
+      document.body.classList.toggle('sidebar-collapsed', !App._sidebarExpanded);
+      const expandedSvg = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"></path></svg>';
+      const collapsedSvg = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h16"></path></svg>';
+      sidebarToggle.innerHTML = App._sidebarExpanded ? expandedSvg : collapsedSvg;
+    });
+  }
+
+  /* ---------- 设置侧边栏入口 → 打开完整面板 ---------- */
+  // 保留旧面板切换能力,供"更多设置 / Provider优先级 / 自定义System Prompt"等入口使用
   let currentView = 'chat';
-  const panelMap = { todo: 'todoPanel', kb: 'kbPanel', memory: 'memoryPanel', runs: 'runsPanel', telemetry: 'telemetryPanel', schedule: 'schedulePanel', prompts: 'promptsPanel', tools: 'toolsPanel', workflow: 'workflowPanel', settings: 'settingsPanel' };
+  const panelMap = { todo: 'todoPanel', kb: 'kbPanel', memory: 'memoryPanel', runs: 'runsPanel', telemetry: 'telemetryPanel', schedule: 'schedulePanel', prompts: 'promptsPanel', tools: 'toolsPanel', workflow: 'workflowPanel' };
 
   function showView(view) {
-    document.querySelectorAll('.nav-btn').forEach((b) => b.classList.toggle('active', b.dataset.view === view));
     if (view === 'chat') {
-      document.body.classList.remove('side-open');
-      currentView = 'chat';
+      closePanel();
+      return;
+    }
+    if (view === 'settings') {
+      openSettingsModal();
       return;
     }
     const panelId = panelMap[view];
@@ -95,29 +110,86 @@
     document.querySelectorAll('.side-content').forEach((el) => el.classList.toggle('active', el.id === panelId));
     document.body.classList.add('side-open');
     currentView = view;
-    // 懒加载:进入面板时刷新数据
-    if (view === 'session' || view === 'chat') {
-      // 切换到会话相关面板时刷新列表（含 collapse 状态变化）
-      if (App.Session) App.Session.renderList();
-    }
     if (view === 'memory' && App.Memory) App.Memory.refresh();
     if (view === 'runs' && App.Runs) App.Runs.load();
     if (view === 'telemetry' && App.Telemetry) App.Telemetry.load();
     if (view === 'schedule' && App.Schedule) App.Schedule.load();
     if (view === 'prompts' && App.Prompts) App.Prompts.render();
-    if (view === 'settings' && App.Settings) {
-      App.Settings.refreshBackend();
-      if (App.Settings.renderProviderAdmin) App.Settings.renderProviderAdmin();
-    }
     if (view === 'workflow' && App.Workflow) App.Workflow.loadList();
   }
 
   function closePanel() {
     document.body.classList.remove('side-open');
-    document.querySelectorAll('.nav-btn').forEach((b) => b.classList.toggle('active', b.dataset.view === 'chat'));
     currentView = 'chat';
   }
 
+  const openSettingsBtn = document.getElementById('openSettingsBtn');
+  if (openSettingsBtn) openSettingsBtn.addEventListener('click', () => showView('settings'));
+
+  const providerPriorityBtn = document.getElementById('providerPriorityBtn');
+  if (providerPriorityBtn) providerPriorityBtn.addEventListener('click', () => showView('settings'));
+
+  const systemPromptBtn = document.getElementById('systemPromptBtn');
+  if (systemPromptBtn) systemPromptBtn.addEventListener('click', () => openSettingsModal());
+
+  // 统一设置弹窗
+  const settingsModal = document.getElementById('settingsModal');
+  function openSettingsModal() {
+    if (!settingsModal) return;
+    settingsModal.hidden = false;
+    // 填充当前模型信息
+    const modelEl = document.getElementById('settingsCurrentModel');
+    const provEl = document.getElementById('settingsCurrentProvider');
+    if (App.ModelPicker) {
+      const s = App.ModelPicker.get();
+      if (modelEl) modelEl.textContent = s.model || '自动';
+      if (provEl) provEl.textContent = s.provider || '跟随默认';
+    }
+    // 渲染完整提供商管理（新增/编辑/删除）
+    if (App.Settings && App.Settings.renderProviderAdmin) {
+      App.Settings.renderProviderAdmin();
+    }
+    // 初始化设置导航
+    initSettingsNav();
+  }
+  
+  // 设置导航
+  function initSettingsNav() {
+    const navItems = document.querySelectorAll('.settings-nav-item');
+    const sections = document.querySelectorAll('.settings-content .settings-section');
+    
+    navItems.forEach(item => {
+      item.addEventListener('click', () => {
+        const section = item.dataset.section;
+        // 更新导航状态
+        navItems.forEach(n => n.classList.remove('active'));
+        item.classList.add('active');
+        // 更新内容显示
+        sections.forEach(s => {
+          s.classList.toggle('active', s.dataset.section === section);
+        });
+      });
+    });
+  }
+  
+  // 侧边栏按钮打开设置
+  const sidebarModelSetting = document.getElementById('sidebarModelSetting');
+  const sidebarAdvancedSetting = document.getElementById('sidebarAdvancedSetting');
+  if (sidebarModelSetting) sidebarModelSetting.addEventListener('click', () => openSettingsModal());
+  if (sidebarAdvancedSetting) sidebarAdvancedSetting.addEventListener('click', () => openSettingsModal());
+  // 关闭弹窗
+  document.querySelectorAll('.close-modal').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const modal = document.getElementById(btn.dataset.modal);
+      if (modal) modal.hidden = true;
+    });
+  });
+  document.querySelectorAll('.modal-overlay').forEach(overlay => {
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay) overlay.hidden = true;
+    });
+  });
+  // 保留旧式 nav-btn 触发能力(兼容遗留代码)
   document.querySelectorAll('.nav-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
       const view = btn.dataset.view;
@@ -131,18 +203,14 @@
   document.querySelectorAll('.close-panel').forEach((b) => b.addEventListener('click', closePanel));
 
   /* ---------- 会话 ---------- */
-  $('collapseBtn').addEventListener('click', () => App.Session.toggleCollapse());
-  const reopenBtn = document.getElementById('sessionReopen');
-  if (reopenBtn) reopenBtn.addEventListener('click', () => App.Session.toggleCollapse());
-  $('newSessionBtn').addEventListener('click', () => App.Session.newSession());
-  $('sessionSearch').addEventListener('input', debounce(() => App.Session.search(), 200));
+  const newSessionBtn = document.getElementById('newSessionBtn');
+  if (newSessionBtn) newSessionBtn.addEventListener('click', () => App.Session.newSession());
+  const sessionSearch = document.getElementById('sessionSearch');
+  if (sessionSearch) sessionSearch.addEventListener('input', debounce(() => App.Session.renderCards(), 200));
   const clearSessionBtn = document.getElementById('clearSessionBtn');
   if (clearSessionBtn) clearSessionBtn.addEventListener('click', () => App.Session.clearCurrent());
-  $('sessionList').addEventListener('click', (e) => {
-    const item = e.target.closest('.session-item');
-    if (item) App.Session.select(item.dataset.id);
-  });
-  $('exportBtn').addEventListener('click', () => App.Session.exportCurrent());
+  const exportBtn = document.getElementById('exportBtn');
+  if (exportBtn) exportBtn.addEventListener('click', () => App.Session.exportCurrent());
 
   /* 回到最新(滚动远离底部时显示) */
   const backToBottomBtn = document.getElementById('backToBottom');
@@ -432,7 +500,6 @@
   };
 
   /* ---------- 设置 ---------- */
-  App.els.themeBtn.addEventListener('click', () => App.Settings.toggleTheme());
   App.els.themeToggle.addEventListener('click', () => App.Settings.toggleTheme());
 
   /* ---------- 执行面板切换 ---------- */
@@ -531,7 +598,7 @@
       restartBackendBtn.disabled = false;
       restartBackendBtn.textContent = '重启后端';
       App.toast(r && r.ok ? '后端已重启' : (r && r.reason ? r.reason : '重启失败'), r && r.ok ? 'ok' : 'err');
-      if (App._dataLoaded) App.Session.renderList();
+      if (App._dataLoaded) App.Session.renderCards();
     });
   }
 
@@ -568,13 +635,11 @@
 
   async function loadAllData() {
     App._dataLoaded = true;
-    // 恢复会话侧边栏折叠状态
-    if (App.Session) App.Session.loadCollapse();
-    // 各步骤相互隔离:单点异常不再中断后续组件初始化(避免"部分组件不显示")
     const safe = async (label, fn) => {
       try { return await fn(); } catch (e) { console.error(`[init] ${label} 失败:`, e); }
     };
-    const ids = (await safe('renderList', () => App.Session.renderList())) || [];
+    const ids = (await safe('renderSidebarHistory', () => App._renderSidebarHistory())) || [];
+
     safe('KB', () => App.KB.refresh());
     safe('Tools', () => App.Tools.load());
     safe('Todo', () => App.Todo.load());
@@ -584,9 +649,45 @@
     safe('renderProviderAdmin', () => App.Settings.renderProviderAdmin());
     safe('ModelPicker', () => App.ModelPicker.init());
     safe('Mode', () => App.Mode.init());
+    // provider 数据就绪后通知 Mode 刷新(若 init 时数据尚未加载完毕)
+    if (App.Mode && App.Mode.reinitAfterProviders) App.Mode.reinitAfterProviders();
+
+    // 渲染侧边栏会话历史
+    renderSidebarHistory();
     await safe('restoreLast', () => App.Session.restoreLast(ids));
     safe('CtxMeter', () => App.CtxMeter.refresh());
   }
+
+  /* ---------- 侧边栏会话历史 ---------- */
+  async function renderSidebarHistory() {
+    const el = document.getElementById('sidebarSessionHistory');
+    if (!el) return;
+    try {
+      const res = await App.apiJSON('/v1/chat/sessions');
+      if (!res.success || !res.data?.sessions?.length) {
+        el.innerHTML = '<div style="padding:8px 12px;font-size:11px;color:var(--muted);">暂无会话</div>';
+        return;
+      }
+      const sessions = res.data.sessions.slice(0, 30);
+      el.innerHTML = sessions.map(s => {
+        const active = s.id === App.sessionId ? ' active' : '';
+        const time = App.Session.formatTime(s.updated_at);
+        return `<div class="sh-item${active}" data-id="${s.id}" title="${App.escapeHtml(s.title || '新会话')}">
+          <div class="sh-title">${App.escapeHtml(s.title || '新会话')}</div>
+          <div class="sh-meta">${time} · ${s.messages || 0}条</div>
+        </div>`;
+      }).join('');
+      el.querySelectorAll('.sh-item').forEach(item => {
+        item.addEventListener('click', () => {
+          App.Session.select(item.dataset.id);
+        });
+      });
+    } catch (_) {
+      el.innerHTML = '<div style="padding:8px 12px;font-size:11px;color:var(--muted);">加载失败</div>';
+    }
+  }
+  // 暴露给 session.js 调用
+  App._renderSidebarHistory = renderSidebarHistory;
 
   async function init() {
     App.Settings.applyTheme(App.Settings.currentTheme());

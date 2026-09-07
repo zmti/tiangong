@@ -15,7 +15,7 @@ from typing import Optional
 
 
 class RedisSessionStore:
-    def __init__(self, client, max_messages: int = 60, prefix: str = "agent:session"):
+    def __init__(self, client, max_messages: int = 500, prefix: str = "agent:session"):
         self._client = client
         self._max_messages = max_messages
         self._prefix = prefix

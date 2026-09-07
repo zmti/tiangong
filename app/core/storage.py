@@ -44,7 +44,7 @@ def get_session_backend() -> tuple[str, object]:
     if ok:
         from app.memory.session_redis import RedisSessionStore
 
-        return "redis", RedisSessionStore(client=client, max_messages=60)
+        return "redis", RedisSessionStore(client=client, max_messages=500)
     from app.memory.session import SessionStore
 
     return "sqlite", SessionStore()

@@ -60,7 +60,7 @@ def test_workflow_templates():
     from pathlib import Path
     templates_file = Path(__file__).parent.parent / "desktop" / "src" / "ui" / "workflow" / "templates.js"
     if templates_file.exists():
-        content = templates_file.read_text()
+        content = templates_file.read_text(encoding="utf-8")
         assert "simple_chat" in content
         assert "code_review" in content
 
@@ -70,7 +70,7 @@ def test_workflow_designer_import():
     from pathlib import Path
     designer_file = Path(__file__).parent.parent / "desktop" / "src" / "ui" / "workflow" / "designer.js"
     assert designer_file.exists()
-    content = designer_file.read_text()
+    content = designer_file.read_text(encoding="utf-8")
     assert "WorkflowDesigner" in content
 
 

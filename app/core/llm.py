@@ -15,8 +15,9 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from openai import AsyncOpenAI
+import httpx
 
-from app.config import settings
+from app.config import settings, get_httpx_proxy
 from app.core.telemetry import estimate_cost, tracer
 
 # ChatCompletion message 类型定义
@@ -129,6 +130,8 @@ class LLMClient:
             )
         else:
             self.provider = PROVIDER_ALIASES.get(raw, "compat")
+        # 记录原始 provider(用于故障转移后恢复主 provider)
+        self._initial_provider = self.provider
         self._model_override = model
         self.client, self.model = self._build()
         self._api_key = self._get_key()
@@ -184,33 +187,43 @@ class LLMClient:
         return settings.openai_compat_api_key
 
     def _build(self) -> tuple[AsyncOpenAI, str]:
+        proxy = get_httpx_proxy()
+        client_kwargs = {}
+        if proxy:
+            client_kwargs["http_client"] = httpx.AsyncClient(proxy=proxy)
+        
         if self._custom:
             return AsyncOpenAI(
                 api_key=self._custom.get("api_key") or "sk-placeholder",
                 base_url=self._custom["base_url"],
+                **client_kwargs,
             ), self._model_override or self._custom.get("model") or ""
         p = self.provider
         if p == "deepseek":
             return AsyncOpenAI(
                 api_key=settings.deepseek_api_key or "sk-placeholder",
                 base_url=settings.deepseek_base_url,
+                **client_kwargs,
             ), self._model_override or settings.deepseek_model
         if p == "qwen":
             return AsyncOpenAI(
                 api_key=settings.qwen_api_key or "sk-placeholder",
                 base_url=settings.qwen_base_url,
+                **client_kwargs,
             ), self._model_override or settings.qwen_model
         if p == "ollama":
             return AsyncOpenAI(
                 api_key="ollama",
                 base_url=settings.ollama_base_url,
+                **client_kwargs,
             ), self._model_override or settings.ollama_model
         if p == "openai":
-            return AsyncOpenAI(), self._model_override or "gpt-4o-mini"
+            return AsyncOpenAI(**client_kwargs), self._model_override or "gpt-4o-mini"
         # compat: 任意 OpenAI 兼容
         return AsyncOpenAI(
             api_key=settings.openai_compat_api_key or "sk-placeholder",
             base_url=settings.openai_compat_base_url,
+            **client_kwargs,
         ), self._model_override or settings.openai_compat_model
 
     def _require_key(self) -> None:
@@ -238,6 +251,11 @@ class LLMClient:
 
     def _make_client(self, provider: str, model: str) -> tuple[AsyncOpenAI, str]:
         """按 provider 构造 OpenAI 兼容客户端(供故障转移时重建)。"""
+        proxy = get_httpx_proxy()
+        client_kwargs = {}
+        if proxy:
+            client_kwargs["http_client"] = httpx.AsyncClient(proxy=proxy)
+        
         if provider.startswith("custom-"):
             from app.core.provider_registry import get_custom
 
@@ -246,28 +264,33 @@ class LLMClient:
                 return AsyncOpenAI(
                     api_key=entry.get("api_key") or "sk-placeholder",
                     base_url=entry["base_url"],
+                    **client_kwargs,
                 ), model or entry.get("model") or ""
         p = provider
         if p == "deepseek":
             return AsyncOpenAI(
                 api_key=settings.deepseek_api_key or "sk-placeholder",
                 base_url=settings.deepseek_base_url,
+                **client_kwargs,
             ), model or settings.deepseek_model
         if p == "qwen":
             return AsyncOpenAI(
                 api_key=settings.qwen_api_key or "sk-placeholder",
                 base_url=settings.qwen_base_url,
+                **client_kwargs,
             ), model or settings.qwen_model
         if p == "ollama":
             return AsyncOpenAI(
                 api_key="ollama",
                 base_url=settings.ollama_base_url,
+                **client_kwargs,
             ), model or settings.ollama_model
         if p == "openai":
-            return AsyncOpenAI(), model or "gpt-4o-mini"
+            return AsyncOpenAI(**client_kwargs), model or "gpt-4o-mini"
         return AsyncOpenAI(
             api_key=settings.openai_compat_api_key or "sk-placeholder",
             base_url=settings.openai_compat_base_url,
+            **client_kwargs,
         ), model or settings.openai_compat_model
 
     async def _invoke(self, fn, kind: str, tools_n: int = 0, **trace_extra):
@@ -296,13 +319,10 @@ class LLMClient:
                     resp = await fn(client, resolved_model)
                     self._record_success(provider)
                     self.last_usage = self._usage_of(resp)
+                    # 恢复主 provider(熔断冷却期后),保证下次优先用主 provider
                     if idx > 0:
-                        # 故障转移生效:把实例切到实际使用的 provider/model,
-                        # 保证 done.model / trace / info 反映真实模型(粘性切换)
-                        self.provider = provider
-                        self.model = resolved_model
-                        self.client = client
-                        self._api_key = self._get_key()
+                        self._circuit_fails[self._initial_provider or provider] = 0
+                        self._circuit_open_until.pop(self._initial_provider or provider, None)
                     self._trace(kind, t0, self.last_usage, tools_n=tools_n,
                                 **trace_extra)
                     return resp
@@ -316,12 +336,9 @@ class LLMClient:
             self._record_failure(provider)
         raise LLMError(f"LLM 调用失败(已重试{retries}次/切换{len(specs)}个provider): {last_err}") from last_err
 
-    # ---- Provider 熔断状态(进程级共享,同类 provider 复用) ----
-    # 注:实例级 _circuit_fails / _circuit_open_until 已在 __init__ 中初始化
-    # 保留类级别作为兜底(旧代码直接访问 LLMClient._circuit_fails 时使用)
-    _circuit_fails: dict[str, int] = {}
-    _circuit_open_until: dict[str, float] = {}
-
+    # ---- Provider 熔断状态 ----
+    # 实例级 _circuit_fails / _circuit_open_until 已在 __init__ 中初始化，
+    # 每个实例独立维护，无需类级兜底。
     def _is_circuit_open(self, provider: str) -> bool:
         if settings.agent_llm_circuit_threshold <= 0:
             return False
@@ -683,6 +700,19 @@ class LLMClient:
         data = _extract_json(content)
         if isinstance(data, dict):
             return data
+        # JSON 解析失败:重试一次,带纠错提示让模型修正
+        try:
+            fix_messages = list(messages)
+            fix_messages.append({
+                "role": "user",
+                "content": f"上次输出不是合法 JSON，请重新输出完整合法的 JSON。上次输出: {content[:300]}",
+            })
+            fix_resp = await self.chat(fix_messages, temperature=temperature)
+            data = _extract_json(fix_resp)
+            if isinstance(data, dict):
+                return data
+        except Exception:  # noqa: BLE001
+            pass
         raise LLMError(f"结构化输出解析失败: 模型未返回合法 JSON ({content[:200]})")
 
     async def chat_json_schema(
@@ -786,11 +816,12 @@ class LLMClient:
         last_content = ""
         for attempt in range(max_retries + 1):
             if attempt > 0:
-                # 把上次校验错误回灌给模型
-                prompt = list(messages) + [
-                    {"role": "assistant", "content": last_content},
-                    {"role": "user", "content": f"上次输出未通过校验: {last_err}\n请重新输出符合 schema 的 JSON。"},
-                ]
+                # 仅追加错误反馈,不重复发送历史内容(避免 token 膨胀)
+                feedback = (
+                    f"上次输出未通过校验: {last_err[:300]}\n"
+                    f"请重新输出符合 schema 的 JSON(只输出 JSON,不要包裹 markdown)。"
+                )
+                prompt = list(messages) + [{"role": "user", "content": feedback}]
             content, err = await _try_with_format("json_schema", {})
             if err:
                 # 降级到 json_object
@@ -826,7 +857,7 @@ class LLMClient:
                     last_err = err or "未通过校验"
                     continue
             return data
-        raise LLMError(f"结构化输出校验失败(重试 {max_retries} 次): {last_err}")
+        raise LLMError(f"结构化输出校验失败(重试 {max_retries} 次): {last_err[:500]}")
 
     @property
     def info(self) -> dict:

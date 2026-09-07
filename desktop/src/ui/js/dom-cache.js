@@ -6,12 +6,15 @@
     { id: 'messages', name: 'messages' },
     { id: 'input', name: 'input' },
     { id: 'sendBtn', name: 'sendBtn' },
-    { id: 'sessionList', name: 'sessionList' },
     { id: 'sessionLabel', name: 'sessionLabel' },
-    { id: 'sessionSearch', name: 'sessionSearch' },
+
+    // 侧边栏
+    { id: 'sidebar', name: 'sidebar' },
+    { id: 'sidebarToggle', name: 'sidebarToggle' },
+    { id: 'newSessionBtn', name: 'newSessionBtn' },
+    { id: 'sidebarSessionHistory', name: 'sidebarSessionHistory' },
 
     // 主题
-    { id: 'themeBtn', name: 'themeBtn' },
     { id: 'themeToggle', name: 'themeToggle' },
 
     // 后端
@@ -20,8 +23,7 @@
     { id: 'backendUrlInput', name: 'backendUrlInput' },
 
     // 模式选择
-    { id: 'modeSelect', name: 'modeSelect' },
-    { id: 'modeBadge', name: 'modeBadge' },
+    { id: 'modeToggle', name: 'modeToggle' },
     { id: 'modePopover', name: 'modePopover' },
 
     // 模型选择
@@ -34,7 +36,8 @@
     { id: 'previewName', name: 'previewName' },
 
     // 附件
-    { id: 'attachBtn', name: 'attachBtn' },
+    { id: 'attachToggle', name: 'attachToggle' },
+    { id: 'attachPopover', name: 'attachPopover' },
     { id: 'attachInput', name: 'attachInput' },
     { id: 'attachClearBtn', name: 'attachClearBtn' },
     { id: 'attachList', name: 'attachList' },
@@ -91,9 +94,8 @@
     // 其他
     { id: 'scrollPill', name: 'scrollPill' },
     { id: 'typing', name: 'typing' },
-    { id: 'videoBtn', name: 'videoBtn' },
     { id: 'videoInput', name: 'videoInput' },
-    { id: 'micBtn', name: 'micBtn' },
+    { id: 'micInput', name: 'micInput' },
     { id: 'providerAdmin', name: 'providerAdmin' },
     { id: 'provFormWrap', name: 'provFormWrap' },
     { id: 'shortcutsList', name: 'shortcutsList' },
@@ -101,6 +103,8 @@
     { id: 'telStats', name: 'telStats' },
     { id: 'telRuns', name: 'telRuns' },
     { id: '_bgTaskList', name: '_bgTaskList' },
+    { id: 'backToBottom', name: 'backToBottom' },
+    { id: 'backToListBtn', name: 'backToListBtn' },
   ];
 
   function init() {

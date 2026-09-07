@@ -15,7 +15,7 @@ async def list_tools() -> dict:
     registry = get_registry()
     dangerous = {s.strip() for s in settings.agent_dangerous_tools.split(",") if s.strip()}
     tools = []
-    for t in registry.list():
+    for t in await registry.list():
         tools.append({
             "name": t.name,
             "description": t.description,
@@ -63,42 +63,18 @@ async def refresh_mcp() -> dict:
     return {"init": init_result, "registered": registered}
 
 
-@router.get("/providers")
-async def list_providers() -> dict:
-    """可用模型 Provider 列表(带 key 与否,供 UI 下拉)。"""
-    import os
-
-    from app.core.provider_registry import list_custom
-
-    providers = [
-        {"id": "deepseek", "name": "DeepSeek", "configured": bool(settings.deepseek_api_key)},
-        {"id": "qwen", "name": "通义千问 Qwen", "configured": bool(settings.qwen_api_key)},
-        {"id": "ollama", "name": "本地 Ollama", "configured": bool(settings.ollama_base_url)},
-        {"id": "openai", "name": "OpenAI", "configured": bool(os.environ.get("OPENAI_API_KEY"))},
-        {"id": "compat", "name": "OpenAI 兼容", "configured": bool(settings.openai_compat_base_url)},
-    ]
-    providers += [
-        {"id": c["id"], "name": c["name"], "configured": True}
-        for c in list_custom()
-    ]
-    return {
-        "providers": providers,
-        "default": settings.agent_llm_provider,
-        "active": settings.agent_llm_provider,
-    }
-
-
 class ProviderUpsert(BaseModel):
     id: str | None = None
     name: str
     base_url: str
     api_key: str = ""
     model: str = ""
-    models: list[dict] | None = None  # 该厂商下的完整模型列表(探测或手动维护)
+    models: list | None = None  # 该厂商下的完整模型列表(探测或手动维护),支持字符串或对象
 
 
 class ProviderTest(BaseModel):
     base_url: str
+    pid: str = ""
     api_key: str = ""
     id: str | None = None  # 编辑时 Key 留空表示沿用旧值
 
@@ -107,6 +83,10 @@ class ModelUpsert(BaseModel):
     id: str
     name: str = ""
     context: int | None = None
+
+
+class ModelBatchUpsert(BaseModel):
+    models: list[ModelUpsert]
 
 
 @router.get("/providers/custom")
@@ -196,9 +176,23 @@ async def set_custom_default_model(pid: str, mid: str) -> dict:
     return {"ok": True, "entry": entry}
 
 
+def _is_dns_error(exc: Exception) -> bool:
+    """判断是否为 DNS 解析失败类错误。"""
+    msg = str(exc).lower()
+    return any(kw in msg for kw in ("getaddrinfo", "name or service not known", "nodename nor servname", "dns", "gaierror"))
+
+
+def _build_proxy_info() -> dict:
+    """收集系统代理环境变量,供前端提示使用。"""
+    import os
+    keys = ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"]
+    return {k: os.environ.get(k, "") for k in keys if os.environ.get(k)}
+
+
 @router.post("/providers/custom/test")
 async def test_custom_provider(req: ProviderTest) -> dict:
     """测试连通性并尝试拉取模型列表(GET {base_url}/models)。"""
+    import os
     import httpx
 
     from app.core.provider_registry import get_custom, normalize_base_url
@@ -210,21 +204,84 @@ async def test_custom_provider(req: ProviderTest) -> dict:
     base = normalize_base_url(req.base_url)
     if not base.startswith(("http://", "https://")):
         return {"ok": False, "error": f"Base URL 无效: {base}"}
+
+    # 检测目标主机名
+    from urllib.parse import urlparse
+    parsed = urlparse(base)
+    hostname = parsed.hostname or base
+
+    # 构建代理配置(若系统设置了 HTTP(S)_PROXY,httpx 会自动读取)
     headers = {"Authorization": f"Bearer {key}"} if key else {}
-    try:
-        async with httpx.AsyncClient(timeout=12, follow_redirects=True) as client:
-            resp = await client.get(f"{base}/models", headers=headers)
-        if resp.status_code == 200:
-            data = resp.json().get("data", []) or []
-            models = [
-                {"id": m.get("id", ""), "name": m.get("id", "")}
-                for m in data if isinstance(m, dict) and m.get("id")
-            ]
-            return {"ok": True, "models": models}
-        return {"ok": False, "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
-    except Exception as exc:
-        msg = str(exc) or repr(exc) or type(exc).__name__
+    from app.config import get_httpx_proxy
+
+    last_error = None
+    for attempt in range(2):  # 最多重试 1 次
+        try:
+            proxy = get_httpx_proxy()
+            client_kwargs = {
+                "timeout": httpx.Timeout(15.0, connect=10.0),
+                "follow_redirects": True,
+            }
+            if proxy:
+                client_kwargs["proxy"] = proxy
+            async with httpx.AsyncClient(**client_kwargs) as client:
+                resp = await client.get(f"{base}/models", headers=headers)
+            if resp.status_code == 200:
+                data = resp.json().get("data", []) or []
+                models = [
+                    {"id": m.get("id", ""), "name": m.get("id", "")}
+                    for m in data if isinstance(m, dict) and m.get("id")
+                ]
+                return {"ok": True, "models": models}
+            # 非 200 状态码直接返回,不重试
+            return {"ok": False, "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+        except Exception as exc:
+            last_error = exc
+            if not _is_dns_error(exc):
+                # 非 DNS 错误不重试
+                break
+            # DNS 错误可能是临时网络波动,重试一次
+            continue
+
+    # 处理最终错误
+    if last_error:
+        msg = str(last_error) or repr(last_error) or type(last_error).__name__
+        if _is_dns_error(last_error):
+            proxy_info = _build_proxy_info()
+            hint_parts = [f"DNS解析失败:无法访问 {hostname}"]
+            if proxy_info:
+                hint_parts.append("检测到系统代理设置,如仍无法访问请确认代理是否可用")
+            else:
+                hint_parts.append("如 DNS 仍无法解析,请检查网络或配置 HTTP_PROXY/HTTPS_PROXY 代理")
+            return {
+                "ok": False,
+                "error": "; ".join(hint_parts),
+                "detail": msg[:200],
+                "proxy_configured": bool(proxy_info),
+            }
         return {"ok": False, "error": msg[:300]}
+    return {"ok": False, "error": "未知错误"}
+
+
+@router.get("/providers/builtin/{pid}/models")
+async def list_builtin_models(pid: str) -> dict:
+    """获取内置厂商的全部模型列表(含用户追加的扩展模型)。"""
+    from app.core.provider_registry import BUILTIN_PROVIDERS, list_builtin_ext_models
+
+    if pid not in BUILTIN_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"未知内置厂商: {req.pid}")
+    from app.api.chat import _PROVIDER_DEFAULT_MODELS
+
+    models = list(_PROVIDER_DEFAULT_MODELS.get(pid, []))
+    for ext in list_builtin_ext_models(req.pid):
+        models.append({
+            "id": ext.get("id"),
+            "name": ext.get("name") or ext.get("id"),
+            "speed": ext.get("speed", ""),
+            "quality": ext.get("quality", ""),
+            "context": ext.get("context"),
+        })
+    return {"provider": pid, "models": models}
 
 
 @router.post("/providers/builtin/{pid}/models")
@@ -232,12 +289,29 @@ async def add_builtin_ext_model(pid: str, req: ModelUpsert) -> dict:
     from app.core.provider_registry import add_builtin_model, BUILTIN_PROVIDERS
 
     if pid not in BUILTIN_PROVIDERS:
-        raise HTTPException(status_code=400, detail=f"未知内置厂商: {pid}")
+        raise HTTPException(status_code=400, detail=f"未知内置厂商: {req.pid}")
     try:
-        result = add_builtin_model(pid, req.id, req.name, req.context)
+        result = add_builtin_model(req.pid, req.id, req.name, req.context)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "result": result}
+
+
+@router.post("/providers/builtin/{pid}/models/batch")
+async def add_builtin_ext_models_batch(pid: str, req: ModelBatchUpsert) -> dict:
+    """批量添加内置厂商扩展模型。"""
+    from app.core.provider_registry import add_builtin_model, BUILTIN_PROVIDERS
+
+    if pid not in BUILTIN_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"未知内置厂商: {req.pid}")
+    added, errors = [], []
+    for m in req.models:
+        try:
+            add_builtin_model(req.pid, m.id, m.name, m.context)
+            added.append(m.id)
+        except ValueError as exc:
+            errors.append({"id": m.id, "error": str(exc)})
+    return {"ok": True, "added": added, "errors": errors}
 
 
 @router.delete("/providers/builtin/{pid}/models/{mid}")
@@ -245,8 +319,107 @@ async def remove_builtin_ext_model(pid: str, mid: str) -> dict:
     from app.core.provider_registry import remove_builtin_model, BUILTIN_PROVIDERS
 
     if pid not in BUILTIN_PROVIDERS:
-        raise HTTPException(status_code=400, detail=f"未知内置厂商: {pid}")
+        raise HTTPException(status_code=400, detail=f"未知内置厂商: {req.pid}")
     return {"ok": remove_builtin_model(pid, mid)}
+
+
+@router.post("/providers/fetch_models")
+async def fetch_models(req: ProviderTest) -> dict:
+    """拉取内置厂商模型列表并追加到扩展模型。"""
+    import httpx
+    from app.core.provider_registry import BUILTIN_PROVIDERS, add_builtin_model, list_builtin_ext_models
+    from app.config import get_httpx_proxy
+    from urllib.parse import urlparse
+
+    if req.pid not in BUILTIN_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"未知内置厂商: {req.pid}")
+
+    base = req.base_url.strip()
+    key = req.api_key.strip()
+
+    # 内置厂商未传 api_key 时从配置中获取
+    if not key:
+        from app.config import settings as _cfg
+        if req.pid == "deepseek":
+            key = _cfg.deepseek_api_key or ""
+        elif req.pid == "qwen":
+            key = _cfg.qwen_api_key or ""
+        elif req.pid == "openai":
+            import os
+            key = os.environ.get("OPENAI_API_KEY", "")
+        elif req.pid == "compat":
+            key = _cfg.openai_compat_api_key or ""
+        elif req.pid == "ollama":
+            key = "ollama"
+
+    if not base:
+        return {"ok": False, "error": "Base URL 不能为空"}
+    if not base.startswith(("http://", "https://")):
+        return {"ok": False, "error": "Base URL 无效"}
+    if not key:
+        return {"ok": False, "error": f"{req.pid} 的 API Key 未配置"}
+
+    parsed = urlparse(base)
+    hostname = parsed.hostname or base
+
+    headers = {"Authorization": f"Bearer {key}"}
+    last_error = None
+
+    for attempt in range(2):
+        try:
+            proxy = get_httpx_proxy()
+            client_kwargs = {
+                "timeout": httpx.Timeout(15.0, connect=10.0),
+                "follow_redirects": True,
+            }
+            if proxy:
+                client_kwargs["proxy"] = proxy
+            async with httpx.AsyncClient(**client_kwargs) as client:
+                resp = await client.get(f"{base}/models", headers=headers)
+            if resp.status_code == 200:
+                data = resp.json().get("data", []) or []
+                added = 0
+                existing_ids = {m.get("id") for m in list_builtin_ext_models(req.pid)}
+                for m in data:
+                    if not isinstance(m, dict) or not m.get("id"):
+                        continue
+                    mid = m["id"]
+                    if mid in existing_ids:
+                        continue
+                    add_builtin_model(req.pid, mid, m.get("id", mid))
+                    added += 1
+                return {"ok": True, "added": added, "total": len(data)}
+            return {"ok": False, "error": f"HTTP {resp.status_code}: {resp.text[:200]}"}
+        except Exception as exc:
+            last_error = exc
+            if not _is_dns_error(exc):
+                break
+            continue
+
+    if last_error:
+        msg = str(last_error) or repr(last_error)
+        if _is_dns_error(last_error):
+            return {
+                "ok": False,
+                "error": f"DNS解析失败:无法访问 {hostname}; 如 DNS 仍无法解析,请检查网络或配置 HTTP_PROXY/HTTPS_PROXY 代理",
+                "detail": msg[:200],
+            }
+        return {"ok": False, "error": msg[:300]}
+    return {"ok": False, "error": "未知错误"}
+
+
+@router.post("/providers/builtin/{pid}/models/{mid}/default")
+async def set_builtin_default_model(pid: str, mid: str) -> dict:
+    """设置内置厂商的默认模型。"""
+    from app.core.provider_registry import BUILTIN_PROVIDERS, set_builtin_default_model
+
+    if pid not in BUILTIN_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"未知内置厂商: {pid}")
+    try:
+        result = set_builtin_default_model(pid, mid)
+        return {"ok": True, "result": result}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 class TodoCreate(BaseModel):

@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>智能体助手</title>
+  <link rel="stylesheet" href="style-new.css">
+  <link rel="stylesheet" href="style-command.css">
+  <link rel="stylesheet" href="style-message.css">
+  <link rel="stylesheet" href="style-workflow.css">
+</head>
+<body data-theme="light">
+  <!-- 顶部导航 -->
+  <nav id="topNav">
+    <div class="nav-logo" title="智能体助手">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 2a4 4 0 0 1 4 4v2a4 4 0 0 1-8 0V6a4 4 0 0 1 4-4z"/>
+        <path d="M16 14H8a4 4 0 0 0-4 4v2h16v-2a4 4 0 0 0-4-4z"/>
+        <circle cx="12" cy="7" r="1" fill="currentColor"/>
+      </svg>
+      <span>智能体助手</span>
+    </div>
+
+    <div class="nav-separator"></div>
+
+    <div class="nav-group">
+      <button class="nav-btn active" data-view="chat" title="对话">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        <span>对话</span>
+      </button>
+      <button class="nav-btn" data-view="todo" title="待办">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+        <span>待办</span>
+      </button>
+      <button class="nav-btn" data-view="kb" title="知识库">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+        <span>知识库</span>
+      </button>
+      <button class="nav-btn" data-view="memory" title="记忆">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a7 7 0 0 1 7 7c0 5-7 13-7 13S5 14 5 9a7 7 0 0 1 7-7z"/><circle cx="12" cy="9" r="2.5"/></svg>
+        <span>记忆</span>
+      </button>
+      <button class="nav-btn" data-view="workflow" title="工作流">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></svg>
+        <span>工作流</span>
+      </button>
+    </div>
+
+    <div class="nav-spacer"></div>
+
+    <div class="nav-group">
+      <button class="nav-btn" data-view="runs" title="运行记录">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        <span>记录</span>
+      </button>
+      <button class="nav-btn" data-view="telemetry" title="用量统计">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+        <span>用量</span>
+      </button>
+      <button class="nav-btn" data-view="schedule" title="定时任务">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        <span>定时</span>
+      </button>
+      <button class="nav-btn" data-view="prompts" title="提示词库">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+        <span>提示词</span>
+      </button>
+      <button class="nav-btn" data-view="tools" title="工具">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>
+        <span>工具</span>
+      </button>
+      <button class="nav-btn" data-view="settings" title="设置">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+        <span>设置</span>
+      </button>
+    </div>
+
+    <div class="nav-separator"></div>
+
+    <button id="themeBtn" title="切换主题">
+      <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      <svg class="icon-sun" style="display:none" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+    </button>
+  </nav>
+
+  <!-- 主内容区 -->
+  <div id="main">
+    <!-- 会话列表 -->
+    <aside id="sessionPanel">
+      <div class="session-panel-head">
+        <span class="session-panel-title">会话</span>
+        <div class="session-panel-actions">
+          <button class="mini-btn" id="exportBtn" title="导出">⤓</button>
+          <button class="mini-btn" id="collapseBtn" title="收起">⏴</button>
+          <button class="mini-btn" id="newSessionBtn" title="新建">＋</button>
+        </div>
+      </div>
+      <div class="session-search">
+        <input id="sessionSearch" placeholder="搜索会话...">
+      </div>
+      <div id="sessionList" class="session-list"></div>
+    </aside>
+
+    <button id="sessionReopen" title="展开会话栏">☰</button>
+
+    <!-- 聊天区域 -->
+    <div class="chat-area">
+      <header class="chat-header">
+        <span class="chat-title" id="sessionLabel">新会话</span>
+        <div class="chat-header-actions">
+          <button class="mini-btn danger" id="clearSessionBtn" title="清空会话">清空</button>
+          <div class="ctx-meter" id="ctxMeter" title="上下文用量">
+            <div class="ctx-bar"><div class="ctx-fill" id="ctxFill"></div></div>
+            <span class="ctx-text" id="ctxText">-</span>
+          </div>
+          <div class="status">
+            <span class="status-dot" id="statusDot"></span>
+            <span id="statusText">连接中...</span>
+          </div>
+          <button class="mini-btn" id="toggleSidePanel" title="执行面板">⚡</button>
+        </div>
+      </header>
+
+      <div id="messages"></div>
+
+      <!-- 欢迎页 -->
+      <div id="welcome" class="welcome">
+        <div class="welcome-logo">🤖</div>
+        <h2>智能体助手</h2>
+        <p class="welcome-sub">多模型对话 · 知识库 · 工具调用 · 图片识别</p>
+        <div class="welcome-chips">
+          <button class="welcome-chip" data-q="帮我介绍这个项目能做什么">我能做什么？</button>
+          <button class="welcome-chip" data-q="帮我写一段线程安全的 Python 缓存实现">写一段 Python 代码</button>
+          <button class="welcome-chip" data-q="把下面的内容整理成一份周报">整理一份周报</button>
+          <button class="welcome-chip" data-q="解释一下什么是 RAG">什么是 RAG?</button>
+        </div>
+        <p class="welcome-hint">输入框以 <code>/</code> 开头可唤起提示词库</p>
+      </div>
+
+      <!-- 图片预览 -->
+      <div id="imgPreviewBar" class="attach-bar" hidden>
+        <span>已选图片:</span><img id="previewImg" title="点击预览">
+        <span class="preview-name" id="previewName"></span>
+        <button class="lb-btn" id="previewCancel">取消</button>
+      </div>
+
+      <!-- 附件栏 -->
+      <div id="attachBar" class="attach-bar" hidden>
+        <span class="attach-label">📎 附件</span>
+        <div class="attach-list" id="attachList"></div>
+        <button class="mini-btn" id="attachClearBtn">清空</button>
+      </div>
+
+      <!-- 输入区域 -->
+      <footer class="composer">
+        <div class="composer-inner">
+          <div class="composer-top">
+            <div class="composer-selects">
+              <button type="button" id="modelPickerBtn" class="picker-btn" title="选择模型"></button>
+              <select id="modeSelect" title="协作模式">
+                <optgroup label="基础模式">
+                  <option value="auto">自动</option>
+                  <option value="single">快速回答</option>
+                  <option value="review">质量把关</option>
+                  <option value="ensemble">多模型择优</option>
+                </optgroup>
+                <optgroup label="团队模式">
+                  <option value="sequential">流水线</option>
+                  <option value="hierarchical">分工协作</option>
+                  <option value="consensual">擂台赛</option>
+                </optgroup>
+              </select>
+            </div>
+            <div class="composer-tools">
+              <button id="attachBtn" class="tool-btn" title="添加文件">📎</button>
+              <button id="shotBtn" class="tool-btn" title="截屏">📸</button>
+              <button id="imageBtn" class="tool-btn" title="上传图片">🖼</button>
+              <button id="micBtn" class="tool-btn" title="语音输入">🎤</button>
+            </div>
+          </div>
+          <div class="composer-body">
+            <textarea id="input" rows="1" placeholder="输入问题,Enter 发送,Shift+Enter 换行"></textarea>
+            <button id="sendBtn" class="send-btn" title="发送">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M12 19V5M12 5l-6 6M12 5l6 6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <button id="stopBtn" class="stop-btn" title="停止" hidden>⏹</button>
+          </div>
+        </div>
+      </footer>
+    </div>
+  </div>
+
+  <!-- 执行面板 -->
+  <aside id="execPanel">
+    <div class="exec-panel-header">
+      <span class="exec-panel-title">⚡ 执行过程</span>
+      <button class="mini-btn" id="execPanelClose" title="关闭">✕</button>
+    </div>
+    <div class="exec-panel-tabs">
+      <button class="exec-tab active" data-tab="trace">执行轨迹</button>
+      <button class="exec-tab" data-tab="preview">代码预览</button>
+    </div>
+    <div class="exec-panel-body">
+      <div class="exec-tab-content active" id="traceTab">
+        <div id="execTraceList" class="exec-trace-list">
+          <div class="exec-empty">暂无执行记录</div>
+        </div>
+      </div>
+      <div class="exec-tab-content" id="previewTab">
+        <div id="codePreviewContainer" class="code-preview-container">
+          <div class="exec-empty">暂无代码预览</div>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- 浮层面板容器 -->
+  <div class="panel-overlay" id="panelOverlay"></div>
+
+  <!-- 待办面板 -->
+  <div class="side-panel" id="todoPanel" hidden>
+    <div class="panel-header">
+      <span class="panel-title">📋 待办</span>
+      <button class="panel-close" onclick="App.closePanel()">×</button>
+    </div>
+    <div class="panel-body">
+      <div class="todo-form">
+        <input id="todoInput" placeholder="新待办事项...">
+        <input id="todoDueInput" type="date">
+        <button class="lb-btn" id="todoAddBtn">添加</button>
+      </div>
+      <div id="todoList" class="todo-list" style="margin-top:16px"></div>
+    </div>
+  </div>
+
+  <!-- 知识库面板 -->
+  <div class="side-panel" id="kbPanel" hidden>
+    <div class="panel-header">
+      <span class="panel-title">📚 知识库</span>
+      <button class="panel-close" onclick="App.closePanel()">×</button>
+    </div>
+    <div class="panel-body">
+      <div id="dropZone" style="padding:20px;border:2px dashed var(--border);border-radius:var(--radius);text-align:center;color:var(--muted);margin-bottom:16px">
+        <div style="font-size:24px;margin-bottom:8px">📚</div>
+        <div>拖拽文件到这里上传</div>
+        <div style="font-size:12px;margin-top:4px">支持 txt / md / pdf / docx</div>
+      </div>
+      <div id="docStats" class="doc-stats"></div>
+      <div id="docList" class="doc-list"></div>
+    </div>
+  </div>
+
+  <!-- 记忆面板 -->
+  <div class="side-panel" id="memoryPanel" hidden>
+    <div class="panel-header">
+      <span class="panel-title">🧠 长期记忆</span>
+      <button class="panel-close" onclick="App.closePanel()">×</button>
+    </div>
+    <div class="panel-body">
+      <div class="memory-tools" style="display:flex;gap:8px;margin-bottom:16px">
+        <input id="memorySearch" placeholder="搜索记忆..." style="flex:1;padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius-sm)">
+        <select id="memoryScope" style="padding:6px;border:1px solid var(--border);border-radius:var(--radius-sm)">
+          <option value="all">全部</option>
+          <option value="global">全局</option>
+          <option value="session">会话级</option>
+        </select>
+      </div>
+      <div id="memoryStats" class="doc-stats"></div>
+      <div class="memory-form" style="margin-top:16px">
+        <textarea id="memoryInput" placeholder="写入一条新记忆..." style="width:100%;padding:8px;border:1px solid var(--border);border-radius:var(--radius-sm);resize:vertical;min-height:80px"></textarea>
+        <div style="display:flex;gap:8px;margin-top:8px">
+          <input id="memoryKwInput" placeholder="关键词(逗号分隔)" style="flex:1;padding:6px 10px;border:1px solid var(--border);border-radius:var(--radius-sm)">
+          <button class="lb-btn" id="memoryAddBtn">保存</button>
+        </div>
+      </div>
+      <div id="memoryList" class="memory-list" style="margin-top:16px"></div>
+    </div>
+  </div>
+
+  <!-- 运行记录面板 -->
+  <div class="side-panel" id="runsPanel" hidden>
+    <div class="panel-header">
+      <span class="panel-title">🕘 运行记录</span>
+      <button class="panel-close" onclick="App.closePanel()">×</button>
+    </div>
+    <div class="panel-body">
+      <button class="mini-btn" id="runsRefreshBtn" style="margin-bottom:12px">刷新</button>
+      <div id="runsList" class="runs-list"></div>
+    </div>
+  </div>
+
+  <!-- 用量统计面板 -->
+  <div class="side-panel" id="telemetryPanel" hidden>
+    <div class="panel-header">
+      <span class="panel-title">📊 用量统计</span>
+      <button class="panel-close" onclick="App.closePanel()">×</button>
+    </div>
+    <div class="panel-body">
+      <button class="mini-btn" id="telRefreshBtn" style="margin-bottom:12px">刷新</button>
+      <div id="telStats" class="tel-stats"></div>
+      <div id="telRuns" class="tel-runs" style="margin-top:16px"></div>
+    </div>
+  </div>
+
+  <!-- 定时任务面板 -->
+  <div class="side-panel" id="schedulePanel" hidden>
+    <div class="panel-header">
+      <span class="panel-title">⏰ 定时任务</span>
+      <button class="panel-close" onclick="App.closePanel()">×</button>
+    </div>
+    <div class="panel-body">
+      <div class="sched-form">
+        <input id="schedNameInput" placeholder="任务名称" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:var(--radius-sm);margin-bottom:8px">
+        <div style="display:flex;gap:8px;margin-bottom:8px">
+          <select id="schedFuncInput" style="flex:1;padding:8px;border:1px solid var(--border);border-radius:var(--radius-sm)">
+            <option value="get_current_time">当前时间</option>
+            <option value="calculate">计算</option>
+            <option value="fetch_webpage">抓取网页</option>
+          </select>
+          <button class="lb-btn" id="schedAddBtn">创建</button>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <input id="schedCronInput" placeholder="Cron: 0 9 * * *" style="flex:1;padding:8px;border:1px solid var(--border);border-radius:var(--radius-sm)">
+          <span style="color:var(--muted)">或</span>
+          <input id="schedIntervalInput" type="number" min="60" placeholder="间隔秒" style="width:90px;padding:8px;border:1px solid var(--border);border-radius:var(--radius-sm)">
+        </div>
+      </div>
+      <div id="schedList" class="sched-list" style="margin-top:16px"></div>
+    </div>
+  </div>
+
+  <!-- 提示词库面板 -->
+  <div class="side-panel" id="promptsPanel" hidden>
+    <div class="panel-header">
+      <span class="panel-title">📝 提示词库</span>
+      <button class="panel-close" onclick="App.closePanel()">×</button>
+    </div>
+    <div class="panel-body">
+      <div class="prompt-form">
+        <input id="promptTitleInput" placeholder="标题" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:var(--radius-sm);margin-bottom:8px">
+        <textarea id="promptTextInput" placeholder="提示词内容" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:var(--radius-sm);min-height:120px;resize:vertical"></textarea>
+        <button class="lb-btn" id="promptSaveBtn" style="margin-top:8px">保存</button>
+      </div>
+      <div id="promptList" class="prompt-list" style="margin-top:16px"></div>
+    </div>
+  </div>
+
+  <!-- 工具面板 -->
+  <div class="side-panel" id="toolsPanel" hidden>
+    <div class="panel-header">
+      <span class="panel-title">🛠 可用工具</span>
+      <button class="panel-close" onclick="App.closePanel()">×</button>
+    </div>
+    <div class="panel-body">
+      <div id="toolGrid" class="tool-grid"></div>
+    </div>
+  </div>
+
+  <!-- 设置面板 -->
+  <div class="side-panel" id="settingsPanel" hidden>
+    <div class="panel-header">
+      <span class="panel-title">⚙️ 设置</span>
+      <button class="panel-close" onclick="App.closePanel()">×</button>
+    </div>
+    <div class="panel-body">
+      <div class="set-row" style="display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid var(--border)">
+        <span>深色主题</span>
+        <div class="toggle" id="themeToggle"><div class="toggle-knob"></div></div>
+      </div>
+      <div style="padding:12px 0;border-bottom:1px solid var(--border)">
+        <div style="font-weight:500;margin-bottom:8px">模型服务</div>
+        <div class="muted" style="font-size:12px;margin-bottom:12px">内置厂商在 .env 配置;下方可添加任意 OpenAI 兼容提供商</div>
+        <div class="prov-admin" id="providerAdmin"></div>
+      </div>
+      <div style="padding:12px 0;border-bottom:1px solid var(--border)">
+        <div style="font-weight:500;margin-bottom:8px">后端连接</div>
+        <div style="display:flex;justify-content:space-between;padding:4px 0"><span>地址</span><span class="muted" id="backendUrlText">-</span></div>
+        <div style="display:flex;justify-content:space-between;padding:4px 0"><span>状态</span><span class="muted" id="backendStatusText">-</span></div>
+      </div>
+      <div style="padding:12px 0">
+        <button class="lb-btn" id="restartBackendBtn">重启后端</button>
+      </div>
+      <p class="app-tip" style="margin-top:16px;font-size:12px;color:var(--muted)">💡 App 常驻系统托盘,关闭窗口仅最小化;全局快捷键 <code>Alt+Shift+Space</code> 可唤出/隐藏。</p>
+    </div>
+  </div>
+
+  <!-- 工作流面板 -->
+  <div class="side-panel" id="workflowPanel" hidden style="width:95vw;max-width:1400px">
+    <div class="panel-header">
+      <span class="panel-title">⚙️ 工作流</span>
+      <button class="panel-close" onclick="App.closePanel()">×</button>
+    </div>
+    <div class="panel-body" style="padding:0;display:flex;flex-direction:column;height:calc(100vh - 100px)">
+      <div id="wfToolbar" class="wf-toolbar" style="display:flex;gap:8px;padding:12px;border-bottom:1px solid var(--border)">
+        <button class="mini-btn" id="wfNewBtn">+ 新建</button>
+        <button class="mini-btn" id="wfRefreshBtn">刷新</button>
+        <span style="flex:1"></span>
+        <button class="mini-btn" id="wfAddNodeBtn">+ 节点</button>
+        <button class="mini-btn" id="wfSaveBtn">💾 保存</button>
+        <button class="mini-btn" id="wfRunBtn" style="background:var(--accent);color:white">▶ 运行</button>
+        <button class="mini-btn danger" id="wfDeleteBtn">🗑 删除</button>
+        <span class="wf-spacer"></span>
+        <button class="mini-btn" id="wfLayoutBtn">📐 布局</button>
+        <button class="mini-btn" id="wfZoomInBtn">🔍+</button>
+        <button class="mini-btn" id="wfZoomOutBtn">🔍-</button>
+        <button class="mini-btn" id="wfAiGenBtn">✨ AI生成</button>
+      </div>
+      <div style="flex:1;position:relative;overflow:hidden">
+        <div id="wfDesigner" class="wf-designer" style="width:100%;height:100%">
+          <svg id="wfSvg" class="wf-svg"></svg>
+          <div id="wfNodePanel" class="wf-node-panel"></div>
+        </div>
+      </div>
+      <div id="wfList" class="wf-list" style="padding:12px;border-top:1px solid var(--border);max-height:150px;overflow-y:auto"></div>
+    </div>
+  </div>
+
+  <!-- 文件输入 -->
+  <input type="file" id="fileInput" multiple hidden>
+  <input type="file" id="imageInput" accept="image/*" hidden>
+  <input type="file" id="attachInput" multiple hidden>
+  <input type="file" id="videoInput" accept="video/*" hidden>
+
+  <!-- 图片查看器 -->
+  <div id="lightbox" hidden>
+    <button class="lb-close" id="lbClose" title="关闭">×</button>
+    <img id="lbImg" alt="">
+    <div class="lb-bar">
+      <button class="lb-btn" id="lbDownload">下载</button>
+      <button class="lb-btn" id="lbCopy">复制</button>
+    </div>
+  </div>
+
+  <!-- 确认栏 -->
+  <div id="confirmBar" class="confirm-bar"></div>
+
+  <!-- 脚本 -->
+  <script src="vendor/highlight.min.js"></script>
+  <script src="js/init.js"></script>
+  <script src="js/storage.js"></script>
+  <script src="js/dom-cache.js"></script>
+  <script src="js/state.js"></script>
+  <script src="js/api.js"></script>
+  <script src="js/markdown.js"></script>
+  <script src="js/messages.js"></script>
+  <script src="js/group.js"></script>
+  <script src="js/utils.js"></script>
+  <script src="js/common.js"></script>
+  <script src="js/attachments.js"></script>
+  <script src="js/session.js"></script>
+  <script src="js/kb.js"></script>
+  <script src="js/memory.js"></script>
+  <script src="js/runs.js"></script>
+  <script src="js/telemetry.js"></script>
+  <script src="js/schedule.js"></script>
+  <script src="js/prompts.js"></script>
+  <script src="js/todo.js"></script>
+  <script src="js/tools.js"></script>
+  <script src="js/settings.js"></script>
+  <script src="js/model_picker.js"></script>
+  <script src="js/mode.js"></script>
+  <script src="js/chat-group.js"></script>
+  <script src="js/chat-images.js"></script>
+  <script src="js/chat-send.js"></script>
+  <script src="js/chat.js"></script>
+  <script src="js/workflow-list.js"></script>
+  <script src="js/workflow-designer.js"></script>
+  <script src="js/workflow-ops.js"></script>
+  <script src="js/workflow.js?v=3"></script>
+  <script src="js/message-renderer.js"></script>
+  <script src="js/confirm.js"></script>
+  <script src="js/command-palette.js"></script>
+  <script src="js/project.js"></script>
+  <script src="js/voice.js"></script>
+  <script src="js/video.js"></script>
+  <script src="renderer.js"></script>
+</body>
+</html>

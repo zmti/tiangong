@@ -8,16 +8,15 @@ App.Voice = {
 };
 
 App.Voice.init = function () {
+  // 录音按钮通过附件菜单触发，无需独立按钮
+  // 但在 Composer 上保留一个独立的录音按钮（如果 UI 有）
   const micBtn = document.getElementById('micBtn');
-  if (!micBtn) return;
-
-  micBtn.addEventListener('click', () => {
-    if (App.Voice.isRecording) {
-      App.Voice.stopRecording();
-    } else {
-      App.Voice.startRecording();
-    }
-  });
+  if (micBtn) {
+    micBtn.addEventListener('click', () => {
+      if (App.Voice.isRecording) App.Voice.stopRecording();
+      else App.Voice.startRecording();
+    });
+  }
 };
 
 App.Voice.startRecording = async function () {

@@ -79,10 +79,13 @@
       }
 
       wrap.appendChild(avatar);
-      wrap.appendChild(rail);
-      wrap.appendChild(answer);
-      wrap.appendChild(act);
-      wrap.appendChild(timeEl);
+      const body = document.createElement('div');
+      body.className = 'msg-body';
+      body.appendChild(rail);
+      body.appendChild(answer);
+      body.appendChild(act);
+      body.appendChild(timeEl);
+      wrap.appendChild(body);
       App.els.messages.appendChild(wrap);
       App.els.messages.scrollTop = App.els.messages.scrollHeight;
       if (type === 'user') App.refreshWelcomePage();
@@ -221,7 +224,7 @@
     const body = document.createElement('div');
     body.className = 'msg-body';
     const bubble = document.createElement('div');
-    bubble.className = 'bubble';
+    bubble.className = 'answer-doc';
     bubble.innerHTML = '<div class="typing-indicator"><span></span><span></span><span></span></div>';
     body.appendChild(bubble);
     wrap.appendChild(avatar);

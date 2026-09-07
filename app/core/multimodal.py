@@ -145,12 +145,16 @@ async def synthesize_speech(text: str, voice: str = "") -> Optional[bytes]:
 
     未配置 TTS 服务时返回 None。
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    
     tts_base = getattr(settings, "tts_base_url", "")
     tts_key = getattr(settings, "tts_api_key", "")
     tts_model = getattr(settings, "tts_model", "tts-1")
     tts_voice = voice or getattr(settings, "tts_voice", "alloy")
 
     if not tts_base or not tts_key:
+        logger.debug("TTS 服务未配置，跳过语音合成")
         return None
 
     payload = {
@@ -161,11 +165,22 @@ async def synthesize_speech(text: str, voice: str = "") -> Optional[bytes]:
     headers = {"Authorization": f"Bearer {tts_key}", "Content-Type": "application/json"}
     url = tts_base.rstrip("/") + "/audio/speech"
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-        if resp.status_code >= 400:
-            return None
-        return resp.content
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            if resp.status_code >= 400:
+                logger.warning("TTS 请求失败: HTTP %d - %s", resp.status_code, resp.text[:200])
+                return None
+            return resp.content
+    except httpx.TimeoutException:
+        logger.warning("TTS 请求超时")
+        return None
+    except httpx.ConnectError as e:
+        logger.warning("TTS 连接失败: %s", e)
+        return None
+    except Exception as e:
+        logger.error("TTS 合成异常: %s", e, exc_info=True)
+        return None
 
 
 # ── 视频关键帧提取 ─────────────────────────────────────────────────

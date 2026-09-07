@@ -283,11 +283,20 @@ class PersistentWorkspace:
         command: str,
         timeout: int,
     ) -> dict:
-        """在本地执行命令"""
+        """在本地执行命令(使用 shlex.split 避免 shell=True)。"""
+        import shlex
+
+        # 将命令字符串拆分为参数列表，避免 shell 注入
+        try:
+            argv = shlex.split(command)
+        except ValueError as e:
+            return {"error": f"命令解析失败: {e}", "success": False}
+        if not argv:
+            return {"error": "命令不能为空", "success": False}
+
         try:
             result = subprocess.run(
-                command,
-                shell=True,
+                argv,
                 capture_output=True,
                 timeout=timeout,
                 text=True,

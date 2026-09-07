@@ -8,22 +8,16 @@ import time
 from typing import Optional
 
 from app.config import settings
+from app.core.constants import TEST_FAIL_MARKERS, TRANSIENT_PATTERNS
 from app.core.llm import ToolCall
 from app.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
 # 瞬态错误特征(命中即判定为重试)
-_TRANSIENT_PATTERN = (
-    "timeout", "timed out", "rate limit", "429", "overloaded",
-    "connection", "network", "500", "502", "503", "504",
-    "temporarily unavailable", "try again",
-)
+_TRANSIENT_PATTERN = TRANSIENT_PATTERNS
 # 测试/构建失败特征(用于给出定向修复提示)
-_TEST_FAIL_MARKERS = (
-    "failed", "error", "assertionerror", "traceback", "syntaxerror",
-    "importerror", "namerror", "typeerror", "valueerror",
-)
+_TEST_FAIL_MARKERS = TEST_FAIL_MARKERS
 # 计划工具(不由工具执行器处理)
 PLAN_TOOLS = {"set_plan", "update_plan", "get_plan"}
 # 不重试工具
@@ -37,18 +31,18 @@ _has_success_memory = False
 try:
     from app.core.profiling import get_profile_manager, ProfileRecord  # noqa: F401
     _has_profiling = True
-except Exception:  # noqa: BLE001
-    pass
+except Exception as e:  # noqa: BLE001
+    logger.warning("profiling 模块加载失败: %s", e)
 try:
     from app.memory.failure_memory import get_failure_memory  # noqa: F401
     _has_failure_memory = True
-except Exception:  # noqa: BLE001
-    pass
+except Exception as e:  # noqa: BLE001
+    logger.warning("failure_memory 模块加载失败: %s", e)
 try:
     from app.memory.success_memory import get_success_memory  # noqa: F401
     _has_success_memory = True
-except Exception:  # noqa: BLE001
-    pass
+except Exception as e:  # noqa: BLE001
+    logger.warning("success_memory 模块加载失败: %s", e)
 
 
 class ToolExecutor:
@@ -76,19 +70,19 @@ class ToolExecutor:
         self._dangerous_tools = {
             s.strip() for s in settings.agent_dangerous_tools.split(",") if s.strip()
         }
-        # 危险工具频率限制:每个工具名 -> 最近 N 秒内的调用时间戳列表
-        self._dangerous_tool_calls: dict[str, list[float]] = {}
-        # 每分钟危险工具最大调用次数(按工具名分别计数)
-        self._dangerous_tool_rate_limit = int(settings.agent_dangerous_tool_rate_limit or 10)
+        # 危险工具频率限制(共享实现,Agent 与 ToolExecutor 行为一致)
+        from app.core.tool_safety import DangerousToolRateLimiter
 
-    def get_schemas(self, registry: Optional[ToolRegistry] = None) -> list[dict]:
+        self._dangerous_rate_limiter = DangerousToolRateLimiter()
+
+    async def get_schemas(self, registry: Optional[ToolRegistry] = None) -> list[dict]:
         """获取当前活跃工具的 OpenAI Schema 列表。"""
         reg = registry or self.registry
         if self._active_tools is None:
-            tools = reg.list()
+            tools = [t for t in await reg.list()]
         else:
             active = set(self._active_tools) | set(self._always_tools)
-            tools = [t for t in reg.list() if t.name in active]
+            tools = [t for t in await reg.list() if t.name in active]
         return [t.to_openai_schema() for t in tools]
 
     @staticmethod
@@ -200,8 +194,8 @@ class ToolExecutor:
                     success=not self.is_tool_error(result),
                     error=(result[:200] if self.is_tool_error(result) else ""),
                 ))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("性能记录失败(非关键): %s", e)
         if _has_failure_memory and self.is_tool_error(result):
             try:
                 from app.core.telemetry import _current_run_id as _cri
@@ -210,8 +204,8 @@ class ToolExecutor:
                 store = get_failure_memory()
                 err_text = result[:300] if isinstance(result, str) else str(result)[:300]
                 store.record_failure(name, err_text, run_id=rid, session_id=self.session_id)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("失败记忆记录失败(非关键): %s", e)
         if _has_success_memory and not self.is_tool_error(result) and result.strip():
             try:
                 from app.core.telemetry import _current_run_id as _cri
@@ -220,12 +214,13 @@ class ToolExecutor:
                 store = get_success_memory()
                 try:
                     args_preview = json.loads(arguments)[:200] if arguments.strip().startswith("{") else arguments[:200]
-                except Exception:
+                except Exception as e:
+                    logger.debug("解析工具参数预览失败(非关键): %s", e)
                     args_preview = arguments[:200]
                 preview = result[:200] if isinstance(result, str) else str(result)[:200]
                 store.record_success(name, args_preview, preview, run_id=rid, session_id=self.session_id)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("成功记忆记录失败(非关键): %s", e)
 
     async def _execute_tool_once(self, name: str, arguments: str) -> str:
         self._check_cancel()
@@ -315,21 +310,12 @@ class ToolExecutor:
     ) -> list[tuple[ToolCall, str, bool]]:
         """并行执行一批工具调用,记录执行步骤。"""
         # 危险工具频率限制:超出速率直接拒绝,防止滥用
-        if self._dangerous_tool_rate_limit > 0:
-            now = time.time()
-            for tc in tool_calls:
-                if tc.name in self._dangerous_tools:
-                    calls = self._dangerous_tool_calls.setdefault(tc.name, [])
-                    # 清理超过 60s 的旧记录
-                    self._dangerous_tool_calls[tc.name] = [t for t in calls if now - t < 60]
-                    if len(self._dangerous_tool_calls[tc.name]) >= self._dangerous_tool_rate_limit:
-                        msg = (
-                            f"工具 {tc.name} 触发频率限制:"
-                            f" 最近 60 秒内已调用 {self._dangerous_tool_rate_limit} 次,请稍后重试"
-                        )
-                        logger.warning(msg)
-                        return [(tc, json.dumps({"error": msg, "blocked": True}, ensure_ascii=False), True)]
-                    self._dangerous_tool_calls[tc.name].append(now)
+        for tc in tool_calls:
+            if tc.name in self._dangerous_tools:
+                allowed, msg = self._dangerous_rate_limiter.allow(tc.name)
+                if not allowed:
+                    logger.warning(msg)
+                    return [(tc, json.dumps({"error": msg, "blocked": True}, ensure_ascii=False), True)]
 
         from app.tools.memory_tool import _current_session
         from app.tools.delegation_tool import set_delegate_context, _delegate_parent
@@ -461,60 +447,21 @@ class ToolExecutor:
 
     def scan_pending_confirmations(self, tool_calls: list[ToolCall]) -> list[tuple[ToolCall, object]]:
         """预扫描一批工具调用,返回需要人工确认且未批准的。"""
-        from app.core.security import decide, Decision
-        pending: list[tuple[ToolCall, object]] = []
-        for tc in tool_calls:
-            if tc.name in self.approve_tools or tc.name in self._runtime_approved:
-                continue
-            if settings.agent_tool_confirm and tc.name in self._dangerous_tools:
-                pending.append((tc, Decision(
-                    confirm=True, reason=f"工具 {tc.name} 属于危险操作,需要用户确认",
-                )))
-                continue
-            if settings.agent_confirm_enabled:
-                decision = decide(tc.name, tc.arguments)
-                if decision.confirm:
-                    pending.append((tc, decision))
-        return pending
+        from app.core.tool_safety import scan_pending_confirmations as _scan
+
+        return _scan(tool_calls, self.approve_tools, self._runtime_approved, self._dangerous_tools)
 
     def create_confirm_requests(self, pending: list[tuple[ToolCall, object]]) -> list[dict]:
         """为待确认的工具调用创建持久化确认请求。"""
-        from app.core.security import describe
-        from app.tools.collaboration_tool import _get_store
-        store = _get_store()
-        requests = []
-        for tc, decision in pending:
-            try:
-                params = json.loads(tc.arguments) if isinstance(tc.arguments, str) and tc.arguments.strip() else {}
-            except (json.JSONDecodeError, TypeError):
-                params = {}
-            if not isinstance(params, dict):
-                params = {"raw": str(params)}
-            rec = store.create(
-                action=tc.name,
-                description=f"{getattr(decision, 'reason', '') or ''}。\n详情: {describe(tc.name, tc.arguments)}",
-                params=params,
-            )
-            requests.append({
-                "confirmation_id": rec["id"],
-                "tool": tc.name,
-                "arguments": tc.arguments,
-                "reason": getattr(decision, "reason", "") or "",
-            })
-        return requests
+        from app.core.tool_safety import create_confirm_requests as _create
+
+        return _create(pending)
 
     def is_tool_approved_by_resume(self, tc: ToolCall, state) -> bool:
         """恢复运行时,判断该工具是否已被用户批准。"""
-        resume = (state.interrupt or {}).get("resume")
-        if isinstance(resume, list):
-            return tc.name in resume
-        resume = resume or {}
-        requests = (state.interrupt or {}).get("value", {}).get("requests") or []
-        for req in requests:
-            if req.get("tool") != tc.name:
-                continue
-            return bool(req.get("approved", False))
-        return False
+        from app.core.tool_safety import is_tool_approved_by_resume as _approved
+
+        return _approved(tc, state, runtime_approved=self._runtime_approved)
 
     def build_reflection_hint(self, messages: list[dict], batch: list[tuple], failures: dict) -> Optional[str]:
         """根据失败模式构建反思提示,如果命中直接返回终止工具名。"""

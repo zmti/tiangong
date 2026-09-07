@@ -55,8 +55,8 @@ class TestProjectAnalyze:
     def test_analyze_existing_project(self):
         from app.tools.project_tool import project_analyze
 
-        # 分析 agent-service 本身
-        result = project_analyze.func(path="E:/dev/agent-service", max_files=50)
+        # 分析 TianGong 项目本身（确保路径存在）
+        result = project_analyze.func(path="E:/dev/TianGong", max_files=50)
         assert result["ok"]
         assert result["total_files"] > 0
         assert isinstance(result["build_system"], str) or result["build_system"] is None

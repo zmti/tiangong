@@ -1,5 +1,7 @@
 import os
+from typing import Optional
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # 应用版本:随协议/接口变更递增;桌面端启动器据此识别旧版残留进程
@@ -109,10 +111,28 @@ class Settings(BaseSettings):
     # 请求级 max_output_tokens 上限;0 = 不限制。达到上限后停止生成并以截断提示结束。
     agent_default_max_output_tokens: int = 0
 
+    # ---- 工作流生成服务地址 ----
+    # Agent 通过 create_workflow_from_desc 工具调用此地址生成工作流。
+    # 默认 http://127.0.0.1:8517;容器化部署时请修改为实际服务地址。
+    workflow_service_base_url: str = "http://127.0.0.1:8517"
+
+    # ---- 自动记忆沉淀限制 ----
+    # 每次对话最多沉淀的事实数(semantic 层)
+    agent_auto_memory_max_facts: int = 5
+    # 每次对话最多沉淀的情节数(episodic 层)
+    agent_auto_memory_max_episodic: int = 3
+
     # ---- 语义记忆分层 ----
     # 开启后记忆注入分为 working(即时)/semantic(语义检索)/episodic(过往会话摘要)三层,
     # 以带强度标签的方式注入上下文;关闭则维持旧的单一检索注入。
     agent_layered_memory: bool = True
+
+    # ---- 代理配置 ----
+    # HTTP/HTTPS 代理地址(留空则使用系统环境变量 HTTP_PROXY/HTTPS_PROXY)
+    http_proxy: str = ""
+    https_proxy: str = ""
+    # 代理排除列表(逗号分隔的域名,不走代理)
+    no_proxy: str = ""
 
     # ---- 数据层后端 ----
     # 会话/记忆存储:sqlite(默认,零依赖) / redis(需 redis-py + REDIS_URL)
@@ -131,7 +151,7 @@ class Settings(BaseSettings):
     agent_code_heal_rounds: int = 2
 
     # ---- Agent ----
-    agent_max_steps: int = 10
+    agent_max_steps: int = 20
     # 同一 Agent 实例最大并发运行数(0=不限制);防止大量并发请求耗尽 LLM 配额和服务器资源
     agent_max_concurrent_runs: int = 5
     agent_temperature: float = 0.7
@@ -179,26 +199,6 @@ class Settings(BaseSettings):
     # 透出为 thinking 事件而不是混入正文;关闭时忽略该字段
     agent_reasoning_enabled: bool = True
 
-    # ---- 代码语义理解 ----
-    # AST/符号解析:开启后 code_symbols 使用增强规则(多行签名/嵌套括号识别)
-    agent_ast_symbols: bool = True
-    # 自动 LSP 集成(定义跳转/悬停/引用查询);需额外安装语言服务器
-    agent_lsp_enabled: bool = False
-    # LSP 服务器配置(JSON 字符串),格式 {"python":{"command":"pylsp"},"typescript":{"command":"typescript-language-server","args":["--stdio"]}}
-    agent_lsp_servers: str = ""
-    # 自动构建感知:代码修改后自动检测并运行构建/安装命令
-    agent_auto_build: bool = False
-
-    # ---- 长期记忆衰退 ----
-    # 开启后,超过 TTL 且低活跃度的记忆会被自动清理
-    agent_memory_decay_enabled: bool = True
-    # 记忆 TTL(小时),超过后开始衰减
-    ltm_ttl_hours: float = 720.0
-    # 每过一个 TTL 周期衰减系数
-    ltm_decay_rate: float = 0.95
-    # 低于此分数视为过期
-    ltm_min_score: float = 0.1
-
     # ---- Git PR 工作流 ----
     # Git 平台(github/gitlab);留空=github
     agent_git_host: str = "github"
@@ -218,8 +218,6 @@ class Settings(BaseSettings):
     agent_consolidate_min_interval: int = 3600
     # 用户画像开关:根据历史消息自动提取偏好并注入系统提示
     agent_user_profile_enabled: bool = True
-    # 技能开关:把高级组合操作作为可用工具暴露给模型
-    agent_skills_enabled: bool = False
 
     # ---- 会话摘要压缩 ----
     # 历史超过预算时,不再粗暴截断,而是用 LLM 把较早对话压成摘要再注入
@@ -239,8 +237,8 @@ class Settings(BaseSettings):
     # ---- 任务规划(Plan-then-Execute) ----
     # 开启时,复杂任务先由 LLM 生成执行计划,ReAct 循环内用 set_plan/update_plan 维护进度
     agent_planning: bool = True
-    # 计划步骤数上限
-    agent_plan_max_steps: int = 6
+    # 计划步骤数上限(增加到10以适应更复杂的任务)
+    agent_plan_max_steps: int = 10
     # 计划失败后自动重新规划(replan):同一工具连续失败达到阈值时,
     # 基于"原始任务 + 失败原因"让 LLM 生成修订版计划并替换旧计划。
     # 关闭时仅注入反思提示(现状),开启时给出一条可执行的修订路线。
@@ -248,7 +246,7 @@ class Settings(BaseSettings):
     # 连续失败多少次触发重新规划
     agent_replan_after_failures: int = 2
     # 单次运行最多重新规划次数(防止死循环)
-    agent_replan_max_times: int = 2
+    agent_replan_max_times: int = 3
 
     # ---- 工具执行重试(瞬态错误指数退避) ----
     # 工具返回超时/网络/限流等瞬态错误时,自动重试次数(0 = 不重试)
@@ -261,18 +259,21 @@ class Settings(BaseSettings):
     # 昂贵/有副作用风险的确定性调用,对齐 Claude Code 的 tool result caching)。
     # 注意:仅缓存成功结果,失败/带副作用工具不缓存。0 = 关闭
     agent_tool_cache_size: int = 50
+    # 仅对这些工具启用缓存(逗号分隔);其余带副作用工具(文件/数据库/网络)不缓存
+    # 避免缓存过期导致返回陈旧数据
+    agent_tool_cache_safe_tools: str = "run_code,calculate,days_between,get_current_time"
 
     # ---- 最终答案事实校验(LLM-as-judge) ----
     # finalize 产出答案后,用评审模型交叉核对"答案中的断言 vs 工具结果",
     # 发现幻觉/未支撑断言时重写一次答案再返回。开启会多一次 LLM 调用
-    agent_verify: bool = True
+    agent_verify: bool = False  # 默认关闭,避免过度验证导致任务失败
 
     # ---- 反思循环(生成→自评→重写,Reflexion 式) ----
     # 关闭时保留现有"工具失败反思"(失败提示注入);开启后最终回答前先用 LLM
     # 按结构化 schema 自评,不合格且有预算则回灌评语要求模型重写(最多 agent_reflect_max_rounds 轮)
     agent_reflect: bool = True
-    # 自评→重写最多轮数(每轮多一次 LLM 调用)
-    agent_reflect_max_rounds: int = 1
+    # 自评→重写最多轮数(每轮多一次 LLM 调用),增加到2轮以提高成功率
+    agent_reflect_max_rounds: int = 2
     # critic/executor 双角色:开启后评审用独立模型(区别于执行模型),避免自评偏袒。
     # provider 留空 = 与执行模型同 provider
     agent_critic_provider: str = ""
@@ -297,7 +298,8 @@ class Settings(BaseSettings):
     # checkpoint 每条消息最大字符数(防大消息撑爆 SQLite);0=不截断
     checkpoint_message_char_cap: int = 8000
     # 运行最大图节点数(兜底防死循环;llm 轮数上限仍由 agent_max_steps 控制)
-    agent_graph_max_iters: int = 300
+    # 注: 此配置项已废弃,由 agent_max_steps 统一控制
+    # agent_graph_max_iters: int = 300
     # 单个工具执行超时(秒);0=不限制
     agent_tool_timeout: int = 0
     # checkpoint 保留天数(0=不清理);超过天数的已完成/已取消 checkpoint 自动清理
@@ -334,15 +336,14 @@ class Settings(BaseSettings):
     # 开启后,危险工具(run_terminal/run_code 等)需请求 approve_tools 字段确认后才执行
     agent_tool_confirm: bool = True
     # 危险工具清单(逗号分隔)
-    agent_dangerous_tools: str = "run_terminal,run_code"
+    agent_dangerous_tools: str = "run_terminal,run_code,send_email,delete_email"
     # 每个危险工具每分钟最大调用次数(0=不限制)
     agent_dangerous_tool_rate_limit: int = 10
 
     # ---- 多租户 ----
     # 启用多租户:每个 API Key 归属一个租户,支持独立的用量统计和数据隔离
     default_tenant_enabled: bool = False
-    # 多租户模式下,未匹配任何 Key 时是否回退到单 Key 模式(向后兼容)
-    tenant_fallback_to_single_key: bool = True
+    # tenant_fallback_to_single_key: bool = True  # 已废弃,由 tenant.py 硬编码处理
 
     # ---- 服务 ----
     agent_host: str = "0.0.0.0"
@@ -353,34 +354,24 @@ class Settings(BaseSettings):
     # ---- RAG 检索质量阈值 ----
     # 向量相关性最低分数阈值;低于此值的 chunk 不注入答案上下文(0.0=不过滤)
     rag_min_relevance: float = 0.3
-    # RAG 返回结果最大字符数(防止低相关片段撑爆上下文)
-    rag_max_context_chars: int = 4000
+    # rag_max_context_chars: int = 4000  # 已废弃,由 retriever.py 硬编码
     # RAG 结果是否附带引用溯源(每段附 doc_id + chunk_index + 来源页码)
     rag_return_refs: bool = True
 
     # ---- 图片多模态模式 ----
-    # 图片处理模式: data_url=内联 base64(兼容所有模型) / server_url=生成服务端可访问 URL(默认)
-    # 开启 server_url 后,上传的图片会保存到临时目录并返回 http://... URL 给模型,
-    # 避免大图片撑爆上下文;要求服务端配置 PUBLIC_BASE_URL 或可通过请求推断
-    multimodal_image_mode: str = "server_url"
-    # 图片 URL 服务器地址(公开可访问),留空则自动从请求推断
-    multimodal_public_base_url: str = ""
-    # 图片附件最大字节数(超过则拒绝)
-    multimodal_max_image_bytes: int = 10 * 1024 * 1024
+    # 图片附件最大字节数(超过则拒绝,由代码硬编码 10MB)
+    # multimodal_image_mode: str = "server_url"  # 已废弃
+    # multimodal_public_base_url: str = ""  # 已废弃
+    # multimodal_max_image_bytes: int = 10 * 1024 * 1024  # 已废弃
 
     # ---- 上下文重要性感知裁剪 ----
-    # 开启后,超预算时按重要性优先级裁剪:
-    #   P0: system_prompt(固定前缀) > P1: 最近 N 条消息原文 >
-    #   P2: 用户偏好/事实记忆 > P3: 工具中间结果/调试信息
-    context_preserve_priority: bool = True
+    # 开启后,超预算时按重要性优先级裁剪
+    # context_preserve_priority: bool = True  # 已废弃,由 _prepare_history 硬编码处理
 
-    # ---- 长期记忆沉淀过滤 ----
-    # 开启后,自动沉淀的记忆经过质量过滤(过滤短记忆、客套话、纯工具输出)
-    memory_auto_filter_enabled: bool = True
-    # 最短有效记忆长度(字),低于此值跳过沉淀
-    memory_min_length: int = 15
-    # 过滤关键词(匹配任意一个则跳过沉淀)
-    memory_skip_keywords: str = "好的,明白,收到,没问题,谢谢,感谢,明白了,了解,知道了,嗯,哦,哈,呵呵"
+    # 长期记忆沉淀过滤由 ltm.py 内部处理,不再使用独立配置项
+    # memory_auto_filter_enabled: bool = True  # 已废弃
+    # memory_min_length: int = 15  # 已废弃
+    # memory_skip_keywords: str = ""  # 已废弃
 
     # ---- Guardrail 语义级检测 ----
     # 开启后,除关键词匹配外,额外调用 LLM 做语义级 Prompt 注入/提示词泄露检测
@@ -396,14 +387,11 @@ class Settings(BaseSettings):
     agent_embedding_cache_enabled: bool = True
     # 持久化缓存跨进程重启有效(内存缓存 + SQLite 文件)
     agent_embedding_cache_persistent: bool = True
-    # 缓存最大条目数
-    agent_embedding_cache_max_size: int = 10000
-    # 缓存 TTL(秒),默认 24 小时
-    agent_embedding_cache_ttl: int = 86400
+    # agent_embedding_cache_max_size: int = 10000  # 已废弃,由代码硬编码
+    # agent_embedding_cache_ttl: int = 86400  # 已废弃,由代码硬编码
 
     # ---- 会话成本预算 ----
-    # 开启后 Agent 会在每次 LLM 调用后记录 token/成本到 budget.db
-    agent_cost_budget_enabled: bool = True
+    # agent_cost_budget_enabled: bool = True  # 已废弃,成本记录由 metrics.py 独立处理
 
     # ---- 代码沙箱 ----
     # run_code 沙箱使用的 Python 解释器路径(打包后 sys.executable 是应用 exe,不可用作解释器);
@@ -457,7 +445,7 @@ class Settings(BaseSettings):
     # 拦截时返回固定安全文案;违规记录在 steps(type=guardrail)。
     agent_guardrails_enabled: bool = True
     # 禁止输出的词汇列表(逗号分隔),用于敏感词过滤
-    guardrail_blocked_terms: str = ""
+    # guardrail_blocked_terms: str = ""  # 已废弃,由 guardrails.py 硬编码
 
     # ---- Webhook 回调 ----
     # WEBHOOK_URLS 在 .env 中配置(逗号分隔多个 URL);此处保留默认空值
@@ -475,14 +463,13 @@ class Settings(BaseSettings):
     rag_bm25_enabled: bool = True
     # 多路召回最小相关度阈值
     rag_multi_min_relevance: float = 0.0
+    # rerank_top_n: int = 10  # 已废弃,由 reranker.py 硬编码
 
     # ---- 长时自主循环 ----
     # 最大并发长时任务数
     agent_max_concurrent_long_running: int = 3
-    # 长时任务默认最大执行时长(分钟)
-    agent_long_running_default_minutes: int = 120
-    # 周期 checkpoint 间隔(分钟)
-    agent_long_running_checkpoint_interval: int = 10
+    # agent_long_running_default_minutes: int = 120  # 已废弃,由 tasks.py 硬编码
+    # agent_long_running_checkpoint_interval: int = 10  # 已废弃,由 long_running.py 硬编码
     webhook_retries: int = 2
     webhook_events: str = ""  # 逗号分隔事件类型,留空=全部
 
@@ -507,6 +494,77 @@ class Settings(BaseSettings):
         path = os.path.join(base, self.data_dir)
         os.makedirs(path, exist_ok=True)
         return path
+
+
+def _env_path() -> str:
+    return os.environ.get("AGENT_ENV_FILE", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"))
+
+
+def get_env_value(key: str) -> str | None:
+    """读取 .env 文件中指定 key 的值(未配置返回 None)。"""
+    path = _env_path()
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                k, _, v = line.partition("=")
+                if k.strip() == key:
+                    return v.strip().strip('"').strip("'")
+    return None
+
+
+def get_httpx_proxy():
+    """获取 httpx 代理配置。优先使用配置项,回退到环境变量。返回单个代理URL字符串。"""
+    try:
+        from app.config import settings
+        https_proxy = settings.https_proxy or os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        http_proxy = settings.http_proxy or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+        # 优先使用 HTTPS 代理
+        if https_proxy:
+            return https_proxy
+        if http_proxy:
+            return http_proxy
+    except Exception:
+        pass
+    # 回退到环境变量
+    https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    http_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+    if https_proxy:
+        return https_proxy
+    if http_proxy:
+        return http_proxy
+    return None
+
+
+def set_env_value(key: str, value: str) -> None:
+    """更新或写入 .env 文件中的 key=value。"""
+    path = _env_path()
+    lines: list[str] = []
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+    key_stripped = key.strip()
+    value_stripped = value.strip()
+    replaced = False
+    new_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            k, _, v = stripped.partition("=")
+            if k.strip() == key_stripped:
+                new_lines.append(f"{k}={value_stripped}\n")
+                replaced = True
+                continue
+        new_lines.append(line)
+    if not replaced:
+        new_lines.append(f"{key_stripped}={value_stripped}\n")
+    with open(path, "w", encoding="utf-8") as f:
+        f.writelines(new_lines)
 
 
 settings = Settings()

@@ -94,9 +94,16 @@ App.Prompts.clear = function () {
   App.Prompts.render();
 };
 
-/* 初始化 */
-document.addEventListener('DOMContentLoaded', () => {
-  if (App.els.promptList) {
-    App.Prompts.render();
+/* 初始化 — 等待 App.els 就绪后再执行 */
+(function initPrompts() {
+  function doInit() {
+    if (App.els && App.els.promptList) {
+      App.Prompts.render();
+    }
   }
-});
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', doInit);
+  } else {
+    doInit();
+  }
+})();

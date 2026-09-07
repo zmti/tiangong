@@ -6,6 +6,18 @@
     return { pending: '待办', in_progress: '进行中', done: '已完成', failed: '失败', skipped: '跳过' }[s] || s;
   }
 
+  // 找插入锚点:优先找 .answer-doc,其次找 bot msg wrapper,最后找 messages
+  function _findInsertTarget() {
+    if (App._answerWrap) {
+      const doc = App._answerWrap.querySelector
+        ? App._answerWrap.querySelector('.answer-doc')
+        : null;
+      if (doc && doc.parentNode === App.els.messages) return doc;
+      if (App._answerWrap.parentNode === App.els.messages) return App._answerWrap;
+    }
+    return null;
+  }
+
   function appendThinking(content) {
     if (App._currentGroup && App.Group && App.Group.setThinking) {
       App.Group.setThinking(content);
@@ -22,9 +34,10 @@
       label.addEventListener('click', () => div.classList.toggle('open'));
       div.appendChild(label);
       div.appendChild(body);
-      const anchor = App._answerWrap;
-      if (anchor && anchor.parentNode === App.els.messages) {
-        App.els.messages.insertBefore(div, anchor);
+      // 插入到当前 bot 答案之前
+      const insertTarget = _findInsertTarget();
+      if (insertTarget) {
+        insertTarget.parentNode.insertBefore(div, insertTarget);
       } else {
         App.els.messages.appendChild(div);
       }
@@ -59,7 +72,16 @@
       div = App._planCard;
     }
     renderPlanCard(div, plan);
-    if (!appendTo) App.els.messages.scrollTop = App.els.messages.scrollHeight;
+    // 插入到当前 bot 答案之前
+    if (!appendTo) {
+      const insertTarget = _findInsertTarget();
+      if (insertTarget) {
+        insertTarget.parentNode.insertBefore(div, insertTarget);
+      } else {
+        App.els.messages.appendChild(div);
+      }
+    }
+    App.els.messages.scrollTop = App.els.messages.scrollHeight;
     return div;
   }
 

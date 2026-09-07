@@ -71,6 +71,15 @@ _INJECTION_PATTERNS: tuple[str, ...] = (
     "this is a test only",
     "simulation only",
     "experiment only",
+    # 分隔符注入变体(字面量匹配,不含正则特殊字符)
+    "---\n", "***\n", "===\n", "\n\n---", "\n\n***",
+    # 分隔后紧跟指令的模式(含通配符 *)
+    "忽略*\n", "忽略*之前的", "忽略*所有之前的",
+    "你*\指令是", "你*\是",
+    # 中英混合变体
+    "忽略*以上指令", "忽略*上面的", "忽略*此前",
+    "forget*everything", "forget*all",
+    "pretend*that", "pretend*you",
 )
 
 # 输出护栏:敏感信息(API Key / 密钥 / token)外泄模式
@@ -96,7 +105,9 @@ _SENSITIVE_PATH_PATTERNS: tuple[re.Pattern, ...] = (
     re.compile(r"\.ssh[\\/](id_rsa|id_ed25519|config)"),
     re.compile(r"\.aws[\\/]credentials"),
     re.compile(r"credentials\.json"),
-    re.compile(r"secret[\\/_-]?"),
+    re.compile(r"\bsecret[\\/_-]?"),  # 敏感文件/路径中的 secret 关键词
+    re.compile(r"(?i)\bsecret[_-]?[kK]ey\b"),  # secret_key / secret-key
+    re.compile(r"(?i)\bsecret[_-]?[pP]ass\b"),  # secret_pass / secret-pass
     re.compile(r"password\.txt"),
     re.compile(r"\.git[\\/]config"),
 )
@@ -145,7 +156,12 @@ OutputChecker = Callable[[str], GuardrailResult]
 def _contains_injection(text: str) -> Optional[str]:
     low = (text or "").lower()
     for pat in _INJECTION_PATTERNS:
-        if pat.lower() in low:
+        # 通配符 * 转为正则 .* ,其他字符直接子串匹配
+        if "*" in pat:
+            regex_pat = pat.replace("*", ".*")
+            if re.search(regex_pat, low):
+                return pat
+        elif pat.lower() in low:
             return pat
     return None
 
@@ -210,7 +226,10 @@ def check_instruction_leak(text: str) -> GuardrailResult:
 
 
 def _run_checks(checks, text: str) -> GuardrailReport:
-    """顺序执行校验器(异步校验器需在外层 await)。"""
+    """顺序执行校验器(异步校验器需在外层 await)。
+
+    校验器异常时记录警告但不阻断主流程(避免误拦截)。
+    """
     report = GuardrailReport()
     for check in checks:
         try:

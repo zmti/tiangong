@@ -17,7 +17,7 @@ from app.tools.registry import tool
 
 @tool("run_skill", "执行预定义的多步骤技能(如部署、回归测试、安全扫描等)。"
       "返回每步执行结果和最终汇总。", timeout=120)
-def run_skill(
+async def run_skill(
     skill_name: str = Field(..., description="技能名称,用 list_skills 查看可用技能"),
     params: str = Field("{}", description="JSON 格式的参数,覆盖技能默认值"),
     stop_on_error: bool = Field(True, description="某步失败时是否停止后续步骤"),
@@ -41,13 +41,10 @@ def run_skill(
 
     user_params["_stop_on_error"] = stop_on_error
 
-    import asyncio
     from app.tools.registry import get_registry
     executor = SkillExecutor()
     tool_exec = _get_tool_executor()
-    result = asyncio.get_event_loop().run_until_complete(
-        executor.execute(skill, user_params, tool_exec)
-    )
+    result = await executor.execute(skill, user_params, tool_exec)
     return result.to_dict()
 
 

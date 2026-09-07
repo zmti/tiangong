@@ -11,10 +11,35 @@ from app.tools.file_tool import _resolve_write_path
 
 router = APIRouter(prefix="/v1/files", tags=["files"])
 
+# 允许读取文件的基础目录:通过 _resolve_write_path 白名单控制
+
+
+def _validate_read_path(path: str) -> str:
+    """校验读取路径在允许的根目录内(防目录穿越)。"""
+    full = os.path.abspath(os.path.expanduser(path))
+    # 与写入路径共用同一白名单机制
+    allowed_roots = [
+        os.path.abspath(os.path.expanduser(d.strip()))
+        for d in (os.environ.get("ALLOWED_READ_DIRS") or "").split(",")
+        if d.strip()
+    ]
+    if not allowed_roots:
+        # 默认只允许 data 目录
+        allowed_roots = [os.path.abspath("data")]
+    for root in allowed_roots:
+        if full == root or full.startswith(root + os.sep):
+            return full
+    raise ValueError(
+        f"路径不在允许读取目录内: {full}。允许目录: {', '.join(allowed_roots)}"
+    )
+
 
 @router.get("/history")
 async def file_history(path: str = Query(..., description="文件路径")) -> dict:
-    full = os.path.abspath(os.path.expanduser(path))
+    try:
+        full = _validate_read_path(path)
+    except ValueError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
     versions = file_version_store.list_versions(full)
     return {"path": full, "versions": versions}
 
@@ -24,6 +49,11 @@ async def file_content(path: str = Query(..., description="文件路径")) -> di
     """读取允许写入目录内文件的当前内容(供 diff 视图)。"""
     try:
         full = _resolve_write_path(path)
+    except ValueError as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    # 额外验证读取路径也在白名单内
+    try:
+        _validate_read_path(path)
     except ValueError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     if not os.path.isfile(full):

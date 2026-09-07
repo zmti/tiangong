@@ -9,12 +9,18 @@
 """
 from __future__ import annotations
 
+import hmac
 import logging
 from fastapi import Header, HTTPException
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _constant_time_compare(a: str, b: str) -> bool:
+    """常量时间比较,防止时序攻击。"""
+    return hmac.compare_digest(a.encode('utf-8'), b.encode('utf-8'))
 
 
 async def require_api_key(
@@ -27,7 +33,8 @@ async def require_api_key(
     single_key = settings.agent_api_key
     if single_key:
         expected = f"Bearer {single_key}"
-        if authorization != expected:
+        # 使用常量时间比较防止时序攻击
+        if not _constant_time_compare(authorization or "", expected):
             raise HTTPException(status_code=401, detail="无效的 API Key")
         return
 
@@ -40,7 +47,7 @@ async def require_api_key(
 
     # 提取 Key
     parts = authorization.split(" ", 1)
-    if len(parts) != 2 or parts[0] != "Bearer":
+    if len(parts) != 2 or not _constant_time_compare(parts[0], "Bearer"):
         raise HTTPException(status_code=401, detail="Authorization 格式错误,应为 Bearer <key>")
     raw_key = parts[1].strip()
     if not raw_key:

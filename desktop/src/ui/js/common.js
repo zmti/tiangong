@@ -9,9 +9,13 @@
     let panelOpen = false;
 
     const TOOL_ICONS = {
-      read: '📖', write: '✏️', exec: '▶️', search: '🔍', browser: '🌐',
+      read: '📖', write: '✏️', edit: '🔧', exec: '▶️', search: '🔍', browser: '🌐',
       edit: '🔧', system: '⚙️', tool: '🔨', file: '📄', code: '💻',
       generate_image: '🖼️', python: '🐍', shell: '⚡', plan: '📋',
+      read_file: '📖', write_file: '✏️', edit_file: '🔧',
+      run_terminal: '⚡', run_code: '💻', git: '📦',
+      code_search: '🔎', file_search: '🔍',
+      fetch_content: '🌐', delegate_task: '🔀', save_memory: '🧠', search_memory: '🔎',
     };
     function getIcon(name) {
       const n = (name || '').toLowerCase();
@@ -19,6 +23,23 @@
         if (n.includes(k)) return v;
       }
       return '🔨';
+    }
+
+    // 从工具参数中提取关键路径/命令
+    function extractDetail(name, args) {
+      try {
+        const obj = typeof args === 'string' ? JSON.parse(args) : args;
+        if (!obj || typeof obj !== 'object') return null;
+        if (name === 'read_file' || name === 'read') return '📖 ' + (obj.path || obj.file || obj.filePath || '');
+        if (name === 'write_file' || name === 'write') return '✏️ ' + (obj.path || obj.file || obj.filePath || '');
+        if (name === 'edit_file' || name === 'edit') return '🔧 ' + (obj.path || obj.file || obj.filePath || '');
+        if (name === 'run_terminal' || name === 'exec') return '⚡ ' + (obj.command || obj.cmd || '');
+        if (name === 'run_code' || name === 'python') return '💻 执行代码';
+        if (name.startsWith('git_')) return '📦 Git ' + name.replace('git_', '');
+        if (name === 'code_search' || name === 'search') return '🔍 ' + (obj.query || obj.q || '');
+        if (name === 'file_search') return '🔍 文件搜索';
+        return null;
+      } catch (_) { return null; }
     }
 
     function getElapsed(ms) {
@@ -29,6 +50,8 @@
 
     function ensurePanel() {
       if (!panelOpen) {
+        const fd = document.getElementById('featureDialog');
+        if (fd && !fd.hidden) return;
         document.body.classList.add('exec-panel-open');
         panelOpen = true;
         const traceTab = document.querySelector('.exec-tab[data-tab="trace"]');
@@ -46,19 +69,27 @@
       const running = steps.filter(s => s.status === 'running').length;
       const done = steps.filter(s => s.status === 'done').length;
       const failed = steps.filter(s => s.status === 'fail').length;
-      let html = '<div class="exec-trace-header" style="padding:8px 12px;font-size:12px;color:var(--muted);border-bottom:1px solid var(--border);">'
-        + '<span>' + done + '✓</span><span style="margin:0 6px;">·</span>'
-        + '<span style="color:var(--err)">' + failed + '✗</span><span style="margin:0 6px;">·</span>'
-        + '<span style="color:var(--primary)">' + running + '⏳</span><span style="margin:0 6px;">·</span>'
-        + '<span>' + getElapsed(Date.now() - startTime) + '</span></div>';
+      let html = '<div class="exec-trace-header">'
+        + '<span style="color:var(--ok)">' + done + '✓</span>'
+        + '<span style="margin:0 4px;color:var(--muted)">·</span>'
+        + '<span style="color:var(--err)">' + failed + '✗</span>'
+        + '<span style="margin:0 4px;color:var(--muted)">·</span>'
+        + '<span style="color:var(--primary)">' + running + '⏳</span>'
+        + '<span style="margin:0 4px;color:var(--muted)">·</span>'
+        + '<span>' + getElapsed(Date.now() - startTime) + '</span>'
+        + '</div>';
       html += '<div class="exec-trace-list">';
       for (const s of steps) {
         const cls = s.status === 'fail' ? 'et-fail' : s.status === 'running' ? 'et-running' : 'et-done';
+        const detail = s.detail || '';
         html += '<div class="exec-trace-item ' + cls + '" title="' + App.escapeHtml(s.args || '') + '">'
           + '<span class="exec-trace-icon">' + s.icon + '</span>'
+          + '<div class="exec-trace-item-body">'
           + '<span class="exec-trace-name">' + App.escapeHtml(s.name) + '</span>'
+          + (detail ? '<span class="exec-trace-detail">' + App.escapeHtml(detail) + '</span>' : '')
+          + '</div>'
           + '<span class="exec-trace-status">' + (s.status === 'running' ? '⏳' : s.status === 'fail' ? '✗' : '✓') + '</span>'
-          + '<span class="exec-trace-time">' + s.time + '</span></div>';
+          + '<span class="exec-trace-time">' + s.elapsed_str + '</span></div>';
       }
       html += '</div>';
       listEl.innerHTML = html;
@@ -74,7 +105,12 @@
     function addStep(name, args, status) {
       const icon = getIcon(name);
       const elapsed = Date.now() - startTime;
-      steps.push({ name, icon, status: status || 'running', args, time: new Date().toLocaleTimeString(), elapsed });
+      const detail = extractDetail(name, args);
+      steps.push({
+        name, icon, status: status || 'running', args,
+        time: new Date().toLocaleTimeString(),
+        elapsed, elapsed_str: getElapsed(elapsed), detail
+      });
       ensurePanel();
       renderList();
     }
@@ -85,6 +121,7 @@
       step.status = status;
       step.result = result;
       step.elapsed = Date.now() - startTime;
+      step.elapsed_str = getElapsed(step.elapsed);
       renderList();
     }
 

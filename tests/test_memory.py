@@ -1,12 +1,26 @@
 """长期记忆、会话摘要、模型路由、JSON 解析测试。"""
 import json
+from pathlib import Path
 
 from app.core.llm import _extract_json
 from app.core.router import classify_task
+from app.core.storage_backend import reset_storage_backend
 from app.memory.ltm import MemoryStore
 
 
+def run(coro):
+    import asyncio
+    return asyncio.run(coro)
+
+
+def _reset_ltm():
+    import app.memory.ltm as ltm_mod
+    ltm_mod._instance = None
+    reset_storage_backend()
+
+
 def test_memory_save_and_search():
+    _reset_ltm()
     store = MemoryStore(db_path=":memory:")
     store.save("用户偏好:喜欢喝茶", keywords=["茶", "偏好"])
     store.save("项目将于下月上线", keywords=["项目", "上线"], source="auto")
@@ -20,14 +34,16 @@ def test_memory_save_and_search():
 
 
 def test_memory_delete_and_stats():
+    _reset_ltm()
     store = MemoryStore(db_path=":memory:")
     rec = store.save("临时记忆内容", keywords=["临时"])
-    assert store.stats()["total"] == 1
-    assert store.delete(rec["id"]) is True
-    assert store.stats()["total"] == 0
+    assert run(store.stats())["total"] == 1
+    assert run(store.delete(rec["id"])) is True
+    assert run(store.stats())["total"] == 0
 
 
 def test_memory_scope_filter():
+    _reset_ltm()
     store = MemoryStore(db_path=":memory:")
     store.save("会话专属记忆", scope="session", session_id="s1")
     # global 作用域搜索不命中 session 记忆
@@ -39,15 +55,16 @@ def test_memory_scope_filter():
 
 
 def test_memory_hit_count_increments_on_search():
+    _reset_ltm()
     store = MemoryStore(db_path=":memory:")
     rec = store.save("用户叫张三", keywords=["张三"])
-    assert store.stats()["hits"] == 0
+    assert run(store.stats())["hits"] == 0
     store.search("张三", count_hit=True)
     store.search("张三", count_hit=True)
-    assert store.stats()["hits"] == 2
+    assert run(store.stats())["hits"] == 2
     # 不指定 count_hit 时不计数
     store.search("张三")
-    assert store.stats()["hits"] == 2
+    assert run(store.stats())["hits"] == 2
 
 
 def test_memory_tool_session_aware():
@@ -97,7 +114,7 @@ def test_memory_tool_save_session_uses_current_session():
             _current_session.reset(token)
     finally:
         ltm_mod._instance = old
-    rows = store.list(scope="session")
+    rows = run(store.list(scope="session"))
     assert rows and rows[0]["session_id"] == "sx"
 
 

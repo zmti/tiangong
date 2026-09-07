@@ -85,8 +85,8 @@ async def download_export(session_id: str) -> FileResponse:
 async def import_session(session_id: str, file_path: str = Query(..., description="JSONL 文件绝对路径")) -> dict:
     """从 JSONL 文件导入会话消息(安全限制:仅限 data 目录内)。"""
     data_dir = settings.resolved_data_dir
-    abs_path = os.path.abspath(file_path)
-    if not abs_path.startswith(data_dir):
+    abs_path = os.path.realpath(file_path)
+    if not abs_path.startswith(os.path.realpath(data_dir) + os.sep) and abs_path != os.path.realpath(data_dir):
         raise HTTPException(status_code=403, detail="仅允许导入 data 目录内的文件")
     if not os.path.isfile(abs_path):
         raise HTTPException(status_code=404, detail=f"文件不存在: {abs_path}")

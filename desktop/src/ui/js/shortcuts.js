@@ -3,6 +3,7 @@ App.Shortcuts = {};
 
 const KEYBOARD_SHORTCUTS = [
   { keys: ['Alt', 'Shift', 'Space'], desc: '唤出 / 隐藏窗口' },
+  { keys: ['Ctrl', 'K'], desc: '打开命令面板' },
   { keys: ['Enter'], desc: '发送消息' },
   { keys: ['Shift', 'Enter'], desc: '换行' },
   { keys: ['/'], desc: '唤起提示词库' },

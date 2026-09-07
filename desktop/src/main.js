@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, globalShortcut, nativeImage, desktopCapturer, screen } = require('electron');
+﻿const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, globalShortcut, nativeImage, desktopCapturer, screen } = require('electron');
 const { spawn, execFileSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
@@ -10,6 +10,7 @@ app.commandLine.appendSwitch('disable-gpu');
 app.commandLine.appendSwitch('disable-gpu-compositing');
 app.commandLine.appendSwitch('no-proxy-server');
 app.commandLine.appendSwitch('no-sandbox');
+app.commandLine.appendSwitch('remote-debugging-port', '9222');
 
 const BACKEND_PORT = 8517;
 const BACKEND_URL = `http://127.0.0.1:${BACKEND_PORT}`;
@@ -22,6 +23,7 @@ let isQuitting = false;
 let backendRestartCount = 0; // 连续崩溃自动重启次数
 let backendRestartTimer = null;
 let backendUpTimer = null;
+let backendGaveUp = false; // 已放弃自动重启,需手动重启
 
 // 程序化生成托盘图标(16x16 紫色圆角方块,中心白点),避免依赖外部 .ico 资源
 function createTrayIcon() {
@@ -216,29 +218,62 @@ function startBackend() {
     console.log('[backend] exited', code);
     notifyRenderer('backend-status', { running: false, restarts: backendRestartCount });
     // 正常退出(托盘退出流程)不再拉起;异常退出则自动重启,连续多次失败后放弃
-    if (isQuitting) return;
+    if (isQuitting || backendGaveUp) return;
     if (backendRestartCount >= 5) {
       console.error('[backend] 连续重启失败,停止自动拉起');
       notifyRenderer('backend-status', { running: false, restarts: backendRestartCount, gaveUp: true });
+      backendGaveUp = true;
       return;
     }
     clearTimeout(backendRestartTimer);
+    // 退避: 每次重启等待时间递增 (800ms, 1600ms, 3200ms, ...)
+    const backoff = Math.min(800 * Math.pow(2, backendRestartCount), 10000);
     backendRestartTimer = setTimeout(async () => {
-      console.log('[backend] 检测到异常退出,自动重启中...');
+      console.log(`[backend] 检测到异常退出,自动重启中... (第${backendRestartCount + 1}次, 退避${backoff}ms)`);
       const started = startBackend();
       if (!started) {
         notifyRenderer('backend-status', { running: false, restarts: backendRestartCount, gaveUp: true });
+        backendGaveUp = true;
         return;
       }
       backendRestartCount++;
       const ok = await waitForBackend(25000);
       if (ok) {
+        backendRestartCount = 0; // 重启成功后重置计数
+        backendGaveUp = false;
         armUptimeReset();
         notifyRenderer('backend-status', { running: true, restarts: backendRestartCount, restarted: true });
       } else {
-        notifyRenderer('backend-status', { running: false, restarts: backendRestartCount, gaveUp: true });
+        console.error(`[backend] 重启后无法连接,等待${backoff}ms后重试`);
+        // 不重置计数,也不放弃,继续尝试(最多5次)
+        notifyRenderer('backend-status', { running: false, restarts: backendRestartCount, gaveUp: false });
+        // 安排下一次重试(使用退避)
+        const nextBackoff = Math.min(800 * Math.pow(2, backendRestartCount), 10000);
+        backendRestartTimer = setTimeout(async () => {
+          if (isQuitting || backendGaveUp) return;
+          console.log(`[backend] 重试重启... (第${backendRestartCount + 1}次, 退避${nextBackoff}ms)`);
+          const started = startBackend();
+          if (!started) {
+            backendGaveUp = true;
+            notifyRenderer('backend-status', { running: false, restarts: backendRestartCount, gaveUp: true });
+            return;
+          }
+          const ok = await waitForBackend(25000);
+          if (ok) {
+            backendRestartCount = 0;
+            backendGaveUp = false;
+            armUptimeReset();
+            notifyRenderer('backend-status', { running: true, restarts: backendRestartCount, restarted: true });
+          } else {
+            backendRestartCount++;
+            if (backendRestartCount >= 5) {
+              backendGaveUp = true;
+              notifyRenderer('backend-status', { running: false, restarts: backendRestartCount, gaveUp: true });
+            }
+          }
+        }, nextBackoff);
       }
-    }, 800);
+    }, backoff);
   });
   return true;
 }
@@ -313,6 +348,16 @@ function createWindow() {
 
   mainWindow.on('closed', () => {
     mainWindow = null;
+  });
+
+  // // 自动打开 DevTools
+  mainWindow.webContents.on('did-finish-load', () => { mainWindow.webContents.openDevTools({ mode: 'detach' }); });
+  // F12 打开 DevTools 便于调试
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    if (input.key === 'F12') {
+      event.preventDefault();
+      mainWindow.webContents.openDevTools({ mode: 'detach' });
+    }
   });
 
   // 点关闭按钮 → 隐藏到托盘(后台常驻),真正退出走托盘菜单/全局退出
@@ -416,10 +461,14 @@ app.whenReady().then(async () => {
 
   // 兜底看护:复用外部后端(backendProcess 为 null)异常死亡时,尝试自行拉起
   setInterval(async () => {
-    if (isQuitting) return;
+    if (isQuitting || backendGaveUp) return;
     const up = await checkHealthFast();
     if (up) {
-      if (backendRestartCount > 0) armUptimeReset();
+      if (backendRestartCount > 0) {
+        backendRestartCount = 0;
+        backendGaveUp = false;
+        armUptimeReset();
+      }
       return;
     }
     if (backendProcess) return; // 自有进程的异常退出由 exit 处理器负责拉起
@@ -429,10 +478,12 @@ app.whenReady().then(async () => {
     if (started) {
       const alive = await waitForBackend(25000);
       if (alive) {
+        backendRestartCount = 0;
+        backendGaveUp = false;
         armUptimeReset();
         notifyRenderer('backend-status', { running: true, restarts: backendRestartCount, restarted: true });
       } else {
-        notifyRenderer('backend-status', { running: false, restarts: backendRestartCount, gaveUp: true });
+        notifyRenderer('backend-status', { running: false, restarts: backendRestartCount, gaveUp: false });
       }
     }
   }, 15000);
@@ -460,6 +511,11 @@ ipcMain.handle('get-backend-url', () => BACKEND_URL);
 
 // IPC: 手动重启后端(设置页入口)
 ipcMain.handle('restart-backend', async () => {
+  // 清除之前的重启计时器
+  clearTimeout(backendRestartTimer);
+  // 重置状态
+  backendRestartCount = 0;
+  backendGaveUp = false;
   if (!backendProcess) {
     return { ok: false, reason: '后端由其他实例托管,请先退出后在重启' };
   }
@@ -478,6 +534,23 @@ ipcMain.handle('restart-backend', async () => {
 });
 ipcMain.handle('get-backend-status', () => (backendProcess ? 'running' : 'stopped'));
 ipcMain.handle('get-backend-api-key', () => backendApiKey);
+
+// IPC: 打开文件夹选择对话框
+ipcMain.handle('open-folder-dialog', async () => {
+  try {
+    const result = await dialog.showOpenDialog({
+      properties: ['openDirectory'],
+      title: '选择项目文件夹',
+    });
+    if (result.canceled || !result.filePaths.length) {
+      return { canceled: true };
+    }
+    return { path: result.filePaths[0] };
+  } catch (e) {
+    console.error('[open-folder-dialog]', e);
+    return { error: e.message };
+  }
+});
 
 // IPC: 截屏整块屏幕(主显示),返回 PNG dataURL 供渲染进程直接做图片识别
 ipcMain.handle('capture-screen', async () => {
@@ -499,3 +572,4 @@ ipcMain.handle('capture-screen', async () => {
     return null;
   }
 });
+

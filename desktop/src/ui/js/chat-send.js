@@ -1,10 +1,23 @@
 /* 聊天核心发送模块:模式参数 / 发送 / 重新生成 / 编辑 */
-App.Chat = {};
+App.Chat = App.Chat || {};
+
+/* 引用回复状态 */
+App._replyQuote = null;
+
+App.Chat.setReplyQuote = function(text) {
+  App._replyQuote = text;
+  App.updateReplyIndicator && App.updateReplyIndicator(text);
+};
+
+App.Chat.clearReplyQuote = function() {
+  App._replyQuote = null;
+  App.updateReplyIndicator && App.updateReplyIndicator(null);
+};
 
 /* 组装协作模式参数:统一从 App.Mode(单一状态源)读取,UI 控件的改动已同步进该状态 */
 App.Chat.modeParams = function () {
   if (App.Mode && App.Mode.params) return App.Mode.params();
-  return { mode: (App.els.modeSelect && App.els.modeSelect.value) || 'auto' };
+  return { mode: 'auto' };
 };
 
 App.Chat.send = async function () {
@@ -44,12 +57,17 @@ App.Chat.regenerate = async function (wrap) {
     }
   }
   if (!userText) return;
+  const confirm = App.confirm;
+  if (confirm) {
+    const ok = await confirm('将删除此回复后的所有消息，确定重新生成？', { okText: '重新生成' });
+    if (!ok) return;
+  }
   const cutFrom = userNode ? nodes.indexOf(userNode) + 1 : baseIdx + 1;
   for (let i = nodes.length - 1; i >= cutFrom; i--) nodes[i].remove();
   App.lastUserText = userText;
   App._lastUserWrap = userNode;
   App.showTyping();
-  await App.Chat.doSend(userText, { skipAppendUser: true });
+  App.Chat.doSend(userText, { skipAppendUser: true });
 };
 
 /* 编辑用户消息:气泡转输入框,保存后重发 */
@@ -90,5 +108,4 @@ App.Chat.editMessage = async function (wrap, bubble) {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); finish(true); }
     else if (e.key === 'Escape') { finish(false); }
   });
-  input.addEventListener('blur', () => finish(true));
 };

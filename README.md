@@ -435,3 +435,5 @@ def query_weather(city: str = Field(description="城市名"), days: int = Field(
 - **跨会话失败记忆**:`app/memory/failure_memory.py`,自动记录工具失败模式并注入下次会话;API:`GET /v1/failure-memory`、`GET /v1/failure-memory/tools/{name}`、`POST /v1/failure-memory/hints/{id}`
 - **任务 Webhook 回调**:`WEBHOOK_URLS` 配置后,对话/后台任务完成异步推送 HTTP 通知;支持 HMAC 签名
 - **文件锁**:`app/core/file_lock.py`,防止多 Agent 并发修改同一文件;API:`GET /v1/file-locks`、`POST /v1/file-locks/cleanup`
+
+

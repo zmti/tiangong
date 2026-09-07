@@ -334,13 +334,16 @@ _backend_lock = threading.Lock()
 def get_storage_backend(
     backend: str = "auto",
     db_path: str | Path | None = None,
+    *,
+    memory_mode: bool = False,
 ) -> StorageBackend:
     """获取存储后端实例（单例）
-    
+
     Args:
         backend: "auto" | "sqlite" | "redis" | "postgresql"
         db_path: 数据库路径，None 时使用默认路径
-    
+        memory_mode: 是否使用 SQLite 内存模式（用于测试）
+
     Returns:
         StorageBackend 实例
     """
@@ -382,7 +385,7 @@ def get_storage_backend(
         # 默认 SQLite
         if db_path is None:
             db_path = DEFAULT_DATA_DIR / "storage.db"
-        _backend_cache = SqliteBackend(db_path)
+        _backend_cache = SqliteBackend(db_path, memory_mode=memory_mode)
         logger.info(f"使用 SQLite 存储后端: {db_path}")
         return _backend_cache
 

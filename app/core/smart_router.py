@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 from typing import Optional
 
@@ -65,22 +66,70 @@ def _get_routing_stats() -> dict:
 _KEYWORD_INDEX: dict[str, list[str]] = {}
 
 
-def _build_keyword_index(registry) -> None:
-    """构建关键词→工具名索引。"""
+async def _build_keyword_index(registry) -> None:
+    """构建关键词→工具名索引(使用智能分词)。
+
+    支持中英文混合:提取 ASCII 单词和中文词语(2-4字符)。
+    """
     global _KEYWORD_INDEX
     _KEYWORD_INDEX = {}
-    for tool in registry.list():
+    async for tool in registry.list():
         desc_lower = (tool.description or "").lower()
         name_lower = tool.name.lower()
-        keywords = re.findall(r"[a-z_]{3,}", desc_lower + " " + name_lower)
+        combined = desc_lower + " " + name_lower
+        # 使用智能分词提取关键词
+        keywords = _smart_tokenize(combined)
         for kw in keywords:
             _KEYWORD_INDEX.setdefault(kw, []).append(tool.name)
+
+
+# ── 缓存:避免每次路由重建索引 ──────────────────────────────────
+_keyword_index_lock = threading.Lock()
+_keyword_index_key = None  # 上次构建时 registry 的工具数量
+
+
+# ── 中文智能分词 ──────────────────────────────────────────────────
+def _smart_tokenize(text: str) -> list[str]:
+    """智能分词:支持中英文混合,提取有意义的关键词。
+
+    策略:
+    1. ASCII单词(3字符以上)直接提取
+    2. 中文字符按2-4字符切分,避免过长短语导致匹配失败
+    3. 额外提取常见动词(写/读/编辑/创建等),确保关键动作不丢失
+    4. 合并去重,保留最长匹配
+    """
+    tokens: list[str] = []
+    # 1. 提取ASCII单词
+    ascii_words = re.findall(r"[a-z_]{3,}", text.lower())
+    tokens.extend(ascii_words)
+    # 2. 提取中文词语(按2-4字符切分)
+    cn_chars = re.findall(r"[一-龥]+", text)
+    for chunk in cn_chars:
+        if len(chunk) >= 2:
+            # 滑动窗口切分:优先保留4字符,其次3字符,最后2字符
+            for size in (4, 3, 2):
+                for i in range(0, len(chunk) - size + 1):
+                    word = chunk[i: i + size]
+                    if len(word) >= 2 and word not in tokens:
+                        tokens.append(word)
+    # 3. 额外提取常见动词(解决关键动词丢失问题)
+    common_verbs = [
+        "写", "读", "编辑", "创建", "删除", "搜索", "运行", "执行",
+        "分析", "生成", "下载", "上传", "查看", "修改", "保存",
+    ]
+    for verb in common_verbs:
+        if verb in text and verb not in tokens:
+            tokens.append(verb)
+    return tokens
 
 
 # ── 置信度评分 ────────────────────────────────────────────────────
 def _score_tool(query: str, tool_name: str, tool_desc: str,
                 user_tech_stack: list[str] = None) -> float:
-    """多维度工具评分:关键词匹配 + 类别匹配 + 技术栈加权。"""
+    """多维度工具评分:智能分词匹配 + 类别匹配 + 技术栈加权。
+
+    改进:使用 _smart_tokenize 替代原来的 word-boundary 模式,正确处理中英文混合查询。
+    """
     score = 0.0
     q_lower = query.lower()
     d_lower = tool_desc.lower()
@@ -89,19 +138,20 @@ def _score_tool(query: str, tool_name: str, tool_desc: str,
     # 1. 精确关键词匹配(最高权重)
     if t_lower in q_lower:
         score += 0.5
-    # 描述词匹配
-    words = re.findall(r"\b\w+\b", q_lower)
-    for w in words:
-        if len(w) >= 4 and w in d_lower:
+    # 2. 智能分词匹配(替代原来的 word-boundary 模式,支持中文)
+    query_tokens = _smart_tokenize(query)
+    for token in query_tokens:
+        # 允许单字符动词(写/读/搜/运行等)匹配,提升评分灵敏度
+        if len(token) >= 1 and token in d_lower:
             score += 0.1
 
-    # 2. 类别匹配
+    # 3. 类别匹配
     category = get_category(tool_name)
     category_keywords = {
-        "代码": ["代码", "编程", "开发", "函数", "类", "脚本"],
-        "文件": ["文件", "读取", "写入", "编辑", "目录"],
-        "网络": ["搜索", "网页", "网站", "curl", "http"],
-        "视觉": ["图片", "图像", "截图", "ocr", "分析"],
+        "代码": ["代码", "编程", "开发", "函数", "类", "脚本", "后端", "前端", "接口"],
+        "文件": ["文件", "读取", "写入", "编辑", "目录", "路径"],
+        "网络": ["搜索", "网页", "网站", "curl", "http", "下载", "上传"],
+        "视觉": ["图片", "图像", "截图", "ocr", "分析", "生成"],
         "记忆": ["记忆", "记住", "存储"],
         "规划": ["计划", "任务", "步骤", "分解"],
     }
@@ -110,7 +160,7 @@ def _score_tool(query: str, tool_name: str, tool_desc: str,
             score += 0.15
             break
 
-    # 3. 技术栈加权
+    # 4. 技术栈加权
     if user_tech_stack:
         tech_lower = [t.lower() for t in user_tech_stack]
         for tech in tech_lower:
@@ -122,10 +172,11 @@ def _score_tool(query: str, tool_name: str, tool_desc: str,
 
 # ── Embedding 路由(第二级) ────────────────────────────────────────
 _EMBEDDING_CACHE: dict[str, tuple[list[float], str]] = {}
+_MAX_EMBEDDING_CACHE = 500  # 防止内存无限增长
 
 
 def _get_embedding(query: str) -> Optional[list[float]]:
-    """获取 query 的 embedding(带缓存)。"""
+    """获取 query 的 embedding(带缓存,LRU 淘汰)。"""
     if query in _EMBEDDING_CACHE:
         vec, cached_query = _EMBEDDING_CACHE[query]
         if cached_query == query:
@@ -134,8 +185,12 @@ def _get_embedding(query: str) -> Optional[list[float]]:
         from app.rag.embeddings import get_embedder, run_embed
         vec = run_embed(get_embedder(), [query])[0]
         _EMBEDDING_CACHE[query] = (vec, query)
+        # LRU: 淘汰最旧的条目
+        if len(_EMBEDDING_CACHE) > _MAX_EMBEDDING_CACHE:
+            _EMBEDDING_CACHE.pop(next(iter(_EMBEDDING_CACHE)))
         return vec
-    except Exception:
+    except Exception as e:
+        logger.debug("embedding 缓存写入失败(非关键): %s", e)
         return None
 
 
@@ -153,8 +208,14 @@ async def select_tools_enhanced(
     """
     user_tech_stack = user_tech_stack or []
 
-    # 0. 构建关键词索引
-    _build_keyword_index(registry)
+    # 0. 构建关键词索引(缓存:仅在 registry 工具数量变化时重建)
+    global _keyword_index_key
+    tool_count = len([t async for t in registry.list()])
+    if _keyword_index_key != tool_count:
+        with _keyword_index_lock:
+            if _keyword_index_key != tool_count:
+                await _build_keyword_index(registry)
+                _keyword_index_key = tool_count
 
     # 1. 第一级:关键词精确匹配(快速路径)
     q_words = re.findall(r"[a-z_]{3,}", user_input.lower())
@@ -165,7 +226,7 @@ async def select_tools_enhanced(
 
     if keyword_hits:
         scored = []
-        for tool in registry.list():
+        async for tool in registry.list():
             if tool.name in SYSTEM_TOOLS or not tool.enabled:
                 continue
             s = keyword_hits.get(tool.name, 0) + _score_tool(
@@ -187,7 +248,7 @@ async def select_tools_enhanced(
             from app.rag.embeddings import get_embedder, run_embed
             from app.rag.store import cosine_similarity
             scored = []
-            for tool in registry.list():
+            async for tool in registry.list():
                 if tool.name in SYSTEM_TOOLS or not tool.enabled:
                     continue
                 desc = (tool.description or "").strip()
@@ -206,7 +267,8 @@ async def select_tools_enhanced(
                     ) * 0.3
                     if final_score >= min_confidence:
                         scored.append((final_score, tool.name))
-                except Exception:
+                except Exception as e:
+                    logger.debug("工具 embedding 计算失败(跳过): %s", e)
                     continue
             scored.sort(key=lambda x: x[0], reverse=True)
             if scored:
@@ -238,7 +300,7 @@ async def select_tools_enhanced(
         if t and t.enabled and n not in SYSTEM_TOOLS and n not in fallback:
             fallback.append(n)
     if len(fallback) < max_tools:
-        for t in registry.list():
+        async for t in registry.list():
             if len(fallback) >= max_tools:
                 break
             if t.name not in SYSTEM_TOOLS and t.enabled and t.name not in fallback:
@@ -317,10 +379,10 @@ def build_routed_llm(message: str, fallback=None):
     return fallback
 
 
-def build_tool_router_index(registry) -> str:
+async def build_tool_router_index(registry) -> str:
     """把注册器里的工具压缩成路由器可读的一行索引。"""
     lines = []
-    for t in registry.list():
+    async for t in registry.list():
         desc = (t.description or "").strip().replace("\n", " ")
         if len(desc) > 80:
             desc = desc[:80] + "…"
@@ -387,7 +449,7 @@ async def select_tools(
     from app.core.llm import LLMError
 
     max_tools = max_tools or settings.agent_tool_router_max_tools
-    index = build_tool_router_index(registry)
+    index = await build_tool_router_index(registry)
     if not index.strip():
         return []
     prompt = [
@@ -411,9 +473,9 @@ async def select_tools(
         selected = []
 
     if not selected:
-        selected = select_tools_by_embedding(user_input, registry, max_tools)
+        selected = await select_tools_by_embedding(user_input, registry, max_tools)
 
-    known = {t.name for t in registry.list()}
+    known = {t.name for t in await registry.list()}
     valid = []
     for name in selected:
         name = name.strip()
@@ -422,7 +484,7 @@ async def select_tools(
     return valid[:max_tools]
 
 
-def select_tools_by_embedding(
+async def select_tools_by_embedding(
     user_input: str,
     registry,
     max_tools: int = 10,
@@ -432,16 +494,18 @@ def select_tools_by_embedding(
     try:
         from app.rag.embeddings import get_embedder, run_embed
         from app.rag.store import cosine_similarity
-    except Exception:
+    except Exception as e:
+        logger.warning("embedding 模块不可用,降级为关键词路由: %s", e)
         return []
 
     try:
         query_vec = run_embed(get_embedder(), [user_input])[0]
-    except Exception:
+    except Exception as e:
+        logger.warning("查询 embedding 失败,降级: %s", e)
         return []
 
     scored = []
-    for tool in registry.list():
+    async for tool in registry.list():
         if tool.name in SYSTEM_TOOLS or not tool.enabled:
             continue
         desc = (tool.description or "").strip()
@@ -452,7 +516,8 @@ def select_tools_by_embedding(
             sim = cosine_similarity(query_vec, tool_vec)
             if sim >= min_similarity:
                 scored.append((sim, tool.name))
-        except Exception:
+        except Exception as e:
+            logger.debug("工具 embedding 计算失败(跳过): %s", e)
             continue
 
     scored.sort(key=lambda x: x[0], reverse=True)

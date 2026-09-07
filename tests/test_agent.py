@@ -11,11 +11,19 @@ class MockLLM(LLMClient):
     """Mock LLM:第一次返回工具调用,第二次返回最终回答。"""
 
     def __init__(self, responses):
+        # 不调用 super().__init__(),直接设置所有必要属性避免真实 API 调用
         self._responses = list(responses)
         self._i = 0
         self.provider = "mock"
         self.model = "mock-model"
         self.client = None  # 供 _native_enabled 检查(有 client 才启用原生 tool calling)
+        self._custom = None
+        self._api_key = ""
+        self._initial_provider = self.provider
+        self._circuit_fails: dict[str, int] = {}
+        self._circuit_open_until: dict[str, float] = {}
+        self.last_usage = None
+        self._reasoning = ""
 
     async def chat(self, messages, temperature=0.7):
         resp = self._responses[min(self._i, len(self._responses) - 1)]
@@ -33,11 +41,19 @@ class NativeMockLLM(LLMClient):
     """Mock LLM:模拟原生 function calling(tool_calls)。"""
 
     def __init__(self, responses):
+        # 不调用 super().__init__(),直接设置所有必要属性避免真实 API 调用
         self._responses = list(responses)
         self._i = 0
         self.provider = "native-mock"
         self.model = "mock-model"
         self.client = object()  # 模拟原生 client 存在,启用原生 tool calling 路径
+        self._custom = None
+        self._api_key = ""
+        self._initial_provider = self.provider
+        self._circuit_fails: dict[str, int] = {}
+        self._circuit_open_until: dict[str, float] = {}
+        self.last_usage = None
+        self._reasoning = ""
 
     async def chat_with_tools(self, messages, tools=None, temperature=0.7):
         resp = self._responses[min(self._i, len(self._responses) - 1)]
@@ -92,8 +108,19 @@ class RouterLLM(MockLLM):
     """模拟支持 chat_json 的真实 LLM,provider 非 mock 以触发工具路由。"""
 
     def __init__(self, responses, selected_tools=None, fail_json=False):
-        super().__init__(responses)
+        # 不调用 super().__init__(),直接设置所有必要属性避免真实 API 调用
+        self._responses = list(responses)
+        self._i = 0
         self.provider = "router-test"
+        self.model = "mock-model"
+        self.client = None
+        self._custom = None
+        self._api_key = ""
+        self._initial_provider = self.provider
+        self._circuit_fails: dict[str, int] = {}
+        self._circuit_open_until: dict[str, float] = {}
+        self.last_usage = None
+        self._reasoning = ""
         self._selected_tools = list(selected_tools or [])
         self._fail_json = fail_json
 

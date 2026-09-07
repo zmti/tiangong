@@ -8,11 +8,14 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
 from typing import Callable, Optional
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 class FileEvent:
@@ -112,8 +115,8 @@ class FileWatcher:
         while self._running:
             try:
                 self._scan_once()
-            except Exception:  # noqa: BLE001
-                pass  # 扫描异常不应停止监听器
+            except Exception:
+                logger.exception("文件监听器扫描异常,跳过本次轮询")
             time.sleep(self._poll_interval)
 
     def _scan_once(self) -> None:
@@ -179,8 +182,8 @@ class FileWatcher:
         for cb in cbs:
             try:
                 cb(event)
-            except Exception:  # noqa: BLE001
-                pass  # 回调异常不应影响其他回调
+            except Exception:
+                logger.warning("文件监听回调异常,继续其他回调: %s", e)
 
     @staticmethod
     def _is_noise(path: str) -> bool:

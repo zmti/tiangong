@@ -117,10 +117,39 @@ class MultiAgentOrchestrator:
                     dependencies=[str(d) for d in t.get("dependencies", [])],
                 )
                 tasks.append(task_obj)
+            # 隐式依赖检测:分析子任务描述中的文件路径,有重叠的自动添加依赖
+            tasks = self._resolve_implicit_dependencies(tasks)
             return tasks
         except Exception as e:
             logger.error(f"任务分解失败: {e}")
             return [SubTask(description=task, assigned_agent="default")]
+
+    @staticmethod
+    def _resolve_implicit_dependencies(tasks: list["SubTask"]) -> list["SubTask"]:
+        """检测隐式依赖:多个子任务操作同一文件则自动建立依赖。"""
+        import re
+        # 提取文件路径:匹配绝对路径和相对路径
+        # 支持: src/app.py, /etc/passwd, C:\project\main.py
+        path_pattern = re.compile(
+            r'(?:(?:^|[\s\x27\x22])([a-zA-Z]:[/\\\\][\w./\\\\-]+\.(?:py|js|ts|go|rs|java|c|cpp|h|json|yaml|yml|md|txt|sql|html|css)|'
+            r'[\w][\w./\\\\-]+\.(?:py|js|ts|go|rs|java|c|cpp|h|json|yaml|yml|md|txt|sql|html|css)))(?=[\s\x27\x22]|$)'
+        )
+        file_map: dict[str, list[int]] = {}  # 文件路径 → 子任务索引
+        for i, task in enumerate(tasks):
+            paths = path_pattern.findall(task.description)
+            for p in paths:
+                file_map.setdefault(p, []).append(i)
+        # 对共享文件的任务添加依赖
+        added = set()
+        for paths, indices in file_map.items():
+            if len(indices) < 2:
+                continue
+            for i in range(1, len(indices)):
+                dep_key = (indices[i], indices[i - 1])
+                if dep_key not in added:
+                    tasks[indices[i]].dependencies.append(str(indices[i - 1]))
+                    added.add(dep_key)
+        return tasks
 
     def _build_agent_descriptions(self) -> str:
         """构建 Agent 描述文本"""
@@ -159,12 +188,22 @@ class MultiAgentOrchestrator:
         return best_agent or list(self._agents.keys())[0] if self._agents else "default"
 
     def _topological_sort(self, tasks: list[SubTask]) -> list[SubTask]:
-        """拓扑排序(按依赖关系)"""
+        """拓扑排序(按依赖关系)。
+
+        依赖 ID 处理:支持字符串索引("0"/"1"/...) 和 SubTask.id(UUID hex)。
+        同时过滤自引用和越界依赖。
+        """
+        # 建立索引字符串 → SubTask 的映射
+        index_map = {str(i): t for i, t in enumerate(tasks)}
         task_map = {t.id: t for t in tasks}
+        # 合并两个 map
+        all_map = {**index_map, **task_map}
+
         in_degree = {t.id: 0 for t in tasks}
         for t in tasks:
             for dep in t.dependencies:
-                if dep in in_degree:
+                dep_task = all_map.get(dep)
+                if dep_task and dep_task != t:  # 过滤自引用
                     in_degree[t.id] += 1
 
         queue = [t for t in tasks if in_degree[t.id] == 0]
@@ -173,7 +212,8 @@ class MultiAgentOrchestrator:
             task = queue.pop(0)
             result.append(task)
             for t in tasks:
-                if task.id in t.dependencies:
+                # 检查 task.id 是否出现在 t 的依赖中(支持 UUID 和索引)
+                if task.id in t.dependencies or str(tasks.index(task)) in t.dependencies:
                     in_degree[t.id] -= 1
                     if in_degree[t.id] == 0:
                         queue.append(t)

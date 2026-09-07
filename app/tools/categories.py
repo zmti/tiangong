@@ -33,7 +33,6 @@ TOOL_CATEGORIES: dict[str, str] = {
     "list_directory": "文件",
     "read_document": "文件",
     "write_file": "文件",
-    "edit_file": "文件",
     "file_history": "文件",
     "file_restore": "文件",
     "file_undo": "文件",
@@ -166,13 +165,12 @@ TOOL_CATEGORIES: dict[str, str] = {
     # ---- AST 编辑 ----
     "ast_edit": "代码",
     # ---- 结构化代码编辑 ----
-    "read_file": "文件",
+    "read_file": "代码",
     "edit_file": "代码",
     "apply_patch": "代码",
     "check_syntax": "代码",
     "count_lines": "代码",
     "find_functions": "代码",
-    # ---- 成本追踪 ----
     "cost_summary": "成本",
     "cost_report": "成本",
     "cost_daily_trend": "成本",
@@ -181,13 +179,16 @@ TOOL_CATEGORIES: dict[str, str] = {
     "screenshot_ocr": "视觉",
 }
 
-# 系统级工具:无论任务如何都常驻(规划与记忆基础设施),不参与路由裁剪
+# 系统级工具:无论任务如何都常驻(规划与记忆基础设施 + 文件/代码执行工具)
+# 这些工具不参与路由裁剪,确保修复/修改类任务能正常执行
 SYSTEM_TOOLS: tuple[str, ...] = (
+    # 规划与记忆基础设施
     "set_plan",
     "update_plan",
     "memory_save",
     "memory_search",
     "memory_forget",
+    "memory_update",
     "memory_list",
     "memory_stats",
     "delegate_task",
@@ -196,9 +197,16 @@ SYSTEM_TOOLS: tuple[str, ...] = (
     "file_list_watches",
     "cost_summary",
     "cost_report",
+    "cost_daily_trend",
     # 经验学习基础设施(自动注入,不参与工具路由)
     "_failure_memory_note",
     "_success_memory_note",
+    # 文件/代码执行工具(修复类任务必需,防止路由器遗漏)
+    "read_file",
+    "write_file",
+    "edit_file",
+    "run_code",
+    "run_terminal",
 )
 
 

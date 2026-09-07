@@ -1,1 +1,0 @@
-cat -n desktop/src/ui/js/model_picker.js | sed -n '170,198p'

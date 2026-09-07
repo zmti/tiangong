@@ -50,7 +50,7 @@
       { from: 'agent_theme', to: 'theme', transform: v => v },
       { from: 'agent_mode', to: 'mode', transform: v => v },
       { from: 'agent_provider', to: 'model_provider', transform: v => v },
-      { from: 'agent_session_collapsed', to: 'session_panel_collapsed', transform: v => v === '1' },
+      { from: 'agent_session_collapsed', to: 'sidebar_collapsed', transform: v => v === '1' },
     ];
 
     const raw = localStorage.getItem(STORE_KEY);
@@ -97,9 +97,8 @@
       if (raw) {
         const parsed = JSON.parse(raw);
         if (parsed && typeof parsed === 'object') {
-          _data = { ...getDefault('_custom') }; // 初始化 _custom
+          _data = {};
           Object.keys(SCHEMA).forEach(key => {
-            if (key === '_custom') return;
             const def = getDefault(key);
             if (typeof def === 'object' && !Array.isArray(def)) {
               _data[key] = { ...def, ...(parsed[key] || {}) };

@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 
-from fastapi import APIRouter, Body, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -13,6 +13,7 @@ from app.core.llm import LLMClient, LLMError
 from app.config import settings
 from app.memory.session import get_session_store
 from app.tools.registry import get_registry
+from app.api.security import require_api_key
 
 router = APIRouter(prefix="/v1", tags=["chat"])
 
@@ -516,7 +517,7 @@ async def rename_session(req: RenameRequest) -> dict:
     return {"session_id": req.session_id, "title": req.title[:100].strip(), "ok": True}
 
 
-@router.post("/vision")
+@router.post("/vision", dependencies=[Depends(require_api_key)])
 async def vision(
     file: UploadFile = File(...),
     prompt: str = Form("请描述这张图片的内容"),
@@ -529,6 +530,9 @@ async def vision(
     provider/model 由前端传入(左下角模型选择器的当前选择);
     留空时回退到后端全局配置。
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.info("[Vision] 收到图片识别请求: provider=%s, model=%s, filename=%s", provider, model, file.filename)
     content = await file.read()
     if len(content) > 20 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="图片超过 20MB 限制")
@@ -801,31 +805,63 @@ async def list_providers() -> dict:
             elif pid == "ollama":
                 configured = True
 
+            # 获取该 provider 的模型列表
+            from app.core.provider_registry import list_builtin_ext_models
+            _builtin_models = list(_PROVIDER_DEFAULT_MODELS.get(pid, []))
+            for ext in list_builtin_ext_models(pid):
+                _builtin_models.append({
+                    "id": ext.get("id"),
+                    "name": ext.get("name") or ext.get("id"),
+                    "speed": "",
+                    "quality": "",
+                    "context": ext.get("context"),
+                })
+            _default_model = (
+                settings.deepseek_model if pid == "deepseek"
+                else settings.qwen_model if pid == "qwen"
+                else settings.ollama_model if pid == "ollama"
+                else settings.openai_compat_model if pid == "compat"
+                else "gpt-4o-mini"
+            )
+            for m in _builtin_models:
+                m["default"] = (m.get("id") == _default_model)
+
+            # 获取 base_url 供前端 fetch_models 使用
+            base_url = ""
+            if pid == "deepseek":
+                base_url = settings.deepseek_base_url
+            elif pid == "qwen":
+                base_url = settings.qwen_base_url
+            elif pid == "ollama":
+                base_url = settings.ollama_base_url
+            elif pid == "compat":
+                base_url = settings.openai_compat_base_url
+
             providers.append({
                 "id": pid,
                 "name": next((g["name"] for g in _PROVIDER_GROUPS if pid in g["providers"]), pid),
                 "group": group["id"],
                 "configured": configured,
-                "default_model": (
-                    settings.deepseek_model if pid == "deepseek"
-                    else settings.qwen_model if pid == "qwen"
-                    else settings.ollama_model if pid == "ollama"
-                    else settings.openai_compat_model if pid == "compat"
-                    else "gpt-4o-mini"
-                ),
+                "base_url": base_url,
+                "default_model": _default_model,
+                "models": _builtin_models,
             })
 
     # 自定义 OpenAI 兼容提供商(设置-模型服务中配置)
     from app.core.provider_registry import list_custom, list_models as registry_list_models
 
     for c in list_custom():
+        custom_models = registry_list_models(c["id"])
         providers.append({
             "id": c["id"],
             "name": c["name"],
             "group": "custom",
             "configured": True,
+            "base_url": c.get("base_url", ""),
+            "api_key_masked": c.get("api_key_masked", ""),
             "default_model": c.get("default_model") or c.get("model", ""),
-            "model_count": len(registry_list_models(c["id"])),
+            "models": custom_models,
+            "model_count": len(custom_models),
         })
 
     # 获取当前激活的 provider

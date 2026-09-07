@@ -107,7 +107,14 @@ function renderMarkdown(md) {
     if (!md) return '';
     const text = String(md);
     if (!text.trim()) return '';
-    const cleaned = text.replace(/<thinking[^>]*>[\s\S]*?<\/thinking>/gi, '').trim();
+    // 严格剥离thinking标签(多行、贪婪匹配)
+    let cleaned = text.replace(/<thinking[\s\S]*?<\/thinking>/gi, '').trim();
+    // 也剥离无对应关闭标签的残留 open/close tag
+    cleaned = cleaned.replace(/<thinking[^>]*>/gi, '').replace(/<\/thinking>/gi, '').trim();
+    // thinking 块被移除后通常会前后各留一个空行, 先合并多余的空行(4+ → 2)
+    cleaned = cleaned.replace(/\n[ \t]*\n[ \t]*\n[ \t]*\n+/g, '\n\n');
+    // 然后清理行首行尾空白 + 合并重复空行
+    cleaned = cleaned.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
     const lines = cleaned.replace(/\r\n/g, '\n').split('\n');
     let html = '';
     let inCode = false;

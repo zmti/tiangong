@@ -275,7 +275,7 @@ async def init_mcp_from_config() -> dict:
     import os
 
     manager = get_mcp_manager()
-    manager.reset()
+    await manager.reset()
     servers_config = os.environ.get("MCP_SERVERS", "{}")
 
     try:

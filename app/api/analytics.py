@@ -1,7 +1,10 @@
-"""性能剖析与失败经验接口: profiling / failure_memory / file_lock / webhook 配置。"""
+"""性能剖析与失败经验接口: profiling / failure_memory / file_lock / webhook 配置 / 工具路由缓存 / Checkpoint 统计"""
 from __future__ import annotations
 
 from fastapi import APIRouter, Query
+
+from app.core.tool_route_cache import get_tool_route_cache, clear_tool_route_cache
+from app.runtime.batch_checkpoint import get_batch_checkpoint_manager
 
 router = APIRouter(prefix="/v1", tags=["analytics"])
 
@@ -171,3 +174,86 @@ async def success_memory_clear() -> dict:
     store = get_success_memory()
     count = store.clear()
     return {"cleared": count}
+
+
+# ---- 工具路由缓存接口 ----
+
+@router.get("/tool_route_cache/stats")
+async def tool_route_cache_stats() -> dict:
+    """查看工具路由缓存统计信息。"""
+    cache = get_tool_route_cache()
+    return cache.get_stats()
+
+
+@router.post("/tool_route_cache/clear")
+async def tool_route_cache_clear() -> dict:
+    """清空工具路由缓存。"""
+    await clear_tool_route_cache()
+    return {"cleared": True}
+
+
+# ---- Checkpoint 批量写入统计接口 ----
+
+@router.get("/checkpoint/stats")
+async def checkpoint_stats() -> dict:
+    """查看 Checkpoint 批量写入统计信息。"""
+    # 获取当前活跃的 batch manager
+    from app.runtime.batch_checkpoint import _batch_manager
+    if _batch_manager is not None:
+        return _batch_manager.get_stats()
+    return {
+        "buffer_size": 0,
+        "max_buffer_size": 10,
+        "flush_interval": 2.0,
+        "buffered_count": 0,
+        "flushed_count": 0,
+        "skipped_count": 0,
+        "avg_write_time": 0.0,
+        "running": False,
+        "note": "批量写入未启用或管理器未初始化",
+    }
+
+
+# ---- Telemetry 清理接口 ----
+
+@router.post("/traces/cleanup")
+async def cleanup_traces(
+    retention_days: float = Query(7.0, ge=1, le=365, description="保留天数"),
+) -> dict:
+    """清理过期的 trace 记录。"""
+    from app.core.telemetry import cleanup_traces as _cleanup
+    cleaned = await _cleanup()
+    return {"cleaned": cleaned, "retention_days": retention_days}
+
+
+@router.get("/traces/stats")
+async def traces_stats() -> dict:
+    """查看 Telemetry 统计信息。"""
+    from app.core.telemetry import tracer
+    stats = tracer.stats()
+    stats["buffer_size"] = len(tracer._buffer)  # noqa: SLF001
+    return stats
+
+
+# ---- 会话管理接口 ----
+
+@router.post("/sessions/cleanup")
+async def cleanup_sessions(
+    max_age_days: float = Query(90.0, ge=1, le=365, description="最大存活天数"),
+    min_messages: int = Query(0, ge=0, le=100, description="最小消息数"),
+    dry_run: bool = Query(True, description="仅统计，不实际删除"),
+) -> dict:
+    """清理过期或空会话。"""
+    from app.memory.session import get_session_store
+    store = get_session_store()
+    result = await store.cleanup_expired(
+        max_age_days=max_age_days,
+        min_messages=min_messages if dry_run else 0,
+    )
+    if dry_run:
+        result["dry_run"] = True
+        result["message"] = f"统计结果: 将删除 {result['deleted']} 个会话"
+    else:
+        result["dry_run"] = False
+        result["message"] = f"已删除 {result['deleted']} 个会话"
+    return result

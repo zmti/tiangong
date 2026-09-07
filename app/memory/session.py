@@ -22,7 +22,7 @@ from app.core.storage_backend import StorageBackend, get_storage_backend
 class SessionStore:
     """会话存储,按 session_id 隔离,含历史容量限制。"""
 
-    def __init__(self, db_path: Optional[str] = None, max_messages: int = 60, backend: Optional[StorageBackend] = None):
+    def __init__(self, db_path: Optional[str] = None, max_messages: int = 500, backend: Optional[StorageBackend] = None):
         """初始化 SessionStore
         
         Args:
@@ -38,9 +38,25 @@ class SessionStore:
             self._backend = get_storage_backend(db_path=self._db_path)
         
         self._max_messages = max_messages
-        self._init_db()
+        # 使用 asyncio.Lock 替代 threading.Lock
+        self._lock = asyncio.Lock()
+        # 初始化数据库需要在事件循环中运行
+        try:
+            asyncio.get_running_loop()
+            asyncio.create_task(self._init_db_async())
+        except RuntimeError:
+            # 没有运行中的事件循环，同步初始化
+            self._init_db_sync()
 
-    def _init_db(self) -> None:
+    def _init_db_sync(self) -> None:
+        """同步初始化数据库(用于启动阶段)。"""
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(self._init_db_async())
+        finally:
+            loop.close()
+
+    async def _init_db_async(self) -> None:
         schema = {
             "sessions": [
                 {"name": "id", "type": "TEXT", "constraints": "PRIMARY KEY"},
@@ -49,11 +65,14 @@ class SessionStore:
                 {"name": "created_at", "type": "REAL", "constraints": "NOT NULL"},
                 {"name": "updated_at", "type": "REAL", "constraints": "NOT NULL"},
                 {"name": "title", "type": "TEXT", "constraints": ""},
+                {"name": "category", "type": "TEXT", "constraints": "DEFAULT '未分类'"},
             ],
         }
         self._backend.init_db(schema)
         # 迁移:为旧数据库补填 tenant_id 列
         self._migrate_add_tenant_column()
+        # 迁移:为旧数据库补填 category 列
+        self._migrate_add_category_column()
 
     def _migrate_add_tenant_column(self) -> None:
         """迁移:为旧表补加 tenant_id 列(如果不存在)。"""
@@ -64,33 +83,44 @@ class SessionStore:
         except Exception:
             pass  # 列已存在
 
+    def _migrate_add_category_column(self) -> None:
+        """迁移:为旧表补加 category 列(如果不存在)。"""
+        try:
+            self._backend.execute(
+                "ALTER TABLE sessions ADD COLUMN category TEXT NOT NULL DEFAULT '未分类'"
+            )
+        except Exception:
+            pass  # 列已存在
+
     async def get_or_create(self, session_id: str, tenant_id: Optional[str] = None):
         from app.core.tenant_context import get_tenant
         tid = tenant_id or get_tenant() or "default"
         now = time.time()
-        rows = self._backend.select(
-            "sessions",
-            "id = ? AND tenant_id = ?",
-            (session_id, tid),
-            limit=1
-        )
-        if not rows:
-            self._backend.insert(
+        # 使用锁保护会话操作
+        async with self._lock:
+            rows = self._backend.select(
                 "sessions",
-                {
-                    "id": session_id,
-                    "tenant_id": tid,
-                    "messages": json.dumps([]),
-                    "created_at": now,
-                    "updated_at": now,
-                }
+                "id = ? AND tenant_id = ?",
+                (session_id, tid),
+                limit=1
             )
-            messages = []
-            created = now
-        else:
-            row = rows[0]
-            messages = json.loads(row["messages"])
-            created = row["created_at"]
+            if not rows:
+                self._backend.insert(
+                    "sessions",
+                    {
+                        "id": session_id,
+                        "tenant_id": tid,
+                        "messages": json.dumps([]),
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                )
+                messages = []
+                created = now
+            else:
+                row = rows[0]
+                messages = json.loads(row["messages"])
+                created = row["created_at"]
         return {
             "id": session_id,
             "tenant_id": tid,
@@ -136,17 +166,19 @@ class SessionStore:
 
     async def clear(self, session_id: str) -> None:
         """清空会话消息但保留会话记录。"""
-        self._backend.update(
-            "sessions",
-            {"messages": json.dumps([], ensure_ascii=False), "updated_at": time.time()},
-            "id = ?",
-            (session_id,),
-        )
+        async with self._lock:
+            self._backend.update(
+                "sessions",
+                {"messages": json.dumps([], ensure_ascii=False), "updated_at": time.time()},
+                "id = ?",
+                (session_id,),
+            )
 
     async def delete(self, session_id: str) -> bool:
         """删除整个会话记录。"""
-        n = self._backend.delete("sessions", "id = ?", (session_id,))
-        return n > 0
+        async with self._lock:
+            n = self._backend.delete("sessions", "id = ?", (session_id,))
+            return n > 0
 
     async def _extract_content(self, m: dict) -> str:
         """从新旧兼容的消息结构中提取可检索的文本内容。"""
@@ -211,26 +243,41 @@ class SessionStore:
 
     async def rename(self, session_id: str, title: str) -> None:
         """设置会话自定义名称(空串表示清除自定义名,回到自动标题)。"""
-        await self.get_or_create(session_id)
-        self._backend.update(
-            "sessions",
-            {
-                "title": title.strip(),
-                "updated_at": time.time(),
-            },
-            "id = ?",
-            (session_id,)
-        )
+        async with self._lock:
+            await self.get_or_create(session_id)
+            self._backend.update(
+                "sessions",
+                {
+                    "title": title.strip(),
+                    "updated_at": time.time(),
+                },
+                "id = ?",
+                (session_id,)
+            )
+
+    async def set_category(self, session_id: str, category: str) -> None:
+        """设置会话分类。"""
+        async with self._lock:
+            await self.get_or_create(session_id)
+            self._backend.update(
+                "sessions",
+                {
+                    "category": category.strip() or "未分类",
+                    "updated_at": time.time(),
+                },
+                "id = ?",
+                (session_id,)
+            )
 
     async def list_sessions(self, limit: int = 200) -> list[dict]:
-        """列出所有会话(含标题、消息数、更新时间),按最近更新倒序。"""
+        """列出所有会话(含标题、消息数、更新时间、分类),按最近更新倒序。"""
         rows = self._backend.select(
             "sessions",
             "1 = 1",
             order_by="updated_at DESC",
             limit=limit
         )
-        
+
         out: list[dict] = []
         for row in rows:
             msgs = json.loads(row["messages"])
@@ -249,8 +296,114 @@ class SessionStore:
                 "messages": len(msgs),
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
+                "category": row.get("category") or "未分类",
             })
         return out
+
+    async def cleanup_expired(
+        self,
+        max_age_days: float = None,
+        min_messages: int = 0,
+    ) -> dict:
+        """清理过期会话。
+        
+        Args:
+            max_age_days: 会话最大存活天数，超过则删除。None 表示不清理。
+            min_messages: 最小消息数，低于此值的会话也视为空会话清理。
+            
+        Returns:
+            清理统计信息
+        """
+        import time as _time
+        from app.config import settings
+        
+        max_age_days = max_age_days or float(getattr(settings, "session_retention_days", 90))
+        cutoff = _time.time() - (max_age_days * 86400)
+        
+        # 获取所有会话
+        rows = self._backend.select("sessions", "1 = 1", columns=["id", "updated_at", "messages"])
+        
+        to_delete = []
+        for row in rows:
+            session_id = row["id"]
+            updated_at = row.get("updated_at", 0) or 0
+            
+            # 检查是否过期
+            if updated_at < cutoff:
+                to_delete.append(session_id)
+                continue
+            
+            # 检查是否空会话
+            if min_messages > 0:
+                try:
+                    msgs = json.loads(row["messages"] or "[]")
+                    if len(msgs) < min_messages:
+                        to_delete.append(session_id)
+                except (json.JSONDecodeError, TypeError):
+                    to_delete.append(session_id)
+        
+        # 执行删除
+        deleted = 0
+        for session_id in to_delete:
+            await self.delete(session_id)
+            deleted += 1
+        
+        logger.info("会话清理完成: 删除 %d 个过期/空会话", deleted)
+        return {
+            "total_checked": len(rows),
+            "deleted": deleted,
+            "kept": len(rows) - deleted,
+        }
+
+    async def archive_session(self, session_id: str) -> bool:
+        """归档会话（压缩为摘要并删除详细消息）。
+        
+        Args:
+            session_id: 会话 ID
+            
+        Returns:
+            是否成功归档
+        """
+        async with self._lock:
+            session = await self.get_or_create(session_id)
+            messages = session.get("messages", [])
+            
+            if not messages:
+                return True
+            
+            # 提取摘要信息
+            first_message = ""
+            last_message = ""
+            message_count = len(messages)
+            
+            for m in messages:
+                content = await self._extract_content(m)
+                if m.get("role") == "user" and content:
+                    if not first_message:
+                        first_message = content.strip()[:100]
+                    last_message = content.strip()[:100]
+            
+            # 保留摘要，删除详细消息
+            summary = {
+                "role": "system",
+                "kind": "summary",
+                "content": f"[会话摘要] 共 {message_count} 条消息\n首次: {first_message}\n最后: {last_message}",
+            }
+            
+            tid = session.get("tenant_id", "default")
+            now = time.time()
+            self._backend.update(
+                "sessions",
+                {
+                    "messages": json.dumps([summary], ensure_ascii=False),
+                    "updated_at": now,
+                },
+                "id = ? AND tenant_id = ?",
+                (session_id, tid)
+            )
+            
+            logger.info("会话已归档: %s (%d 条消息压缩为摘要)", session_id, message_count)
+            return True
 
 
 def _select_session_store():

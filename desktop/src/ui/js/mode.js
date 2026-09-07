@@ -21,7 +21,7 @@ App.Mode = (() => {
   };
   const CANDIDATE_LABELS = { single: '快速回答', auto: '自动', review: '质量把关', ensemble: '多模型择优' };
 
-  let _state = null;
+  let _state = defaultState();
 
   function defaultState() {
     return {
@@ -126,6 +126,7 @@ App.Mode = (() => {
   function get() { return _state; }
 
   function setMode(mode) {
+    if (!_state) _state = defaultState();
     if (MODES[mode]) {
       _state.mode = mode;
       if (MODES[mode].group === 'team' && !_state.orch.template) {
@@ -143,16 +144,146 @@ App.Mode = (() => {
     if (sel) sel.value = _state.mode;
     if (badge) {
       const meta = MODES[_state.mode];
-      badge.textContent = meta ? meta.label : _state.mode;
+      const labelEl = badge.querySelector('span');
+      if (labelEl) labelEl.textContent = meta ? meta.label : _state.mode;
       badge.title = meta ? meta.desc : '';
+      // 团队模式显示警告色
+      badge.classList.toggle('warn', meta && meta.group === 'team');
     }
   }
 
-  return { load, save, get, setMode, params, normalize, refreshUI };
+  const MODE_ICONS = {
+    single: '⚡',
+    auto: '🤖',
+    review: '🔍',
+    ensemble: '🏆',
+    sequential: '🔗',
+    hierarchical: '🧩',
+    consensual: '⚔️',
+  };
+
+  function renderPopover() {
+    const pop = App.els.modePopover || document.getElementById('modePopover');
+    if (!pop) return;
+    const providers = App.Settings && App.Settings._providers ? App.Settings._providers : [];
+    const hasConfigured = providers.some((p) => p.configured);
+    const groups = { basic: [], team: [] };
+    Object.entries(MODES).forEach(([k, v]) => {
+      if (groups[v.group]) groups[v.group].push({ key: k, ...v });
+    });
+    const teamNote = !hasConfigured
+      ? '<div class="mpl-empty" style="padding:8px 12px;">请先在设置中配置 API Key 以使用团队模式</div>'
+      : '';
+    pop.innerHTML = `
+      <div class="mode-popover-header">选择模式</div>
+      <div class="mode-popover-section">
+        ${groups.basic.map(m => `
+          <div class="mode-item${m.key === _state.mode ? ' active' : ''}" data-mode="${m.key}">
+            <span class="mode-item-icon">${MODE_ICONS[m.key] || '🤖'}</span>
+            <div class="mode-item-body">
+              <span class="mode-item-name">${m.label}</span>
+              <span class="mode-item-desc">${m.desc}</span>
+            </div>
+            <span class="mode-item-cost">${m.cost}</span>
+          </div>
+        `).join('')}
+      </div>
+      ${teamNote ? '' : '<div class="mode-popover-divider"></div>'}
+      ${teamNote || `
+        <div class="mode-popover-section">
+          ${groups.team.map(m => `
+            <div class="mode-item${m.key === _state.mode ? ' active' : ''}" data-mode="${m.key}">
+              <span class="mode-item-icon">${MODE_ICONS[m.key] || '🤖'}</span>
+              <div class="mode-item-body">
+                <span class="mode-item-name">${m.label}</span>
+                <span class="mode-item-desc">${m.desc}</span>
+              </div>
+              <span class="mode-item-cost">${m.cost}</span>
+            </div>
+          `).join('')}
+        </div>
+      `}
+      ${teamNote}
+    `;
+    pop.querySelectorAll('.mode-item[data-mode]').forEach(el => {
+      el.addEventListener('click', () => {
+        setMode(el.dataset.mode);
+        pop.hidden = true;
+      });
+    });
+  }
+
+  function togglePopover() {
+    const pop = App.els.modePopover || document.getElementById('modePopover');
+    const badge = App.els.modeBadge;
+    if (!pop || !badge) return;
+    if (!pop.hidden) { pop.hidden = true; return; }
+    renderPopover();
+    pop.hidden = false;
+    const r = badge.getBoundingClientRect();
+    pop.style.left = Math.min(Math.max(8, r.left), window.innerWidth - 280) + 'px';
+    pop.style.bottom = (window.innerHeight - r.top + 8) + 'px';
+    pop.style.top = 'auto';
+  }
+
+  // renderer.js 在 loadAllData 中统一调用 init()，此处实现以保证接口一致性
+  function init() {
+    load();
+    refreshUI();
+    // 绑定下拉框 change 事件，同步到 _state
+    const sel = App.els.modeSelect || document.getElementById('modeSelect');
+    if (sel && !sel._modeBound) {
+      sel._modeBound = true;
+      sel.addEventListener('change', () => setMode(sel.value));
+    }
+    // 绑定 badge 点击事件
+    const badge = App.els.modeBadge || document.getElementById('modeBadge');
+    if (badge && !badge._modeClickBound) {
+      badge._modeClickBound = true;
+      badge.addEventListener('click', (e) => {
+        e.stopPropagation();
+        togglePopover();
+      });
+    }
+    // 点击外部关闭
+    document.addEventListener('click', (e) => {
+      const pop = App.els.modePopover || document.getElementById('modePopover');
+      if (pop && !pop.hidden && !pop.contains(e.target) && !badge?.contains(e.target)) {
+        pop.hidden = true;
+      }
+    });
+  }
+
+  // 暴露给 renderer.js 在 provider 数据就绪后调用
+  function reinitAfterProviders() {
+    // providers 数据已加载,重新同步 select 可选项(保留兼容性)
+    refreshUI();
+  }
+
+  return { init, load, save, get, setMode, params, normalize, refreshUI, reinitAfterProviders };
 })();
 
-/* 初始化 */
-document.addEventListener('DOMContentLoaded', () => {
-  App.Mode.load();
-  App.Mode.refreshUI();
-});
+/* 初始化 — 等待 App.els 就绪后再执行 */
+(function initMode() {
+  function doInit() {
+    if (App.els && (App.els.modeBadge || App.els.modeSelect)) {
+      App.Mode.load();
+      App.Mode.refreshUI();
+    } else {
+      const check = () => {
+        if (App.els && (App.els.modeBadge || App.els.modeSelect)) {
+          App.Mode.load();
+          App.Mode.refreshUI();
+        } else {
+          setTimeout(check, 100);
+        }
+      };
+      check();
+    }
+  }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', doInit);
+  } else {
+    doInit();
+  }
+})();

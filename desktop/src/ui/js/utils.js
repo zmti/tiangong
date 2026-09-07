@@ -12,17 +12,22 @@
       const obj = typeof resultStr === 'string' ? JSON.parse(resultStr) : resultStr;
       if (obj && typeof obj === 'object') {
         url = obj.image_url || obj.url || '';
-        if (url) return url;
       }
     } catch (_) {}
     // 3. Python dict repr
-    try {
-      const quoted = String(resultStr).replace(/'/g, '"');
-      const obj = JSON.parse(quoted);
-      url = obj.image_url || obj.url || '';
-      if (url) return url;
-    } catch (_) {}
-    return '';
+    if (!url) {
+      try {
+        const quoted = String(resultStr).replace(/'/g, '"');
+        const obj = JSON.parse(quoted);
+        url = obj.image_url || obj.url || '';
+      } catch (_) {}
+    }
+    // 相对路径补全:后端返回 /images/xxx.png,Electron 页面协议是 file://,
+    // 必须拼上 App.backendUrl 才能正确访问。
+    if (url && url.startsWith('/') && App.backendUrl) {
+      url = App.backendUrl + url;
+    }
+    return url;
   };
 
   // 刷新欢迎页显隐

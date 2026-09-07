@@ -254,9 +254,11 @@ def test_storage_fallback_sqlite(tmp_path, monkeypatch):
 def test_session_search_method(tmp_path):
     """SQLite SessionStore 的 search 方法(替代原 /chat/search 直连 SQLite)。"""
     from app.memory.session import SessionStore
+    from app.core.storage_backend import reset_storage_backend
 
+    reset_storage_backend()
     store = SessionStore(db_path=os.path.join(str(tmp_path), "sessions.db"))
-    run(store.add_message("s1", "user", "我喜欢蓝色"))
+    run(store.add_message("s1", "user", kind="text", content="我喜欢蓝色"))
     results = run(store.search("蓝色"))
     assert results and results[0]["session_id"] == "s1"
 

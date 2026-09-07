@@ -7,32 +7,23 @@ App.Session._listCache = { ids: null, ts: 0 };
 /* 会话侧边栏折叠状态 */
 App.Session._collapsed = false;
 
-/* 会话侧边栏折叠/展开 */
+/* 会话侧边栏折叠/展开 - 使用新的 sidebar 结构 */
 App.Session.toggleCollapse = function () {
   App.Session._collapsed = !App.Session._collapsed;
-  document.body.classList.toggle('session-collapsed', App.Session._collapsed);
-  const panel = document.getElementById('sessionPanel');
-  const btn = document.getElementById('collapseBtn');
-  const reopen = document.getElementById('sessionReopen');
-  if (btn) btn.textContent = App.Session._collapsed ? '⏵' : '⏴';
-  if (reopen) reopen.style.display = App.Session._collapsed ? '' : 'none';
-  if (App.Storage) App.Storage.set('session_panel_collapsed', App.Session._collapsed);
+  document.body.classList.toggle('sidebar-collapsed', App.Session._collapsed);
+  if (App.Storage) App.Storage.set('sidebar_collapsed', App.Session._collapsed);
 };
 
 App.Session.loadCollapse = function () {
   try {
     if (App.Storage) {
-      App.Session._collapsed = !!App.Storage.get('session_panel_collapsed');
+      App.Session._collapsed = !!App.Storage.get('sidebar_collapsed');
     } else {
-      App.Session._collapsed = localStorage.getItem('agent_session_collapsed') === '1';
+      App.Session._collapsed = localStorage.getItem('agent_sidebar_collapsed') === '1';
     }
   } catch (_) {}
   if (App.Session._collapsed) {
-    document.body.classList.add('session-collapsed');
-    const btn = document.getElementById('collapseBtn');
-    const reopen = document.getElementById('sessionReopen');
-    if (btn) btn.textContent = '⏵';
-    if (reopen) reopen.style.display = '';
+    document.body.classList.add('sidebar-collapsed');
   }
 };
 
@@ -64,7 +55,7 @@ App.Session.togglePin = async function (id) {
   const pins = App.Session.loadPins();
   if (pins.has(id)) pins.delete(id); else pins.add(id);
   App.Session.savePins(pins);
-  App.Session.renderList();
+  App.Session.renderCards();
 };
 
 /* 最近使用的会话 - 使用统一存储 */
@@ -127,43 +118,38 @@ App.Session.autoRename = async function (userText) {
       body: JSON.stringify({ session_id: App.sessionId, title }),
     });
     // 更新会话列表显示
-    const item = document.querySelector(`#sessionList .session-item[data-id="${CSS.escape(App.sessionId)}"]`);
-    if (item) { 
-      item.dataset.title = title; 
-      const t = item.querySelector('.s-title'); 
-      if (t) t.textContent = title; 
-    }
+    const card = document.querySelector(`.sidebar-session-history .session-item[data-id="${CSS.escape(App.sessionId)}"]`);
+    if (card) { card.dataset.title = title; const t = card.querySelector('.s-title'); if (t) t.textContent = title; }
     if (App.els.sessionLabel) App.els.sessionLabel.textContent = title;
     App.Session._listCache = { ids: null, ts: 0 };
   } catch (_) { /* 忽略命名失败,不影响体验 */ }
 };
 
-/* 会话列表搜索(全文搜索) */
+/* 会话列表搜索(全文搜索) - 搜索侧边栏会话历史 */
 App.Session.search = async function () {
-  const query = (App.els.sessionSearch.value || '').trim();
-  if (!query) {
-    App.Session.renderList();
+  const historyEl = App.els.sidebarSessionHistory || document.getElementById('sidebarSessionHistory');
+  const query = (document.getElementById('sessionSearch')?.value || '').trim();
+  if (!query || !historyEl) {
+    App.Session.renderCards();
     return;
   }
-  // 全文搜索:遍历所有会话内容,返回命中标题与片段
-  const listEl = App.els.sessionList;
   try {
     const res = await App.apiJSON(`/v1/chat/search?q=${encodeURIComponent(query)}`);
-    if (!res.success) {
-      listEl.innerHTML = '<div class="session-empty">搜索失败</div>';
+    if (!res.success || !res.data?.results?.length) {
+      historyEl.innerHTML = '<div style="padding:12px;text-align:center;color:var(--muted);font-size:12px;">未找到匹配内容</div>';
       return;
     }
-    const data = res.data;
-    listEl.innerHTML = '';
-    if (!data.results || !data.results.length) {
-      listEl.innerHTML = '<div class="session-empty">未找到匹配内容</div>';
-      return;
-    }
-    for (const r of data.results) {
-      listEl.appendChild(App.Session.buildSearchItem(r));
-    }
+    const results = res.data.results;
+    historyEl.innerHTML = results.map(r => `
+      <div class="session-item search-hit" data-id="${r.id}">
+        <div class="s-title">${App.escapeHtml(r.title || '新会话')} · ${r.snippets?.length || 0} 处命中</div>
+      </div>
+    `).join('');
+    historyEl.querySelectorAll('.session-item').forEach(item => {
+      item.addEventListener('click', () => App.Session.select(item.dataset.id));
+    });
   } catch (_) {
-    listEl.innerHTML = '<div class="session-empty">网络错误</div>';
+    historyEl.innerHTML = '<div style="padding:12px;text-align:center;color:var(--muted);font-size:12px;">网络错误</div>';
   }
 };
 
@@ -197,7 +183,8 @@ App.Session.buildSearchItem = function (r) {
 };
 
 App.Session.renderList = async function () {
-  const listEl = App.els.sessionList;
+  const listEl = App.els.sidebarSessionHistory || document.getElementById('sidebarSessionHistory');
+  if (!listEl) return [];
   try {
     const res = await App.apiJSON('/v1/chat/sessions');
     console.log('[Session] renderList res:', res);
@@ -209,7 +196,7 @@ App.Session.renderList = async function () {
     console.log('[Session] sessions raw data:', JSON.stringify(res.data).slice(0, 200));
     const sessions = res.data?.sessions || [];
     const pins = App.Session.loadPins();
-    const query = (App.els.sessionSearch.value || '').trim().toLowerCase();
+    const query = (document.getElementById('sessionSearch')?.value || '').trim().toLowerCase();
     const filtered = sessions.filter(s =>
       !query || (s.title || '').toLowerCase().includes(query)
     );
@@ -266,6 +253,67 @@ App.Session.renderList = async function () {
   }
 };
 
+/* 渲染会话卡片视图(新布局) */
+App.Session.renderCards = async function () {
+  const listEl = App.els.sidebarSessionHistory || document.getElementById('sidebarSessionHistory');
+  if (!listEl) return;
+  try {
+    const res = await App.apiJSON('/v1/chat/sessions');
+    if (!res.success) {
+      listEl.innerHTML = '<div style="padding:48px;text-align:center;color:var(--muted);">加载失败</div>';
+      return;
+    }
+    const sessions = res.data?.sessions || [];
+    const pins = App.Session.loadPins();
+    const query = (document.getElementById('sessionSearch')?.value || '').trim().toLowerCase();
+    const filtered = sessions.filter(s =>
+      !query || (s.title || '').toLowerCase().includes(query)
+    );
+    if (!filtered.length) {
+      listEl.innerHTML = '<div style="padding:12px;text-align:center;color:var(--muted);font-size:12px;"><div style="font-size:28px;margin-bottom:8px;">💬</div><div style="font-size:13px;font-weight:500;color:var(--text);margin-bottom:4px;">暂无会话</div><div style="font-size:11px;">点击"新建对话"开始</div></div>';
+      return;
+    }
+    const sorted = [...filtered].sort((a, b) => {
+      const ap = pins.has(a.id) ? 0 : 1;
+      const bp = pins.has(b.id) ? 0 : 1;
+      if (ap !== bp) return ap - bp;
+      return (b.updated_at || 0) - (a.updated_at || 0);
+    });
+    listEl.innerHTML = sorted.map(s => {
+      const isActive = s.id === App.sessionId;
+      const isPinned = pins.has(s.id);
+      const timeStr = App.Session.formatTime(s.updated_at);
+      return `
+        <div class="session-item ${isActive ? 'active' : ''} ${isPinned ? 'pinned' : ''}"
+             data-id="${s.id}" data-title="${App.escapeHtml(s.title || '未命名')}">
+          <div class="s-title">${isPinned ? '📌 ' : ''}${App.escapeHtml(s.title || '新会话')}</div>
+          <div class="s-meta">
+            <span class="s-time">${timeStr}</span>
+            <span class="s-count">${s.messages || 0} 条</span>
+            <span class="s-pin ${isPinned ? 'active' : ''}" title="${isPinned ? '取消置顶' : '置顶会话'}">📌</span>
+          </div>
+        </div>
+      `;
+    }).join('');
+    listEl.querySelectorAll('.session-item').forEach(item => {
+      item.addEventListener('click', () => App.Session.select(item.dataset.id));
+      item.querySelector('.s-pin')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        App.Session.togglePin(item.dataset.id);
+      });
+      item.querySelector('.s-title')?.addEventListener('dblclick', (e) => {
+        e.stopPropagation();
+        App.Session.enterRename(sorted.find(s => s.id === item.dataset.id), item);
+      });
+    });
+  } catch (err) {
+    listEl.innerHTML = '<div style="padding:48px;text-align:center;color:var(--muted);">加载失败</div>';
+    console.error('[Session] renderCards failed:', err);
+  }
+  // 同步刷新侧边栏会话历史
+  if (typeof App._renderSidebarHistory === 'function') App._renderSidebarHistory();
+};
+
 /* 进入重命名模式 */
 App.Session.enterRename = function (s, btn) {
   if (!s) return;
@@ -287,7 +335,7 @@ App.Session.enterRename = function (s, btn) {
     if (save && val && val !== (s.title || '')) {
       await App.Session.rename(s.id, val);
     } else {
-      App.Session.renderList();
+      App.Session.renderCards();
     }
   };
   input.dataset.orig = input.value;
@@ -314,7 +362,7 @@ App.Session.rename = async function (id, title) {
   } catch (e) {
     if (App.toast) App.toast(`重命名失败: ${e.message}`, 'err');
   }
-  App.Session.renderList();
+  App.Session.renderCards();
 };
 
 /* 删除会话 */
@@ -329,7 +377,7 @@ App.Session.remove = async function (id) {
       App.Session.newSession();
     } else {
       App.Session._listCache = { ids: null, ts: 0 };
-      App.Session.renderList();
+      App.Session.renderCards();
     }
   } catch (e) {
     if (App.toast) App.toast(`删除失败: ${e.message}`, 'err');
@@ -344,13 +392,15 @@ App.Session.clearCurrent = async function () {
     : true);
   if (!ok) return;
   try {
-    // 只清空内存中的消息，不删除会话记录
+    // 清空后端记录,并保留会话本身
+    await App.apiJSON(`/v1/chat/clear?session_id=${encodeURIComponent(App.sessionId)}`, { method: 'POST' });
+    // 只清空内存中的消息
     App.els.messages.innerHTML = '';
     App._planCard = null;
     if (App._currentGroup) { App._currentGroup.wrap.remove(); App._currentGroup = null; }
     if (App.Attach) App.Attach.reset();
     if (App.CtxMeter) App.CtxMeter.refresh();
-    App.Session.renderList();
+    App.Session.renderCards();
     if (App.toast) App.toast('当前会话已清空', 'ok');
   } catch (e) {
     if (App.toast) App.toast(`清空失败: ${e.message}`, 'err');
@@ -360,7 +410,6 @@ App.Session.clearCurrent = async function () {
 /* 新建会话 */
 App.Session.newSession = async function () {
   if (App.streaming && App.Chat?.stop) App.Chat.stop(true);
-  // 清除当前分组状态
   if (App._currentGroup) {
     App._currentGroup.wrap.remove();
     App._currentGroup = null;
@@ -369,12 +418,8 @@ App.Session.newSession = async function () {
   App.Session.saveSessionId(App.sessionId);
   App.els.sessionLabel.textContent = '新会话';
   App.els.messages.innerHTML = '';
-  document.querySelectorAll('#sessionList .session-item').forEach((el) => {
-    el.classList.toggle('active', el.dataset.id === App.sessionId);
-  });
+  // 显示聊天视图，隐藏会话列表
   App.els.input.focus();
-  App.Session.renderList();
-  // 清空消息后同步欢迎页显隐
   if (App.refreshWelcomePage) App.refreshWelcomePage();
   if (App.Attach) App.Attach.reset();
   if (App.CtxMeter) App.CtxMeter.refresh();
@@ -414,10 +459,13 @@ App.Session.select = async function (id) {
     const fragments = [];
     let lastPlanContent = '';
 
+    // 后端可能将文本存在 kind 或 content 字段
+    function msgText(m) { return m.content || m.kind || ''; }
+
     // 预渲染所有 assistant 消息
     const assistantContents = [];
     for (const m of data.messages || []) {
-      if (m.role === 'assistant') assistantContents.push(m.content || '');
+      if (m.role === 'assistant') assistantContents.push(msgText(m));
     }
     const renderedAssistant = assistantContents.map((c) => App.renderMarkdown(c));
 
@@ -432,8 +480,8 @@ App.Session.select = async function (id) {
         const body = document.createElement('div');
         body.className = 'msg-body';
         const bubble = document.createElement('div');
-        bubble.className = 'bubble';
-        bubble.textContent = m.content || '';
+        bubble.className = 'answer-doc';
+        bubble.textContent = msgText(m);
         body.appendChild(bubble);
 
         // 添加操作按钮
@@ -475,7 +523,7 @@ App.Session.select = async function (id) {
         const body = document.createElement('div');
         body.className = 'msg-body';
         const bubble = document.createElement('div');
-        bubble.className = 'bubble';
+        bubble.className = 'answer-doc';
         bubble.innerHTML = renderedAssistant[aiIdx++] || '';
         body.appendChild(bubble);
 
@@ -515,13 +563,13 @@ App.Session.select = async function (id) {
       if (m.role === 'error') {
         const div = document.createElement('div');
         div.className = 'msg error';
-        div.textContent = m.content || '';
+        div.textContent = msgText(m);
         fragments.push(div);
         continue;
       }
       if (m.role === 'plan' && App.appendPlan) {
         try {
-          const plan = JSON.parse(m.content);
+          const plan = JSON.parse(msgText(m));
           if (JSON.stringify(plan) !== lastPlanContent) {
             lastPlanContent = JSON.stringify(plan);
             const p = App.appendPlan({ action: 'create', plan }, fragments);
@@ -532,7 +580,7 @@ App.Session.select = async function (id) {
       }
       if (m.role === 'tool' && App.appendToolEvent) {
         let te = null;
-        try { te = JSON.parse(m.content); } catch (_) { te = null; }
+        try { te = JSON.parse(msgText(m)); } catch (_) { te = null; }
         if (te) {
           const t = App.appendToolEvent(te.name || '工具', te.arguments, te.result || '', fragments);
           if (t) fragments.push(t);
@@ -550,12 +598,12 @@ App.Session.select = async function (id) {
     
     // 设置会话标题
     let title = '新会话';
-    const item = document.querySelector(`#sessionList .session-item[data-id="${CSS.escape(id)}"]`);
+    const item = document.querySelector(`.sidebar-session-history .session-item[data-id="${CSS.escape(id)}"]`);
     if (item && item.dataset.title) {
       title = item.dataset.title;
     } else if (data.messages && data.messages.length) {
       const first = data.messages.find((m) => m.role === 'user');
-      if (first) title = String(first.content).slice(0, 30);
+      if (first) title = String(msgText(first)).slice(0, 30);
     }
     App.els.sessionLabel.textContent = title;
   } catch (e) {
@@ -583,7 +631,7 @@ App.Session.deleteSession = async function (id) {
     await App.apiJSON(`/v1/chat/session/${encodeURIComponent(id)}`, { method: 'DELETE' });
   } catch (_) { /* 忽略删除失败 */ }
   App.Session._listCache = { ids: null, ts: 0 };
-  App.Session.renderList();
+  App.Session.renderCards();
 };
 
 /* 清空消息(简化版) */
@@ -615,20 +663,15 @@ App.Session.exportCurrent = async function () {
   }
 };
 
+/* 渲染侧边栏会话历史 (别名,供外部调用) */
+App._renderSidebarHistory = function () {
+  App.Session.renderCards();
+};
+
 /* 初始化 */
 document.addEventListener('DOMContentLoaded', () => {
-  if (App.els.sessionList) {
-    App.els.sessionList.addEventListener('click', (e) => {
-      const item = e.target.closest('.session-item');
-      if (item) App.Session.select(item.dataset.id);
-    });
-  }
-  if (App.els.sessionSearch) {
-    App.els.sessionSearch.addEventListener('input', () => {
-      clearTimeout(App.Session._searchTimer);
-      App.Session._searchTimer = setTimeout(App.Session.search, 300);
-    });
-  }
+  // 加载侧边栏折叠状态
+  if (App.Session) App.Session.loadCollapse();
   // 新建会话按钮
   if (App.els.newSessionBtn) {
     App.els.newSessionBtn.addEventListener('click', App.Session.newSession);

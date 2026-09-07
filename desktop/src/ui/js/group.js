@@ -42,19 +42,19 @@
     const ok = success === true;
     g.tools.push({ name, args, result, ok, time: Date.now() });
     const icon = getIcon(name);
-    g.head.innerHTML = `<span class="rg-pulse">${icon}</span><span class="rg-label">${name} ${ok ? '✓' : '✗'}</span>`;
+    g.head.innerHTML = `<span class="rg-pulse">${icon}</span><span class="rg-label">${App.escapeHtml(name)} ${ok ? '✓' : '✗'}</span>`;
     if (!g._detailVisible) {
       const item = document.createElement('div');
       item.className = 'rg-tool-item' + (ok ? '' : ' rg-tool-fail');
-      item.innerHTML = `<span class="rg-t-icon">${icon}</span><span class="rg-t-name">${App.escapeHtml(name)}</span><span class="rg-t-status">${ok ? '✓' : '✗'}</span>`;
-      item.title = `工具: ${name}\n参数: ${(typeof args === 'string' ? args : JSON.stringify(args) || '').slice(0, 120)}`;
+      item.innerHTML = `<span class="rg-t-icon">${App.escapeHtml(icon)}</span><span class="rg-t-name">${App.escapeHtml(name)}</span><span class="rg-t-status">${ok ? '✓' : '✗'}</span>`;
+      item.title = `工具: ${App.escapeHtml(name)}\n参数: ${(typeof args === 'string' ? args : JSON.stringify(args) || '').slice(0, 120)}`;
       g.body.appendChild(item);
       g._detailVisible = true;
       g.body.style.display = 'flex';
     } else {
       const item = document.createElement('div');
       item.className = 'rg-tool-item' + (ok ? '' : ' rg-tool-fail');
-      item.innerHTML = `<span class="rg-t-icon">${icon}</span><span class="rg-t-name">${App.escapeHtml(name)}</span><span class="rg-t-status">${ok ? '✓' : '✗'}</span>`;
+      item.innerHTML = `<span class="rg-t-icon">${App.escapeHtml(icon)}</span><span class="rg-t-name">${App.escapeHtml(name)}</span><span class="rg-t-status">${ok ? '✓' : '✗'}</span>`;
       g.body.appendChild(item);
     }
   }

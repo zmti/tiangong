@@ -81,9 +81,12 @@ def _validate_ast(node: ast.AST):
                     raise UnsafeExpressionError(f"不允许的函数: {child.func.id}")
             else:
                 raise UnsafeExpressionError("不允许的属性访问")
-        # 检查属性访问
+        # 检查属性访问 — 允许从变量取值（如 result.success）
         elif isinstance(child, ast.Attribute):
-            raise UnsafeExpressionError("不允许的属性访问")
+            # 只允许 obj.attr 形式，且 obj 必须是已解析的变量名
+            if not isinstance(child.value, ast.Name):
+                raise UnsafeExpressionError("不允许的属性访问")
+            # 在 _eval_node 中统一处理，此处仅通过
         # 检查子脚本
         elif isinstance(child, ast.Subscript):
             raise UnsafeExpressionError("不允许的下标访问")
@@ -128,6 +131,18 @@ def _eval_node(node: ast.AST, variables: dict[str, Any]) -> Any:
         func_name = node.func.id
         args = [_eval_node(a, variables) for a in node.args]
         return _call_builtin(func_name, args)
+    elif isinstance(node, ast.Attribute):
+        # 属性访问: obj.attr — obj 必须是已定义变量
+        if not isinstance(node.value, ast.Name):
+            raise UnsafeExpressionError("不支持的属性访问")
+        obj = _eval_node(node.value, variables)
+        # 优先使用 getattr(支持对象属性)
+        if hasattr(obj, node.attr):
+            return getattr(obj, node.attr)
+        # 回退到 dict 式访问 (支持 JSON 对象)
+        if isinstance(obj, dict) and node.attr in obj:
+            return obj[node.attr]
+        raise ValueError(f"变量 '{node.value.id}' 无属性/键 '{node.attr}'")
     else:
         raise UnsafeExpressionError(f"不允许的表达式类型: {type(node).__name__}")
 

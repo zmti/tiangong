@@ -11,4 +11,5 @@ contextBridge.exposeInMainWorld('agentApp', {
     return () => ipcRenderer.removeListener('backend-status', listener);
   },
   restartBackend: () => ipcRenderer.invoke('restart-backend'),
+  openFolderDialog: () => ipcRenderer.invoke('open-folder-dialog'),
 });

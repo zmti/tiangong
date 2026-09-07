@@ -8,9 +8,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 
-from app.api import attachments, chat, documents, files, mcp, mcp_server, runs, schedule, tasks, telemetry, tools, tts, user_profile, budget, advanced, analytics, assistants, plugins, safety, persistent_memory, planning, search, metrics, sessions, long_running, tenants, system, collaboration, reasoning, memory_cleanup, cross_session, collaboration_ui, artifacts, workflow, multimodal
+from app.api import attachments, chat, documents, project, files, mcp, mcp_server, runs, schedule, tasks, telemetry, tools, tts, user_profile, budget, advanced, analytics, assistants, plugins, safety, persistent_memory, planning, search, metrics, sessions, long_running, tenants, system, collaboration, reasoning, memory_cleanup, cross_session, collaboration_ui, artifacts, workflow, multimodal
 from app.api.security import require_api_key, require_admin
 from app.config import settings
 from app.tools.registry import get_registry
@@ -56,7 +55,11 @@ def _check_multimodal_features():
 
         # 图片识别检查
         llm_provider = settings.agent_llm_provider.lower()
-        llm_model = getattr(settings, f"{llm_provider}_model", "") or settings.agent_llm_provider
+        # compat 对应的配置字段是 openai_compat_*，需要特殊处理
+        if llm_provider == "compat":
+            llm_model = settings.openai_compat_model
+        else:
+            llm_model = getattr(settings, f"{llm_provider}_model", "") or settings.agent_llm_provider
         if model_supports_vision(llm_model):
             logger.info("[功能已启用] 图片识别 (模型支持 vision: %s)", llm_model)
         else:
@@ -126,7 +129,7 @@ async def _init_long_running():
     try:
         from app.core.long_running import get_long_running_manager
         mgr = get_long_running_manager()
-        asyncio.get_event_loop().create_task(mgr.start_background_loop())
+        asyncio.get_running_loop().create_task(mgr.start_background_loop())
     except Exception as e:
         logger.warning("长时任务后台循环启动失败(不影响主服务): %s", e)
 
@@ -158,6 +161,16 @@ def _init_memory_ttl():
         logger.info("统一记忆管理器初始化完成")
     except Exception as e:
         logger.warning("记忆管理器初始化失败(不影响主服务): %s", e)
+
+
+async def _init_tool_route_cache():
+    """初始化工具路由缓存"""
+    try:
+        from app.core.tool_route_cache import get_tool_route_cache
+        cache = get_tool_route_cache()
+        logger.info("工具路由缓存已初始化")
+    except Exception as e:
+        logger.warning("工具路由缓存初始化失败(不影响主服务): %s", e)
 
 
 # ===== 停止函数定义 =====
@@ -206,10 +219,11 @@ async def _startup():
     _init_tenant_manager()
     _init_tool_hot_loader()
     _init_memory_ttl()
-    
+
     # 异步初始化
     await _init_mcp()
     await _init_long_running()
+    await _init_tool_route_cache()
 
 
 async def _shutdown():
@@ -218,6 +232,20 @@ async def _shutdown():
     _stop_session_archiver()
     await _stop_long_running()
     _stop_memory_ttl()
+    
+    # 停止 Telemetry 清理
+    try:
+        from app.core.telemetry import tracer
+        tracer.stop_background_cleanup()
+    except Exception as e:
+        logger.warning("Telemetry 清理停止失败: %s", e)
+    
+    # 停止批量 Checkpoint 管理器
+    try:
+        from app.runtime.batch_checkpoint import stop_batch_checkpoint_manager
+        await stop_batch_checkpoint_manager()
+    except Exception as e:
+        logger.warning("批量 Checkpoint 管理器停止失败: %s", e)
 
 
 @asynccontextmanager
@@ -230,15 +258,32 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Agent Service", version="1.0.0", lifespan=lifespan)
 
 # 桌面端渲染进程(file:// 源)需跨域访问本地后端
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# 生产环境建议通过环境变量配置允许的源列表
+_cors_origins = os.environ.get("CORS_ORIGINS", "").split(",") if os.environ.get("CORS_ORIGINS") else []
+if _cors_origins and "" in _cors_origins:
+    _cors_origins.remove("")
+if _cors_origins:
+    # 明确指定允许的来源
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+else:
+    # 开发模式:允许所有来源(仅本地桌面端)
+    logger.warning("CORS 未配置,允许所有来源(开发模式)")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 _auth = [Depends(require_api_key)] if settings.agent_api_key else []
+app.include_router(project.router)
 app.include_router(chat.router, dependencies=_auth)
 app.add_api_route('/v1/models', list_models, methods=['GET'], tags=['chat'])
 
@@ -285,8 +330,16 @@ os.makedirs(_images_dir, exist_ok=True)
 async def get_image(filename: str):
     """提供本地生成的图片"""
     import fastapi
-    filepath = os.path.join(_images_dir, filename)
-    if not os.path.isfile(filepath):
+    # 防路径穿越:规范化路径并严格校验
+    real_images_dir = os.path.realpath(_images_dir)
+    requested_path = os.path.realpath(os.path.join(real_images_dir, filename))
+    # 严格检查:请求路径必须是图片目录的子路径
+    if not (requested_path == real_images_dir or requested_path.startswith(real_images_dir + os.sep)):
+        raise fastapi.HTTPException(status_code=403, detail="访问被拒绝:路径穿越检测")
+    # 额外安全检查:不允许路径中包含特殊字符
+    if ".." in filename or "~" in filename or "\\" in filename or "/" in filename.replace(os.sep, ""):
+        raise fastapi.HTTPException(status_code=400, detail="非法文件名")
+    if not os.path.isfile(requested_path):
         raise fastapi.HTTPException(status_code=404, detail="File not found")
     # 检测 MIME 类型
     ext = os.path.splitext(filename)[1].lower()
@@ -299,14 +352,34 @@ async def get_image(filename: str):
         '.bmp': 'image/bmp',
     }
     mime_type = mime_types.get(ext, 'application/octet-stream')
-    with open(filepath, 'rb') as f:
+    with open(requested_path, 'rb') as f:
         content = f.read()
     return fastapi.responses.Response(content=content, media_type=mime_type)
 
 # 本地生成视频的静态目录(data/videos),供聊天与历史直接播放
 _videos_dir = os.path.join(settings.resolved_data_dir, "videos")
 os.makedirs(_videos_dir, exist_ok=True)
-app.mount("/videos", StaticFiles(directory=_videos_dir), name="videos")
+# 使用 API 路由代替 StaticFiles，避免 PyInstaller 打包问题并防止路径穿越
+@app.get("/videos/{filename}")
+async def get_video(filename: str):
+    """提供本地生成的视频"""
+    import fastapi
+    real_videos_dir = os.path.realpath(_videos_dir)
+    requested_path = os.path.realpath(os.path.join(real_videos_dir, filename))
+    # 严格检查:请求路径必须是视频目录的子路径
+    if not (requested_path == real_videos_dir or requested_path.startswith(real_videos_dir + os.sep)):
+        raise fastapi.HTTPException(status_code=403, detail="访问被拒绝:路径穿越检测")
+    # 额外安全检查:不允许路径中包含特殊字符
+    if ".." in filename or "~" in filename or "\\" in filename or "/" in filename.replace(os.sep, ""):
+        raise fastapi.HTTPException(status_code=400, detail="非法文件名")
+    if not os.path.isfile(requested_path):
+        raise fastapi.HTTPException(status_code=404, detail="File not found")
+    import mimetypes
+    mime_type, _ = mimetypes.guess_type(filename)
+    mime_type = mime_type or 'video/mp4'
+    with open(requested_path, 'rb') as f:
+        content = f.read()
+    return fastapi.responses.Response(content=content, media_type=mime_type)
 
 
 @app.get("/")

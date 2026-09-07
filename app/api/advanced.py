@@ -1,4 +1,4 @@
-"""记忆精炼 / Embedding 缓存 / 技能管理 / A-B评估 API"""
+"""记忆精炼 / Embedding 缓存 / 技能管理 / A-B评估 / 性能监控 API"""
 from __future__ import annotations
 
 import json
@@ -13,6 +13,7 @@ from app.core.skills import get_skill_registry
 from app.eval.ab import ABEvaluator
 from app.memory.consolidator import get_consolidator
 from app.rag.cache import get_embedding_cache
+from app.core.tool_route_cache import get_tool_route_cache
 
 router = APIRouter(prefix="/v1", tags=["advanced"])
 

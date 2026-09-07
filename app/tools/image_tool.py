@@ -38,11 +38,13 @@ def _save_image(data: bytes, ext: str) -> str:
 
 
 def _image_url(name: str) -> str:
-    """拼本地静态 URL,供前端实时展示与历史回放直接访问。"""
-    host = settings.agent_host
-    if not host or host in ("0.0.0.0", "::", ""):
-        host = "127.0.0.1"
-    return f"http://{host}:{settings.agent_port}/images/{name}"
+    """返回图片的相对路径 URL。
+
+    不拼接绝对地址,避免 agent_host/agent_port 配置与实际运行端口不一致时
+    (如 Electron 打包后固定 8517 端口)前端加载图片 404。
+    前端通过 App.backendUrl 拼接完整地址。
+    """
+    return f"/images/{name}"
 
 
 def _generate_image_data_url(prompt: str, size: str = "512x512") -> str:
@@ -99,14 +101,21 @@ def _generate_image_data_url(prompt: str, size: str = "512x512") -> str:
 
 @tool(
     "generate_image",
-    "根据文字描述生成一张图片,适合插画、示意图、图标等。返回图片,适合在聊天中展示",
+    "根据文字描述生成图片。支持真人照片、插画、示意图、图标、艺术图等任何类型。"
+    "可指定尺寸:横版16:9(1792x1024)、竖版9:16(1024x1792)、正方形(1024x1024)等。",
     timeout=360,
     enabled=_image_enabled(),
     terminal=True,
 )
 def generate_image(
-    prompt: str = Field(description="图片内容描述,越具体越好"),
-    size: str = Field("512x512", description="图片尺寸:256x256 / 512x512 / 1024x1024"),
+    prompt: str = Field(description="图片内容描述,越具体越好(语言:中文或英文均可)"),
+    size: str = Field(
+        "1024x1024",
+        description=(
+            "图片尺寸(宽高像素)。可选值:256x256 / 512x512 / 1024x1024(正方形默认) / "
+            "1024x1792(竖版9:16,适合手机壁纸) / 1792x1024(横版16:9,适合宽屏)。"
+        ),
+    ),
 ) -> str:
     data = _generate_image_data_url(prompt, size)
     return {"format": "local_url", "size": size, "image_url": data}

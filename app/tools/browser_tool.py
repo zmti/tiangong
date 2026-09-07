@@ -4,13 +4,44 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import os
 import tempfile
-import threading
 import time
 from typing import Optional
 
 from app.tools.registry import tool
+
+logger = logging.getLogger(__name__)
+
+
+# 浏览器 JS 执行沙箱:禁止访问危险全局对象/属性
+_BROWSER_JS_DANGEROUS_PATTERNS = [
+    "eval(", "Function(", "constructor",
+    "process.", "require(", "import(",
+    "window.location", "document.cookie",
+    "fetch(", "XMLHttpRequest",
+    "localStorage", "sessionStorage",
+    "parent.", "top.", "frame",
+    "crypto.", "indexedDB",
+    "navigator.serviceWorker",
+]
+
+
+def _sanitize_js_expression(expression: str) -> str:
+    """对 JS 表达式做基础安全检查,阻止常见危险模式。
+
+    注意:这不能完全沙箱化 JS,只是减少高风险操作。
+    在生产环境中应使用独立沙箱环境(如 jsdom sandbox)。
+    """
+    expr_lower = expression.lower()
+    for pattern in _BROWSER_JS_DANGEROUS_PATTERNS:
+        if pattern.lower() in expr_lower:
+            raise ValueError(
+                f"JS 表达式包含危险模式 {pattern!r},已拒绝执行。"
+                "仅允许纯计算和页面元素查询,不允许网络请求/文件访问/本地存储操作。"
+            )
+    return expression
 
 
 class BrowserSession:
@@ -147,8 +178,13 @@ class BrowserSession:
     async def evaluate(self, expression: str) -> dict:
         if not self._page:
             return {"error": "浏览器未启动"}
+        # 安全检查:防止执行危险 JS
         try:
-            result = await self._page.evaluate(expression)
+            sanitized = _sanitize_js_expression(expression)
+        except ValueError as e:
+            return {"error": str(e)}
+        try:
+            result = await self._page.evaluate(sanitized)
             return {"status": "ok", "result": result}
         except Exception as e:
             return {"error": f"执行失败: {e}"}
@@ -232,12 +268,12 @@ class BrowserSession:
 
 
 _session: Optional[BrowserSession] = None
-_session_lock = threading.Lock()
+_session_lock = asyncio.Lock()
 
 
 async def _get_session() -> BrowserSession:
     global _session
-    with _session_lock:
+    async with _session_lock:
         if _session is None or not _session.is_active:
             _session = BrowserSession()
             ok = await _session.launch()
@@ -327,10 +363,11 @@ async def browser_fill_form(
     return await session.fill_form(field_list)
 
 
-@tool("browser_evaluate", "执行 JavaScript 代码", timeout=15)
+@tool("browser_evaluate", "执行 JavaScript 代码(受限沙箱)", timeout=15)
 async def browser_evaluate(
     expression: str,
 ) -> dict:
+    """执行浏览器 JS。注意:仅允许安全表达式,禁止网络/文件/存储操作。"""
     session = await _get_session()
     return await session.evaluate(expression)
 

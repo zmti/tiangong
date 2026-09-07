@@ -6,6 +6,11 @@
     opts = opts || {};
     const headers = opts.headers || {};
 
+    // POST/PUT 有 body 时自动加 Content-Type（除非调用方已指定）
+    if (opts.body && !headers['Content-Type'] && !headers['content-type']) {
+      headers['Content-Type'] = 'application/json';
+    }
+
     // 鉴权
     if (App.backendApiKey) {
       headers['Authorization'] = 'Bearer ' + App.backendApiKey;

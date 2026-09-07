@@ -25,6 +25,7 @@ import uuid
 from typing import Optional
 
 from app.config import settings
+from app.core.constants import TEST_FAIL_MARKERS, TRANSIENT_PATTERNS
 from app.runtime.graph import END, Graph, Node
 from app.runtime.state import AgentState
 
@@ -34,6 +35,29 @@ def _clip(text: str, cap: int) -> str:
     if len(text) <= cap:
         return text
     return text[:cap] + "\n...[结果过长已截断]"
+
+
+def _clip_history_for_json(history: list[dict]) -> str:
+    """安全截断对话历史为 JSON:先逐条截断 content,再整体限制字节数。
+
+    避免直接对 json.dumps 结果做字符截断导致 JSON 结构损坏。
+    """
+    clipped = []
+    total_bytes = 0
+    for m in history:
+        raw = m.get("content", "") or m.get("kind", "")
+        if not str(raw).strip():
+            continue
+        s = str(raw)
+        # 按字节截断(UTF-8 下中文字符 3 字节)
+        if len(s.encode("utf-8")) > 500:
+            s = s.encode("utf-8")[:497].decode("utf-8", errors="ignore")
+            s = s + "…"
+        clipped.append({**m, "content": s})
+        total_bytes += len(json.dumps({"role": m.get("role"), "content": s}, ensure_ascii=False).encode("utf-8"))
+        if total_bytes > 5500:
+            break
+    return json.dumps(clipped, ensure_ascii=False)
 
 
 def _truncate_to_token_budget(text: str, max_tokens: int, llm=None) -> tuple[str, bool]:
@@ -59,6 +83,9 @@ from app.core.prompts import TOOL_CALL_PATTERN, build_system_prompt, build_tools
 from app.core.telemetry import _current_run_id, tracer
 from app.tools.categories import SYSTEM_TOOLS
 from app.tools.registry import ToolRegistry, get_registry
+import logging  # noqa: F401  # 保留供后续代码使用
+
+logger = logging.getLogger(__name__)
 
 # 计划工具:在 ReAct 循环内被 Agent 拦截,维护私有计划状态
 PLAN_TOOLS = ("set_plan", "update_plan")
@@ -68,6 +95,26 @@ NO_RETRY_TOOLS = ("run_terminal",)
 
 # 多智能体编排模式(Orchestration 层),与执行模式(single/auto/review/ensemble)正交
 ORCHESTRATION_MODES = ("sequential", "hierarchical", "consensual")
+
+# 工具路由快速通道阈值: 简短问候直接跳过 LLM 路由
+_TOOL_ROUTE_SHORT_INPUT_THRESHOLD = 15
+_TOOL_ROUTE_SHORT_INPUT_KEYWORDS = ("代码", "文件", "搜索", "网页", "执行", "运行", "分析", "报告", "计算")
+
+# 任务规划快速通道阈值: 简短消息跳过规划
+_PLAN_SHORT_INPUT_THRESHOLD = 20
+_PLAN_SHORT_INPUT_KEYWORDS = ("代码", "文件", "搜索", "网页", "执行", "运行", "分析", "报告", "计算", "脚本", "程序")
+
+# 确认流轮询间隔(秒)
+_CONFIRM_POLL_INTERVAL = 0.8
+
+# 错误分析最近消息数
+_ERROR_RECENT_MESSAGE_COUNT = 6
+
+# 历史摘要保留最近消息数
+_MEMORY_RECENT_HISTORY_COUNT = 6
+
+# 自动记忆沉淀单条事实最大字符数
+_AUTO_MEMORY_FACT_MAX_CHARS = 30
 
 
 class AgentResult:
@@ -101,10 +148,20 @@ class Agent:
         max_output_tokens: int = 0,
         orch_subtasks: int = 0,
         orch_candidates: Optional[list[str]] = None,
+        task_config: Optional[dict] = None,
     ):
         self.llm = llm or LLMClient()
-        # 协作模式:请求级优先,否则用全局配置(auto=跟随各开关)
-        self.mode = (mode or settings.agent_mode or "auto").lower()
+        # 自动缩放配置:根据任务复杂度动态调整参数
+        self._task_config = task_config
+        if task_config:
+            # task_config 优先，如果没有则使用参数或默认配置
+            self.max_steps = task_config.get("max_steps") or max_steps or settings.agent_max_steps
+            self.context_budget = task_config.get("context_budget") or settings.context_char_budget
+            self.mode = task_config.get("mode") or (mode or settings.agent_mode or "auto").lower()
+        else:
+            self.max_steps = max_steps or settings.agent_max_steps
+            self.context_budget = settings.context_char_budget
+            self.mode = (mode or settings.agent_mode or "auto").lower()
         # 输出 token 配额硬控制:0 = 不限制;>0 时答案超过即截断并附提示
         self.max_output_tokens = max_output_tokens or int(settings.agent_default_max_output_tokens or 0)
         self.ensemble_models = list(ensemble_models or [])
@@ -123,7 +180,8 @@ class Agent:
                 from app.core.llm import LLMClient as _L
 
                 self.critic_llm = _L(critic_provider, critic_model or None)
-            except Exception:  # noqa: BLE001
+            except Exception as e:
+                logger.warning("critic_llm 初始化失败,降级为单模型模式: %s", e)
                 self.critic_llm = None
         # 实例级评审/校验开关:single 关闭,review 强制开启,auto 跟随全局
         self._verify_enabled = settings.agent_verify
@@ -135,13 +193,14 @@ class Agent:
             self._verify_enabled = True
             self._reflect_enabled = True
         self.registry = registry or get_registry()
-        self.max_steps = max_steps or settings.agent_max_steps
         self.system_prompt = system_prompt or settings.agent_system_prompt
         self.temperature = temperature if temperature is not None else settings.agent_temperature
         self.route = route if route is not None else settings.agent_routing_enabled
         # 上下文预算:实例级覆盖(子智能体可给更小预算以强制聚焦)。
         # 默认继承全局;delegate/handoff 创建子 Agent 时显式收紧。
-        self.context_budget = settings.context_char_budget
+        # 注意: task_config 中的 context_budget 已在上方赋值，此处仅用于无 task_config 时初始化
+        if not hasattr(self, 'context_budget') or self.context_budget is None:
+            self.context_budget = settings.context_char_budget
         self.token_budget = settings.agent_token_budget
         # 当前会话 ID:用于检索/写入 session 级长期记忆,并透传给记忆工具
         self.session_id = session_id or ""
@@ -153,6 +212,10 @@ class Agent:
         # 分层记忆注入的提示块(由 _node_prepare 异步检索后缓存)
         self._memory_note: str = ""
         self._dangerous_tools = {s.strip() for s in settings.agent_dangerous_tools.split(",") if s.strip()}
+        # 危险工具频率限制(共享实现,与 ToolExecutor 行为一致)
+        from app.core.tool_safety import DangerousToolRateLimiter
+
+        self._dangerous_rate_limiter = DangerousToolRateLimiter()
         # interrupt 式确认流:本次运行已由用户批准的工具名(runtime 运行时集合)
         self._runtime_approved: set[str] = set()
         # 工具路由:预选后只把相关工具子集暴露给模型;None=未路由(全量)
@@ -165,7 +228,20 @@ class Agent:
         self._plan: Optional[TaskPlan] = None
         self._plan_dirty = False
         # 工具结果去重缓存:同一运行内 (tool, args) -> result(仅成功结果)
-        self._tool_cache: dict[tuple[str, str], str] = {}
+        # 使用 OrderedDict 实现 LRU 淘汰(而非 FIFO)
+        try:
+            from collections import OrderedDict
+            self._tool_cache: dict[tuple[str, str], str] = OrderedDict()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("工具缓存初始化失败,降级为无缓存模式: %s", e)
+            self._tool_cache = {}
+        # 工具缓存锁:保护 OrderedDict 操作，防止并发访问导致损坏
+        self._tool_cache_lock = asyncio.Lock()
+        # 仅对安全(纯函数)工具启用缓存
+        safe_tools_str = settings.agent_tool_cache_safe_tools or ""
+        self._tool_cache_safe: set[str] = {
+            t.strip() for t in safe_tools_str.split(",") if t.strip()
+        }
         # 图运行时
         self._graph: Optional[Graph] = None
         self._checkpoint = None
@@ -174,7 +250,8 @@ class Agent:
 
             try:
                 self._checkpoint = CheckpointManager()
-            except Exception:  # noqa: BLE001  # checkpoint 不可用不影响主流程
+            except Exception as e:  # noqa: BLE001  # checkpoint 不可用不影响主流程
+                logger.warning("checkpoint 加载失败,降级为无持久化模式: %s", e)
                 self._checkpoint = None
 
     # ---- 对外接口 ----
@@ -289,7 +366,8 @@ class Agent:
             if interrupt is not None:
                 done["interrupt"] = interrupt
             yield done
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            logger.warning("run() 运行异常，记录 trace 后终止: %s", e)
             tracer.record({"type": "run_end", "run_id": run_id, "ok": False,
                            "error": str(state.error or "")[:300],
                            "duration": round(time.time() - t0, 3)})
@@ -345,10 +423,13 @@ class Agent:
             self._plan = None
 
     def _build_graph(self) -> Graph:
-        if self._graph is not None:
-            return self._graph
+        # 每次调用创建新图,避免多次 run 复用同一图实例导致 state 残留
+        # 动态计算初始步数:基于 task_config 中的 max_steps
+        # 注意: 实际执行时会通过 _get_dynamic_max_steps() 动态调整
+        base_max = self.max_steps
+        # Graph.max_iters 需要预留足够余量，实际检查在 _node_llm 中进行
         g = Graph(name="agent", checkpoint=self._checkpoint,
-                  max_iters=self.max_steps + 16)
+                  max_iters=base_max + 100)  # 增加余量到100步
         g.add_node(Node("prepare", self._node_prepare))
         g.add_node(Node("llm", self._node_llm))
         g.add_node(Node("tools", self._node_tools))
@@ -363,7 +444,7 @@ class Agent:
         g.add_conditional_edge("finalize", self._route_finalize)
         g.add_conditional_edge("reflect", self._route_reflect)
         g.add_conditional_edge("verify", self._route_verify)
-        self._graph = g
+        g.set_entry("prepare")
         return g
 
     async def _route_llm(self, state: AgentState) -> Optional[str]:
@@ -374,22 +455,62 @@ class Agent:
             return "tools"
         return "finalize"
 
-    async def _route_finalize(self, state: AgentState) -> Optional[str]:
-        """finalize 之后:反思开启且仍有评审预算→reflect;否则停止。
+    def _get_dynamic_max_steps(self, state: AgentState) -> int:
+        """根据计划进度动态计算最大步数。
 
-        评审预算 = agent_reflect_max_rounds + 1:初稿评审一次,每轮重写后再评审一次。
+        规则:
+        1. 如果有计划且未完成,根据剩余步骤数动态调整上限
+        2. 每完成一步，剩余预算减少
+        3. 动态上限 = base_max + remaining * steps_per_step
         """
+        base_max = self.max_steps
+        if not self._plan:
+            return base_max
+
+        completed = sum(1 for s in self._plan.steps if s.status == "done")
+        total = len(self._plan.steps)
+        remaining = total - completed
+
+        if remaining <= 0:
+            return base_max  # 计划已完成,使用基础步数
+
+        # 正确公式: 基础步数 + 剩余步骤 × 每步预算
+        # 随着任务完成，动态上限逐渐降低到 base_max
+        steps_per_plan_step = 8  # 每个计划步骤分配 8 步 (思考 + 执行 + 验证)
+        dynamic_max = base_max + remaining * steps_per_plan_step
+        return int(dynamic_max)
+
+    async def _route_finalize(self, state: AgentState) -> Optional[str]:
+        """finalize 之后:简单回答跳过反思/校验;否则按预算进入反思→校验。"""
+        answer = state.answer or ""
+        has_tool_steps = any(s.get("type") == "tool" for s in state.steps)
+        # 空答案:跟踪连续空答案次数，超过阈值则触发 giveup
+        if not answer or not answer.strip():
+            consecutive_empty = int(state.metadata.get("consecutive_empty_answers", 0)) + 1
+            state.metadata["consecutive_empty_answers"] = consecutive_empty
+            # 改进：提高阈值到 5 次，避免复杂任务过早放弃
+            if consecutive_empty >= 5:
+                state.metadata["giveup"] = True
+                return "giveup"
+            return "llm"
+        # 有答案时重置计数器
+        state.metadata["consecutive_empty_answers"] = 0
+        # 简单回答(<200字且无工具调用):直接停止,跳过反思和校验
+        # 提高阈值避免任务过早结束(原 100 字过低,容易导致 LLM 用简短回答逃避复杂任务)
+        if len(answer.strip()) < 200 and not has_tool_steps:
+            return END
         if not self._reflect_enabled:
             return END
         rounds = int(state.metadata.get("reflect_rounds", 0))
         if rounds >= settings.agent_reflect_max_rounds + 1:
             return END
-        if not state.answer or state.metadata.get("stream"):
-            return END
         return "reflect"
 
     async def _route_reflect(self, state: AgentState) -> Optional[str]:
-        """reflect 之后:通过→verify(事实校验);不合格且仍有评审预算→回 llm 重写。"""
+        """reflect 之后:空答案直接停止;通过→verify;不合格且仍有评审预算→回 llm 重写。"""
+        answer = state.answer or ""
+        if len(answer.strip()) < 50:
+            return END
         if state.metadata.get("reflect_rewrite"):
             rounds = int(state.metadata.get("reflect_rounds", 0))
             if rounds >= settings.agent_reflect_max_rounds + 1:
@@ -428,6 +549,7 @@ class Agent:
             state.emit({"type": "thinking", "content": f"[准备阶段超时({prepare_timeout}s),使用基础配置继续]"})
             if not state.messages:
                 state.messages = [{"role": "user", "content": user_input}]
+            # 超时后使用最小上下文继续,不中断主流程
             return
 
         state.active_tools = self._active_tools
@@ -452,27 +574,36 @@ class Agent:
         self._memory_note = await self._build_memory_note_async(user_input, history)
         state.messages = self._build_messages(user_input, history)
     async def _node_llm(self, state: AgentState, graph: Graph) -> None:
-        """调用 LLM;把结果(mode/content/tool_calls)暂存到 metadata 供路由与 tools 节点使用。"""
+        """调用 LLM;把结果(tool_call_mode/content/tool_calls)暂存到 metadata 供路由与 tools 节点使用。"""
         rounds = int(state.metadata.get("llm_rounds", 0))
-        if rounds >= self.max_steps:
+        # 动态步数计算:基于计划进度自动扩展
+        dynamic_max = self._get_dynamic_max_steps(state)
+        
+        total_steps = len(state.steps)
+        if rounds >= dynamic_max and total_steps >= dynamic_max:
             state.metadata["giveup"] = True
+            logger.warning("步骤耗尽: rounds=%d, total_steps=%d, dynamic_max=%d",
+                          rounds, total_steps, dynamic_max, effective_max)
             return
+        
         state.metadata["llm_rounds"] = rounds + 1
 
         is_stream = state.metadata.get("stream", False)
         if is_stream:
-            mode, resp, tool_calls = await self._call_llm_stream(state.messages, state)
+            tool_call_mode, resp, tool_calls = await self._call_llm_stream(state.messages, state)
         else:
-            mode, resp, tool_calls = await self._call_llm(state.messages)
+            tool_call_mode, resp, tool_calls = await self._call_llm(state.messages)
+        state.metadata["tool_call_mode"] = tool_call_mode
         state.metadata["resp"] = resp or ""
         state.metadata["tool_calls"] = [tc.to_dict() for tc in tool_calls]
 
         # 推理模型:先把思维链透出为 thinking 事件(与正文分离)
         reasoning = getattr(self.llm, "_reasoning", "") or ""
         if reasoning:
+            state.metadata["reasoning"] = reasoning
             state.emit({"type": "thinking", "content": reasoning, "reasoning": True})
 
-        if mode == "native" and tool_calls:
+        if tool_call_mode == "native" and tool_calls:
             state.messages.append({
                 "role": "assistant",
                 "content": resp or "",
@@ -492,7 +623,7 @@ class Agent:
         创建确认请求并 graph.interrupt(暂停落盘返回控制权),不执行任何工具;
         用户批准后 resume 重入本节点,已批准的工具放行执行。
         """
-        mode = state.metadata.get("mode")
+        tool_call_mode = state.metadata.get("tool_call_mode", "text")
         tool_calls = [
             ToolCall(id=tc.get("id", ""), name=tc.get("name", ""), arguments=tc.get("arguments", "{}"))
             for tc in state.metadata.get("tool_calls", []) or []
@@ -521,13 +652,24 @@ class Agent:
                     if self._is_tool_approved_by_resume(tc, state):
                         self._runtime_approved.add(tc.name)
 
-        # 工具开始执行:先发 tool_start,让前端感知"正在调用工具"并在长耗时调用期间保持连接
-        state.emit({"type": "tool_start", "names": [tc.name for tc in tool_calls]})
+        # 工具开始执行:先逐工具发 tool_call_start,再批量执行
+        state.emit({
+            "type": "tool_call_start",
+            "tools": [
+                {"name": tc.name, "arguments": tc.arguments}
+                for tc in tool_calls
+            ],
+        })
+        # 也发送逐工具的 tool_start 事件(供旧的 ExecTrace 兼容)
+        for tc in tool_calls:
+            state.emit({"type": "tool_start", "name": tc.name, "arguments": tc.arguments})
         batch = await self._execute_batch(tool_calls, state.steps, step)
         # 代码级自愈:对失败的代码类工具自动执行"分析-修复-重跑"闭环
         batch = await self._maybe_self_heal(state, batch, step)
-        for tc, result_str, _is_err in batch:
-            if mode == "native":
+        tool_seq = int(state.metadata.get("tool_seq", 0))
+        for i, (tc, result_str, _is_err) in enumerate(batch):
+            step_id = f"{state.run_id}_t{tool_seq + i}"
+            if tool_call_mode == "native":
                 state.messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -538,7 +680,15 @@ class Agent:
                     "role": "user",
                     "content": f"工具 {tc.name} 执行结果如下,请基于结果继续:\n{_clip(result_str, settings.message_char_cap)}",
                 })
-            state.emit({"type": "tool", "name": tc.name, "arguments": tc.arguments, "result": result_str})
+            # 发送工具执行完成事件,携带 step_id 供前端去重(全局单调递增,跨批次唯一)
+            state.emit({
+                "type": "tool",
+                "name": tc.name,
+                "arguments": tc.arguments,
+                "result": result_str,
+                "step_id": step_id,
+            })
+        state.metadata["tool_seq"] = tool_seq + len(batch)
 
         evt = self._flush_plan(state.steps, step)
         if evt:
@@ -572,19 +722,15 @@ class Agent:
         # 统一从 _node_llm 已收集的响应开始;流式已逐 token 发出,非流式尚未生成完整回答
         answer = state.metadata.get("resp", "") or ""
 
-        if state.metadata.get("stream"):
-            # 流式模式: 兜底重跑(理论上 resp 已收集完整)
-            if not answer:
-                tokens: list[str] = []
-                budget = self.max_output_tokens
-                async for tok in self.llm.chat_stream(state.messages, temperature=self.temperature):
-                    tokens.append(tok)
-                    state.emit({"type": "token", "content": tok})
-                answer = "".join(tokens)
-        else:
-            # 非流式模式: _node_llm 已把 LLM 完整响应存到 resp,直接采用;
-            # 如果 resp 为空(如调用失败),再补一次非流式调用
-            if not answer:
+        # 空答案兜底:如果 resp 为空，尝试重新生成
+        if not answer:
+            # 先尝试 reasoning 作为兜底
+            answer = state.metadata.get("reasoning", "") or ""
+            if answer and state.metadata.get("stream"):
+                for ch in answer:
+                    state.emit({"type": "token", "content": ch})
+            # 如果仍然为空，非流式模式下补一次 LLM 调用
+            if not answer and not state.metadata.get("stream"):
                 answer = await self.llm.chat(state.messages, temperature=self.temperature)
 
         # 输出 token 配额硬控制
@@ -597,7 +743,12 @@ class Agent:
                                 "content": f"[已达输出配额上限 {self.max_output_tokens} token,回答已截断]"})
 
         state.answer = answer
-        state.steps.append({"step": step + 1, "type": "answer", "content": answer})
+        # 剥离 <thinking>...</thinking> 标签,确保存储的答案不含思考内容
+        if state.answer:
+            state.answer = re.sub(r'<thinking[^>]*>[\s\S]*?</thinking>', '', state.answer, flags=re.IGNORECASE).strip()
+            state.answer = re.sub(r'[ \t]+', ' ', state.answer)
+            state.answer = re.sub(r'\n{3,}', '\n\n', state.answer)
+        state.steps.append({"step": step + 1, "type": "answer", "content": state.answer})
 
         # 输出护栏:敏感信息/提示词泄露检测(流式模式 token 已发出,仅记录;非流式可拦截)
         from app.core.guardrails import run_output_guardrails
@@ -614,10 +765,51 @@ class Agent:
         await self._maybe_auto_memory(state.user_input, state.answer, state.metadata.get("history", []) or [])
 
     async def _node_giveup(self, state: AgentState, graph: Graph) -> None:
-        """达到步数上限:给出兜底回答。"""
-        answer = "我已经尝试了多次仍无法完成任务,请简化你的需求或提供更多信息。"
+        """达到步数上限:给出兜底回答,附带失败细节帮助用户重新尝试。"""
+        # 从对话历史中提取最后一条助手消息,了解最后一次尝试
+        last_assistant = ""
+        for msg in reversed(state.messages):
+            if msg.get("role") == "assistant":
+                last_assistant = (msg.get("content") or "")[:300]
+                break
+
+        # 从 _failures 提取失败工具摘要
+        failed_tools = []
+        for name, count in sorted(state._failures.items(), key=lambda x: -x[1])[:3]:
+            failed_tools.append(f"{name}(失败{count}次)")
+        failed_str = "、".join(failed_tools) if failed_tools else "无"
+
+        # 从 messages 提取最近的错误/反思消息作为线索
+        recent_errors = []
+        for msg in reversed(state.messages[-_ERROR_RECENT_MESSAGE_COUNT:]):
+            content = msg.get("content", "") or ""
+            if msg.get("role") == "assistant" and ("失败" in content or "error" in content.lower()
+                                                   or "无法" in content):
+                recent_errors.append(content[:150])
+            elif msg.get("role") == "tool" and "error" in content.lower():
+                recent_errors.append(f"[{msg.get('name', '?')}] {content[:150]}")
+            if len(recent_errors) >= 3:
+                break
+
+        detail_parts = []
+        if failed_tools:
+            detail_parts.append(f"失败工具: {failed_str}")
+        if last_assistant:
+            detail_parts.append(f"最后尝试: {last_assistant[:100]}")
+        if recent_errors:
+            detail_parts.append("错误线索: " + " | ".join(recent_errors))
+        detail = "; ".join(detail_parts) if detail_parts else "无额外信息"
+
+        answer = (
+            f"无法完成任务：已尝试 {self.max_steps} 步，仍未能得到正确结果。\n\n"
+            f"详情: {detail}\n\n"
+            "建议：简化需求、提供更多背景信息，或分步骤描述任务。"
+        )
         state.answer = answer
-        state.steps.append({"step": self.max_steps, "type": "error", "content": "达到最大步数限制"})
+        state.steps.append({"step": self.max_steps, "type": "error",
+                            "content": f"达到最大步数限制({self.max_steps}步)，失败工具: {failed_str}"})
+        logger.info("giveup: input=%r steps=%d failures=%s last_assistant=%r",
+                     state.user_input[:100], self.max_steps, failed_str, last_assistant[:100])
         if state.metadata.get("stream"):
             for ch in answer:
                 state.emit({"type": "token", "content": ch})
@@ -662,11 +854,13 @@ class Agent:
         from app.core.llm import LLMClient as _L
 
         specs = self._ensemble_specs()
-        agents: list[Agent] = []
-        for provider, model in specs:
+        agents: list[tuple[tuple[str, str], Agent]] = []
+        for spec in specs:
+            provider, model = spec
             try:
                 llm = _L(provider, model or None)
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
+                logger.warning("子 Agent LLM 创建失败，跳过 provider=%s model=%s: %s", provider, model, e)
                 continue
             sub = Agent(
                 llm=llm,
@@ -678,19 +872,23 @@ class Agent:
                 critic_provider=(self.critic_llm.provider if self.critic_llm else ""),
                 critic_model=(self.critic_llm.model if self.critic_llm else ""),
             )
-            agents.append(sub)
+            sub._active_tools = self._active_tools
+            sub._schemas_cache = None
+            agents.append((spec, sub))
 
         if not agents:
             return AgentResult(answer="ensemble 模式没有可用模型。", steps=[], model=self.llm.info["model"])
 
         try:
-            results = await asyncio.gather(*[a.run(user_input, history) for a in agents])
+            results = await asyncio.gather(*[a.run(user_input, history) for _, a in agents])
         except Exception as e:  # noqa: BLE001
             return AgentResult(answer=f"ensemble 执行失败: {e}", steps=[], model=self.llm.info["model"])
 
         # 各子 Agent 的轨迹合并为 steps,便于可观测
+        # 用配对列表(spec, agent, result)而非 zip(specs, results),避免创建失败跳过导致的下标错位
+        paired = [(spec, agent, res) for (spec, agent), res in zip(agents, results)]
         steps: list[dict] = []
-        for i, (spec, res) in enumerate(zip(specs, results)):
+        for i, (spec, agent, res) in enumerate(paired):
             steps.append({
                 "step": i + 1,
                 "type": "ensemble_member",
@@ -699,13 +897,14 @@ class Agent:
                 "answer": res.answer,
                 "member_steps": res.steps,
             })
-        steps.append({"step": len(specs) + 1, "type": "ensemble_judge"})
+        steps.append({"step": len(paired) + 1, "type": "ensemble_judge"})
 
-        best = await self._judge_ensemble(user_input, results)
+        judge_results = [res for _spec, _agent, res in paired]
+        best = await self._judge_ensemble(user_input, judge_results)
         if best is not None:
             return AgentResult(answer=best.answer, steps=steps, model=best.model)
         # 评审失败:退回第一个有效结果
-        return AgentResult(answer=results[0].answer, steps=steps, model=results[0].model)
+        return AgentResult(answer=judge_results[0].answer, steps=steps, model=judge_results[0].model)
 
     async def _judge_ensemble(self, user_input: str, results: list[AgentResult]) -> Optional[AgentResult]:
         """对全部候选回答打分,返回最佳结果;失败返回 None(退回第一候选)。"""
@@ -760,7 +959,8 @@ class Agent:
                 temperature=0.2,
                 validator=_validator,
             )
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            logger.warning("ensemble 评审失败，随机选取第一个结果: %s", e)
             return None
         winner = int(verdict.get("winner", 0))
         if not (0 <= winner < len(results)):
@@ -774,9 +974,9 @@ class Agent:
     # 每个子任务都由一个新的执行模式 Agent 完成,因此层级叶子也可以是
     # ensemble / review 等执行模式(天然递归)。
 
-    def _make_worker(self, mode_name: str) -> "Agent":
+    def _make_worker(self, mode_name: str, active_tools: Optional[list[str]] = None) -> "Agent":
         """为某个执行模式创建一个子智能体(执行体)。"""
-        return Agent(
+        sub = Agent(
             llm=self.llm,
             registry=self.registry,
             session_id=self.session_id,
@@ -786,8 +986,12 @@ class Agent:
             ensemble_models=self.ensemble_models,
             max_output_tokens=self.max_output_tokens,
         )
+        # 子 Agent 继承父 Agent 的工具路由结果,避免调用无关工具
+        sub._active_tools = active_tools or self._active_tools
+        sub._schemas_cache = None
+        return sub
 
-    def _register_orch_agents(self, orch, modes: list[str] | None = None) -> None:
+    async def _register_orch_agents(self, orch, modes: list[str] | None = None) -> None:
         """把执行模式注册为编排器的"智能体"(幂等),供任务分解时按需分配。
 
         modes: 限定只注册这些执行模式(来自 UI 的"候选执行体清单");为 None 时注册全部。
@@ -800,7 +1004,7 @@ class Agent:
             "review": "执行后由独立评审模型核查质量,适合校验与总结",
             "ensemble": "多模型并行生成再由评审模型择优,适合高可靠任务",
         }
-        tool_names = [t.name for t in self.registry.list()]
+        tool_names = [t.name for t in await self.registry.list()]
         names = modes if modes else list(roster.keys())
         for name in names:
             if name not in roster:
@@ -873,13 +1077,14 @@ class Agent:
         orch = get_orchestrator()
         # 先注册执行模式"智能体",decompose_task 才能据此分配子任务。
         # 若 UI 配置了候选执行体清单,则只注册这些模式(子任务只能分配给它们)。
-        self._register_orch_agents(orch, modes=self.orch_candidates or None)
+        await self._register_orch_agents(orch, modes=self.orch_candidates or None)
         try:
             sub_tasks = await orch.decompose_task(
                 user_input, user_input, self.llm,
                 num_subtasks=self.orch_subtasks,
             )
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            logger.warning("子任务分解失败，降级为单任务执行: %s", e)
             sub_tasks = None
         if not sub_tasks:
             sub_tasks = [SubTask(description=user_input, assigned_agent="auto")]
@@ -913,7 +1118,7 @@ class Agent:
 
     async def _orch_run_worker(self, mode_name: str, prompt: str, history, index: int, _sink: list[str] | None = None):
         """驱动单个执行体并转发其事件;token 同时写入 _sink 供上层汇总上下文。"""
-        worker = self._make_worker(mode_name)
+        worker = self._make_worker(mode_name, active_tools=self._active_tools)
         async for ev in worker.run_stream(prompt, history=history):
             if ev["type"] == "token":
                 if _sink is not None:
@@ -928,7 +1133,7 @@ class Agent:
         yield {"type": "orchestration", "phase": "parallel_start",
                "candidates": candidates,
                "message": f"并行启动 {len(candidates)} 个执行体,随后投票择优"}
-        workers = [self._make_worker(m) for m in candidates]
+        workers = [self._make_worker(m, active_tools=self._active_tools) for m in candidates]
         try:
             results = await asyncio.gather(*[w.run(user_input, history=history) for w in workers])
         except Exception as e:  # noqa: BLE001
@@ -992,7 +1197,10 @@ class Agent:
             f"- 是否直接回答了用户的问题\n"
             f"- 是否引用了工具结果(如有)\n"
             f"- 是否有多余/错误/幻觉内容\n"
-            f"打分 1-10;若存在需要修正的问题,verdict 返回 rewrite 并列出 issues。"
+            f"打分 1-10;\n"
+            f"- 分数>=7 且无事实错误时,verdict 返回 pass\n"
+            f"- 只有存在事实错误、幻觉或严重不完整时,verdict 才返回 rewrite\n"
+            f"- 格式、语气、详细程度等主观问题不作为 rewrite 理由\n"
         )
         try:
             review = await self._critic().chat_json_schema(
@@ -1004,7 +1212,8 @@ class Agent:
                 temperature=0.2,
                 validator=_validator,
             )
-        except Exception:  # noqa: BLE001  # 评审失败视为通过
+        except Exception as e:  # noqa: BLE001  # 评审失败视为通过
+            logger.warning("反思评审失败，降级为直接通过: %s", e)
             return
 
         verdict = review.get("verdict", "pass")
@@ -1017,10 +1226,18 @@ class Agent:
             "issues": issues,
         })
         if verdict == "rewrite" and issues:
+            # 只在实际问题需要修正时才重写，避免对正确答案的过度修改
+            critical_issues = [i for i in issues if any(kw in str(i) for kw in
+                ["错误", "幻觉", "不实", "不正确", "矛盾", "缺失关键"])]
+            if not critical_issues:
+                # 只有主观建议时不重写，保持原答案
+                state.metadata["reflect_rewrite"] = False
+                return
             state.metadata["reflect_rewrite"] = True
             state.messages.append({"role": "user", "content":
-                "评审意见:你的回答存在以下问题,请修正后重新回答。\n- "
-                + "\n- ".join(str(i) for i in issues)})
+                "请根据以下反馈修正回答中的事实错误：\n- "
+                + "\n- ".join(str(i) for i in critical_issues)
+                + "\n\n请直接给出修正后的完整回答，不要道歉或重复之前的错误。"})
 
     async def _node_verify(self, state: AgentState, graph: Graph) -> None:
         """最终答案事实校验(LLM-as-judge):核对答案断言是否被工具结果支撑。
@@ -1030,8 +1247,6 @@ class Agent:
         校验失败/无工具结果/非必要一律通过,不影响主流程。
         """
         if not self._verify_enabled or not state.answer or not state.answer.strip():
-            return
-        if state.metadata.get("stream"):
             return
         tool_results = [
             s.get("result", "") for s in state.steps
@@ -1081,7 +1296,8 @@ class Agent:
                 temperature=0.1,
                 validator=_validator,
             )
-        except Exception:  # noqa: BLE001  # 校验失败视为通过
+        except Exception as e:  # noqa: BLE001  # 校验失败视为通过
+            logger.warning("事实校验失败，降级为直接通过: %s", e)
             return
 
         unsupported = check.get("unsupported") or []
@@ -1094,10 +1310,11 @@ class Agent:
         if not check.get("supported") and unsupported:
             state.metadata["verify_rewritten"] = True
             rewrite_prompt = (
-                f"你的上一版回答包含未被证据支撑的断言,请只依据下面的工具结果重写回答:\n"
+                f"请根据以下工具结果修正回答中的事实错误:\n"
                 f"未支撑断言:\n- " + "\n- ".join(str(u) for u in unsupported) + "\n\n"
                 f"可用证据:\n{evidence}\n\n"
                 f"重写要求:删除或修正所有无法由证据支撑的表述,不引入证据之外的新信息。"
+                f"直接给出修正后的完整回答，不要道歉或重复之前的错误。"
                 f"用户请求: {state.user_input}"
             )
             try:
@@ -1105,7 +1322,8 @@ class Agent:
                     [{"role": "user", "content": rewrite_prompt}],
                     temperature=self.temperature,
                 )
-            except Exception:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001
+                logger.warning("校验后 LLM 重写回答失败: %s", e)
                 return
             state.answer = new_answer
             state.steps.append({
@@ -1121,10 +1339,10 @@ class Agent:
     def _schemas(self) -> list[dict]:
         if self._schemas_cache is None:
             if self._active_tools is None:
-                tools = self.registry.list()
+                tools = self.registry.list_sync()
             else:
                 active = set(self._active_tools) | set(self._always_tools)
-                tools = [t for t in self.registry.list() if t.name in active]
+                tools = [t for t in self.registry.list_sync() if t.name in active]
             self._schemas_cache = [t.to_openai_schema() for t in tools]
         return self._schemas_cache
 
@@ -1140,10 +1358,23 @@ class Agent:
 
         # 简短问候快速通道:跳过LLM路由
         cleaned = user_input.strip()
-        if len(cleaned) <= 15 and not any(kw in cleaned for kw in ("代码", "文件", "搜索", "网页", "执行", "运行", "分析", "报告", "计算")):
+        if len(cleaned) <= _TOOL_ROUTE_SHORT_INPUT_THRESHOLD and not any(kw in cleaned for kw in _TOOL_ROUTE_SHORT_INPUT_KEYWORDS):
             return None
-        max_tools = min(int(settings.agent_max_tools or 10), len(self.registry.list()))
-        min_confidence = 0.10
+        # 改进：增加默认预选工具数量，从 10 提高到 20
+        max_tools = min(int(settings.agent_max_tools or 20), len(await self.registry.list()))
+        # 改进：提高置信度阈值，从 0.10 提高到 0.30
+        min_confidence = 0.30
+
+        # 尝试从缓存获取路由结果
+        from app.core.tool_route_cache import get_tool_route_cache
+        cache = get_tool_route_cache()
+        cached = await cache.get(user_input)
+        if cached is not None:
+            logger.debug("使用缓存的工具路由结果: %d 个工具", len(cached.tools))
+            self._active_tools = cached.tools
+            self._schemas_cache = None
+            steps.append({"step": step, "type": "tool_route", "tools": cached.tools, "reason": cached.reason, "cached": True})
+            return {"type": "tool_route", "tools": cached.tools, "reason": cached.reason, "cached": True}
 
         # 使用智能路由(关键词+embedding+LLM 三级缓存 + 置信度评分)
         try:
@@ -1157,10 +1388,12 @@ class Agent:
             if selected and conf >= min_confidence:
                 self._active_tools = selected
                 self._schemas_cache = None
+                # 写入缓存
+                await cache.set(user_input, selected, conf, reason)
                 steps.append({"step": step, "type": "tool_route", "tools": selected, "reason": reason})
                 return {"type": "tool_route", "tools": selected, "reason": reason}
-        except Exception:
-            pass  # 智能路由失败,不回退旧版
+        except Exception as e:
+            logger.warning("智能工具路由失败，回退到全量工具集: %s", e)
 
         return None
 
@@ -1175,18 +1408,19 @@ class Agent:
                 if result.tool_calls:
                     return "native", result.content, result.tool_calls
                 # 原生模式无 tool_calls,但 content 可能是手写 JSON(部分 provider 忽略 tools)
-                parsed = self._parse_tool_call(result.content)
-                if parsed is None:
+                tool_calls = self._parse_tool_calls(result.content)
+                if not tool_calls:
                     return "native", result.content, []
-                return "text", result.content, [ToolCall(id="", name=parsed[0], arguments=parsed[1])]
-            except Exception:  # noqa: BLE001  # 原生调用失败,自动降级
+                return "text", result.content, tool_calls
+            except Exception as e:  # noqa: BLE001  # 原生调用失败,自动降级
+                logger.warning("native 模式调用失败，自动降级: %s", e)
                 self._native_enabled = False
 
         resp = await self.llm.chat(messages, temperature=self.temperature)
-        parsed = self._parse_tool_call(resp)
-        if parsed is None:
+        tool_calls = self._parse_tool_calls(resp)
+        if not tool_calls:
             return "text", resp, []
-        return "text", resp, [ToolCall(id="", name=parsed[0], arguments=parsed[1])]
+        return "text", resp, tool_calls
 
 
     async def _call_llm_stream(
@@ -1210,11 +1444,12 @@ class Agent:
                 if result and result.tool_calls:
                     return "native", result.content or "", result.tool_calls
                 full = "".join(collected)
-                parsed = self._parse_tool_call(full)
-                if parsed is None:
+                tool_calls = self._parse_tool_calls(full)
+                if not tool_calls:
                     return "native", full, []
-                return "text", full, [ToolCall(id="", name=parsed[0], arguments=parsed[1])]
-            except Exception:  # noqa: BLE001
+                return "text", full, tool_calls
+            except Exception as e:  # noqa: BLE001
+                logger.warning("native 模式调用失败，自动降级: %s", e)
                 self._native_enabled = False
 
         # 文本模式流式
@@ -1227,11 +1462,12 @@ class Agent:
                 collected.append(tok)
                 state.emit({"type": "token", "content": tok})
             full = "".join(collected)
-            parsed = self._parse_tool_call(full)
-            if parsed is None:
+            tool_calls = self._parse_tool_calls(full)
+            if not tool_calls:
                 return "text", full, []
-            return "text", full, [ToolCall(id="", name=parsed[0], arguments=parsed[1])]
-        except Exception:  # noqa: BLE001
+            return "text", full, tool_calls
+        except Exception as e:
+            logger.error("文本模式流式调用失败: %s", e)
             raise
     async def _execute_tool(self, name: str, arguments: str) -> str:
         """执行单个工具(带瞬态错误重试/退避),统一返回 JSON 字符串结果。"""
@@ -1248,6 +1484,11 @@ class Agent:
             return result
 
     async def _execute_tool_once(self, name: str, arguments: str) -> str:
+        # 危险工具频率限制(与 ToolExecutor 行为一致)
+        if name in self._dangerous_tools:
+            allowed, limit_msg = self._dangerous_rate_limiter.allow(name)
+            if not allowed:
+                return json.dumps({"error": limit_msg, "blocked": True}, ensure_ascii=False)
         # 工具路由裁剪:未选中的工具不允许执行,防止模型意外调用冷门工具
         if self._active_tools is not None and name not in self._active_tools and name not in self._always_tools:
             return json.dumps({"error": f"工具 {name} 未在当前任务启用(工具路由器未选中)"}, ensure_ascii=False)
@@ -1263,18 +1504,9 @@ class Agent:
         if tool is None:
             return json.dumps({"error": f"未知工具: {name}"}, ensure_ascii=False)
 
-        # 去重缓存:同一运行内相同工具+参数且上次成功,直接复用结果
-        if self._tool_cache is not None:
-            key = (name, arguments)
-            cached = self._tool_cache.get(key)
-            if cached is not None:
-                tracer.record({"type": "tool", "name": name, "ok": True, "cached": True,
-                               "result_len": len(cached), "duration": 0.0,
-                               "args_preview": (arguments or "")[:120]})
-                return cached
-
         # 安全门禁:高风险操作必须等待用户人工批准(硬拦截,模型无法绕过)。
         # 已通过 approve_tools / interrupt 式运行时批准的工具直接放行。
+        # 注意:此检查必须在工具缓存之前执行,防止缓存被用作绕过机制
         if settings.agent_confirm_enabled and name not in self.approve_tools \
                 and name not in self._runtime_approved:
             from app.core.security import decide
@@ -1308,96 +1540,44 @@ class Agent:
         tracer.record({"type": "tool", "name": name, "ok": not self._is_tool_error(result),
                        "result_len": len(result), "duration": round(time.time() - t0, 3),
                        "args_preview": (arguments or "")[:120]})
-        # 缓存成功结果(去重缓存):失败/副作用工具不缓存
-        if self._tool_cache is not None and not self._is_tool_error(result):
+        # 缓存成功结果(去重缓存):仅安全工具缓存,失败/副作用工具不缓存
+        if self._tool_cache is not None and not self._is_tool_error(result) and name in self._tool_cache_safe:
             key = (name, arguments)
-            if key not in self._tool_cache:
-                max_size = int(settings.agent_tool_cache_size or 0)
-                if max_size > 0:
-                    if len(self._tool_cache) >= max_size:
-                        next(iter(self._tool_cache), None) and self._tool_cache.pop(next(iter(self._tool_cache)))
+            async with self._tool_cache_lock:
+                if key not in self._tool_cache:
+                    max_size = int(settings.agent_tool_cache_size or 0)
+                    if max_size > 0 and len(self._tool_cache) >= max_size:
+                        # LRU: 淘汰最久未使用的(字典第一个)
+                        self._tool_cache.popitem(last=False)
                     self._tool_cache[key] = result
         return result
 
     def _scan_pending_confirmations(self, tool_calls: list[ToolCall]) -> list[tuple[ToolCall, object]]:
         """预扫描一批工具调用,返回需要人工确认且未批准的 (tool_call, decision)。
 
-        判定规则与 _execute_tool_once 的安全门禁保持一致:
+        判定规则统一由共享实现（app.core.tool_safety）处理两套机制:
         - agent_tool_confirm 机制的危险工具(未在 approve_tools)
         - agent_confirm_enabled 机制的 decide() 命中 confirm
         """
-        from app.core.security import decide
+        from app.core.tool_safety import scan_pending_confirmations as _scan
 
-        pending: list[tuple[ToolCall, object]] = []
-        for tc in tool_calls:
-            if tc.name in self.approve_tools or tc.name in self._runtime_approved:
-                continue
-            if settings.agent_tool_confirm and tc.name in self._dangerous_tools:
-                from app.core.security import Decision
-
-                pending.append((tc, Decision(
-                    confirm=True, reason=f"工具 {tc.name} 属于危险操作,需要用户确认",
-                )))
-                continue
-            if settings.agent_confirm_enabled:
-                decision = decide(tc.name, tc.arguments)
-                if decision.confirm:
-                    pending.append((tc, decision))
-        return pending
+        return _scan(tool_calls, self.approve_tools, self._runtime_approved, self._dangerous_tools)
 
     def _create_confirm_requests(self, pending: list[tuple[ToolCall, object]]) -> list[dict]:
         """为待确认的工具调用创建持久化确认请求,返回请求列表(供事件与 resume 使用)。"""
-        from app.core.security import describe
-        from app.tools.collaboration_tool import _get_store
+        from app.core.tool_safety import create_confirm_requests as _create
 
-        store = _get_store()
-        requests = []
-        for tc, decision in pending:
-            try:
-                params = json.loads(tc.arguments) if isinstance(tc.arguments, str) and tc.arguments.strip() else {}
-            except (json.JSONDecodeError, TypeError):
-                params = {}
-            if not isinstance(params, dict):
-                params = {"raw": str(params)}
-            rec = store.create(
-                action=tc.name,
-                description=f"{getattr(decision, 'reason', '') or ''}。\n详情: {describe(tc.name, tc.arguments)}",
-                params=params,
-            )
-            requests.append({
-                "confirmation_id": rec["id"],
-                "tool": tc.name,
-                "arguments": tc.arguments,
-                "reason": getattr(decision, "reason", "") or "",
-            })
-        return requests
+        return _create(pending)
 
     def _is_tool_approved_by_resume(self, tc: ToolCall, state: AgentState) -> bool:
         """恢复运行时,判断该工具是否已被用户批准。
 
-        resume 值支持两种形式:
-        - dict: {"confirmation_id": {"approved": bool}, ...}
-        - list: ["tool_name", ...](工具名白名单,已批准)
-        此外也会查 confirmations.db,兼容用户已通过前端批准的情况。
+        优先采用运行时批准集合;其次解析 resume 值(list/dict);
+        最后回退查询持久化 confirmations.db,兼容用户已通过前端批准的情况。
         """
-        resume = (state.interrupt or {}).get("resume")
-        if isinstance(resume, list):
-            return tc.name in resume
-        resume = resume or {}
-        requests = (state.interrupt or {}).get("value", {}).get("requests") or []
-        for req in requests:
-            if req.get("tool") != tc.name:
-                continue
-            conf_id = req.get("confirmation_id", "")
-            if isinstance(resume, dict) and conf_id in resume:
-                return bool(resume.get(conf_id, {}).get("approved"))
-            # 从持久化确认请求读状态(用户可能已通过前端批准)
-            from app.tools.collaboration_tool import _get_store
+        from app.core.tool_safety import is_tool_approved_by_resume as _approved
 
-            conf = _get_store().get(conf_id)
-            if conf and conf["status"] == "approved":
-                return True
-        return False
+        return _approved(tc, state, runtime_approved=self._runtime_approved)
 
     async def _await_confirmation(self, name: str, arguments: str, reason: str) -> tuple[bool, str]:
         """创建确认请求并轮询等待用户批准。返回 (是否放行, 状态)。
@@ -1424,21 +1604,17 @@ class Agent:
         )
         deadline = time.time() + max(1, int(settings.agent_confirm_timeout))
         while time.time() < deadline:
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(_CONFIRM_POLL_INTERVAL)
             conf = store.get(rec["id"])
             if conf:
                 if conf["status"] == "approved":
                     return True, "approved"
                 if conf["status"] == "rejected":
                     return False, "rejected"
+        # 超时:返回标记以便前端展示明确提示
         return False, "timeout"
 
-    _TRANSIENT_PATTERN = (
-        "timeout", "超时", "timed out", "connection", "connect error", "连接",
-        "网络", "temporarily", "try again later", "rate limit", "限流", "429",
-        "502", "503", "504", "service unavailable", "server error", "busy",
-        "忙碌", "too many requests", "慢", "slow",
-    )
+    _TRANSIENT_PATTERN = TRANSIENT_PATTERNS
 
     @classmethod
     def _is_transient_error(cls, result_str: str) -> bool:
@@ -1529,7 +1705,8 @@ class Agent:
                     result_str,
                     max_rounds=max_rounds - heal_rounds,
                 )
-            except Exception:  # noqa: BLE001  # 自愈失败不影响主循环
+            except Exception as e:  # noqa: BLE001  # 自愈失败不影响主循环
+                logger.warning("代码自愈失败，保持原始错误结果: %s", e)
                 result = {"healed": False}
             state.metadata["heal_rounds"] = heal_rounds + 1
             state.steps.append({
@@ -1597,11 +1774,7 @@ class Agent:
 
     # ---- 测试/构建失败闭环 ----
 
-    _TEST_FAIL_MARKERS = (
-        "failed", "failures", "traceback", "assertionerror", "error:",
-        "exit code", "npm err", "fatal error", "test failed", "x failed",
-        "failures=", "tests failed", "cannot find", "undefined reference",
-    )
+    _TEST_FAIL_MARKERS = TEST_FAIL_MARKERS
 
     @classmethod
     def _looks_like_test_failure(cls, name: str, result_str: str) -> bool:
@@ -1638,11 +1811,12 @@ class Agent:
         """让 LLM 判断复杂度并生成计划;失败/简单任务返回 None,不影响主循环。"""
         # 简短消息跳过规划
         cleaned = user_input.strip()
-        if len(cleaned) <= 20 and not any(kw in cleaned for kw in ("代码", "文件", "搜索", "网页", "执行", "运行", "分析", "报告", "计算", "脚本", "程序")):
+        if len(cleaned) <= _PLAN_SHORT_INPUT_THRESHOLD and not any(kw in cleaned for kw in _PLAN_SHORT_INPUT_KEYWORDS):
             return None
         try:
             plan = await generate_plan(self.llm, user_input, max_steps=settings.agent_plan_max_steps)
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            logger.warning("任务规划生成失败，放弃分步计划: %s", e)
             return None
         if plan is None or not plan.steps:
             return None
@@ -1707,7 +1881,8 @@ class Agent:
                 schema,
                 temperature=0.2,
             )
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            logger.warning("任务规划 JSON 解析失败，降级为单步执行: %s", e)
             return False
         if not isinstance(data, dict) or not data.get("needs_plan"):
             return False
@@ -1780,17 +1955,26 @@ class Agent:
                 min_keep=6,
             )
             return processed
-        total = sum(
-            len(str(m.get("content", ""))) for m in history if m.get("role") in ("user", "assistant")
+        
+        # 改进：使用 token 估算替代字符计数，更准确
+        from app.memory.context import estimate_tokens
+        total_tokens = sum(
+            estimate_tokens(str(m.get("content", ""))) for m in history if m.get("role") in ("user", "assistant")
         )
-        if total <= self.context_budget * settings.agent_summary_threshold_ratio:
+        
+        # 字符预算转换为 token 预算（约 4 字符/token）
+        token_budget = int(self.context_budget / 4)
+        summary_threshold = int(token_budget * settings.agent_summary_threshold_ratio)
+        
+        if total_tokens <= summary_threshold:
             return history
-        # 保留最近的 50% 预算,更早的合并摘要
+        
+        # 改进：提高保留比例，从 50% 提高到 60%
         keep: list[dict] = []
         acc = 0
-        keep_budget = int(self.context_budget * 0.5)
+        keep_budget = int(token_budget * 0.6)  # 从 0.5 提高到 0.6
         for m in reversed(history):
-            c = len(str(m.get("content", "")))
+            c = estimate_tokens(str(m.get("content", "")))
             if acc + c <= keep_budget:
                 keep.insert(0, m)
                 acc += c
@@ -1825,8 +2009,8 @@ class Agent:
                 )
                 if note:
                     return note
-        except Exception:  # noqa: BLE001
-            pass  # 分层失败回退旧逻辑
+        except Exception as e:  # noqa: BLE001
+            logger.warning("记忆沉淀主流程失败: %s", e)  # 分层失败回退旧逻辑
         try:
             from app.memory.ltm import get_memory_store
 
@@ -1840,7 +2024,8 @@ class Agent:
                     if m["id"] not in seen:
                         mems.append(m)
                         seen.add(m["id"])
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            logger.warning("长期记忆检索失败，不回退历史上下文: %s", e)
             return ""
         if not mems:
             return ""
@@ -1848,21 +2033,27 @@ class Agent:
         return "根据长期记忆,以下信息可能与当前对话相关:\n" + "\n".join(lines)
 
     async def _maybe_auto_memory(self, user_input: str, answer: str, history: list[dict]) -> None:
-        """对话结束后自动抽取事实存入长期记忆(默认关闭)。"""
+        """对话结束后自动抽取事实和经验存入长期记忆(默认关闭)。
+
+        不仅抽取事实性信息,还从工具执行步骤中提取成功经验/失败模式。
+        """
         if not settings.agent_auto_memory:
             return
         try:
-            recent = (history or [])[-6:]
+            recent = (history or [])[-_MEMORY_RECENT_HISTORY_COUNT:]
             prompt = [
                 {
                     "role": "system",
                     "content": (
-                        "从以下对话中抽取值得长期记住的事实(用户偏好、个人信息、项目事实、约定)。"
-                        "每条用一句话陈述。若没有值得记住的,返回空数组。"
-                        '只输出 JSON,格式为 {"facts": ["...", "..."]}'
+                        "从以下对话中抽取值得长期记住的内容。包括:\n"
+                        "1. 事实:用户偏好、个人信息、项目事实、约定(每条不超过30字)\n"
+                        "2. 经验:成功的工具调用模式和失败教训(如'使用 search_files 找到目标最快')\n"
+                        "若没有值得记住的,返回空数组。\n"
+                        '只输出 JSON,格式为 {"facts": ["内容1", "内容2"]}'
+                        " facts 数组的每个元素必须是字符串，不能是对象。"
                     ),
                 },
-                {"role": "user", "content": json.dumps(recent, ensure_ascii=False)[:6000]},
+                {"role": "user", "content": _clip_history_for_json(recent)},
             ]
             if hasattr(self.llm, "chat_json"):
                 data = await self.llm.chat_json(prompt, temperature=0.2)
@@ -1870,17 +2061,32 @@ class Agent:
                 resp = await self.llm.chat(prompt, temperature=0.2)
                 data = self._try_parse_json(resp)
             facts = data.get("facts", []) if isinstance(data, dict) else []
-            if facts:
+            # 规范化 facts: 可能是字符串列表，也可能是对象列表
+            normalized_facts = []
+            for f in facts:
+                if isinstance(f, str) and f.strip():
+                    normalized_facts.append(f.strip())
+                elif isinstance(f, dict):
+                    # 对象格式: 合并所有字段为字符串
+                    parts = []
+                    for k, v in f.items():
+                        if v and str(v).strip():
+                            parts.append(f"{k}: {v}")
+                    if parts:
+                        normalized_facts.append("、".join(parts))
+            if normalized_facts:
                 from app.memory.ltm import get_memory_store
 
                 store = get_memory_store()
-                for f in facts[:5]:
+                max_facts = int(settings.agent_auto_memory_max_facts or 5)
+                for f in normalized_facts[:max_facts]:
                     if isinstance(f, str) and f.strip():
                         store.save(f.strip(), source="auto")
                 # 分层记忆写侧:同一事实同时写入 episodic(本会话情节作用域),
                 # 与 layers._add_episodic 的检索口径对齐。
                 if settings.agent_layered_memory and self.session_id:
-                    for f in facts[:3]:
+                    max_episodic = int(settings.agent_auto_memory_max_episodic or 3)
+                    for f in normalized_facts[:max_episodic]:
                         if isinstance(f, str) and f.strip():
                             try:
                                 store.save(
@@ -1889,10 +2095,10 @@ class Agent:
                                     session_id=self.session_id,
                                     source="auto",
                                 )
-                            except Exception:  # noqa: BLE001
-                                pass
-        except Exception:  # noqa: BLE001
-            pass
+                            except Exception as e:  # noqa: BLE001
+                                logger.warning("会话记忆保存失败: %s", e)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("记忆沉淀主流程失败: %s", e)
 
     @staticmethod
     def _try_parse_json(text: str):
@@ -1970,14 +2176,19 @@ class Agent:
             budget = int(settings.agent_token_budget)
             from app.memory.context import budget_messages
 
-            clipped = [{
-                **msg,
-                "content": (
-                    content[: settings.message_char_cap] + "\n...[内容过长已截断]"
-                    if isinstance(content, str) and len(content) > settings.message_char_cap
-                    else content
-                ),
-            } for msg in history if msg.get("role") not in ("tool", "plan")]
+            # 兼容新旧格式:assistant 消息内容可能在 kind 字段
+            clipped = []
+            for msg in history:
+                if msg.get("role") in ("tool", "plan"):
+                    continue
+                # 获取实际内容:优先 content,其次 kind
+                raw_content = msg.get("content", "") or msg.get("kind", "")
+                if not str(raw_content).strip():
+                    continue
+                content = str(raw_content)
+                if len(content) > settings.message_char_cap:
+                    content = content[: settings.message_char_cap] + "\n...[内容过长已截断]"
+                clipped.append({**msg, "content": content})
             messages += budget_messages(clipped, max_tokens=budget, head_tokens=head_tokens, min_keep=4)
         else:
             total_chars = len(system)
@@ -1985,7 +2196,10 @@ class Agent:
             for msg in history:
                 if msg.get("role") in ("tool", "plan"):
                     continue  # 工具/计划事件仅用于前端展示,不进入模型上下文
-                content = msg.get("content", "")
+                # 获取实际内容:优先 content,其次 kind
+                content = msg.get("content", "") or msg.get("kind", "")
+                if not str(content).strip():
+                    continue  # 跳过空内容消息,避免 LLM 返回 400
                 if isinstance(content, str) and len(content) > settings.message_char_cap:
                     content = content[: settings.message_char_cap] + "\n...[内容过长已截断]"
                 line = f"{msg.get('role', '')}:{content}"
@@ -1998,15 +2212,69 @@ class Agent:
 
     @staticmethod
     def _parse_tool_call(text: str) -> Optional[tuple[str, str]]:
-        """从 LLM 回复中解析工具调用 JSON。"""
+        """从 LLM 回复中解析工具调用 JSON(单条)。
+
+        注意:此方法仅解析第一条工具调用。如果 LLM 返回多条调用,
+        应使用 _parse_tool_calls 解析全部。
+        """
+        if not text or not text.strip():
+            return None
+        # 尝试匹配 JSON 数组格式 [...],提取第一条
+        stripped = text.strip()
+        if stripped.startswith('['):
+            try:
+                data = json.loads(stripped)
+                if isinstance(data, list) and data:
+                    first = data[0]
+                    if isinstance(first, dict) and "tool" in first:
+                        return first["tool"], json.dumps(first.get("arguments", {}), ensure_ascii=False)
+            except json.JSONDecodeError:
+                pass
+            # 数组解析失败,继续尝试单条匹配
+        # 尝试匹配单条 JSON 对象格式 {...}
         m = re.search(TOOL_CALL_PATTERN, text, re.DOTALL)
         if m:
             return m.group(1), m.group(2)
         # 尝试宽松解析: 独立 JSON 对象含 tool 字段
         try:
-            data = json.loads(text.strip())
+            data = json.loads(stripped)
             if isinstance(data, dict) and "tool" in data:
-                return data["tool"], data.get("arguments", {})
+                args = data.get("arguments", {})
+                if isinstance(args, dict):
+                    args = json.dumps(args, ensure_ascii=False)
+                return data["tool"], args
         except json.JSONDecodeError:
             pass
         return None
+
+    @staticmethod
+    def _parse_tool_calls(text: str) -> list[ToolCall]:
+        """从 LLM 回复中解析所有工具调用 JSON(支持单条和数组格式)。"""
+        if not text or not text.strip():
+            return []
+        stripped = text.strip()
+        calls: list[ToolCall] = []
+        # 尝试解析 JSON 数组
+        if stripped.startswith('['):
+            try:
+                data = json.loads(stripped)
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, dict) and "tool" in item:
+                            args = item.get("arguments", {})
+                            if isinstance(args, dict):
+                                args = json.dumps(args, ensure_ascii=False)
+                            calls.append(ToolCall(id="", name=item["tool"], arguments=args))
+                    if calls:
+                        return calls
+            except json.JSONDecodeError:
+                pass
+        # 尝试正则匹配多条 JSON 对象
+        for m in re.finditer(TOOL_CALL_PATTERN, text, re.DOTALL):
+            calls.append(ToolCall(id="", name=m.group(1), arguments=m.group(2)))
+        # 尝试宽松解析单条
+        if not calls:
+            parsed = Agent._parse_tool_call(text)
+            if parsed:
+                calls.append(ToolCall(id="", name=parsed[0], arguments=parsed[1]))
+        return calls

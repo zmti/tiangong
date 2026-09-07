@@ -23,10 +23,12 @@ async def build_layered_memory_note(
     semantic 层走 LTM global 检索;episodic 层走 LTM session 检索。
     """
     blocks: list[str] = []
+    # 融合对话上下文构造检索 query
+    query = _build_query(user_input, history)
     try:
         _add_working(blocks, history)
-        _add_semantic(blocks, user_input)
-        _add_episodic(blocks, user_input, session_id)
+        _add_semantic(blocks, query)
+        _add_episodic(blocks, query, session_id)
     except Exception:  # noqa: BLE001  # 分层检索失败不影响主流程
         return ""
     if not blocks:
@@ -34,18 +36,33 @@ async def build_layered_memory_note(
     return "\n\n".join(blocks)
 
 
+def _build_query(user_input: str, history: list[dict]) -> str:
+    """融合用户输入和最近对话构造检索 query。"""
+    parts = [user_input or ""]
+    # 取最近 3 条有效对话
+    for m in reversed(history[-6:]):
+        role = m.get("role")
+        if role in ("user", "assistant"):
+            content = str(m.get("content", ""))[:100]
+            if content.strip():
+                parts.append(content)
+        if len(parts) >= 4:
+            break
+    return " ".join(p for p in parts if p.strip())
+
+
 def _add_working(blocks: list[str], history: list[dict]) -> None:
-    """working 层:最近 4 条有效对话原文(不注入会超预算的长工具结果)。"""
+    """working 层:最近 8 条有效对话原文(不注入会超预算的长工具结果)。"""
     recent: list[str] = []
     for m in reversed(history or []):
         role = m.get("role")
         if role not in ("user", "assistant"):
             continue
-        content = str(m.get("content", ""))[:400].strip()
+        content = str(m.get("content", ""))[:600].strip()
         if not content:
             continue
         recent.insert(0, f"{'用户' if role == 'user' else '助手'}: {content}")
-        if len(recent) >= 4:
+        if len(recent) >= 8:
             break
     if recent:
         blocks.append("【即时记忆(本会话最近对话)】\n" + "\n".join(recent))

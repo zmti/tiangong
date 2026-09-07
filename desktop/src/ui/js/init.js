@@ -30,5 +30,18 @@
     document.body.dataset.theme = App.theme;
   }
 
-  console.log('[App] 初始化完成, sessionId:', App.sessionId);
+  // 从 Electron 主进程获取后端地址
+  if (typeof window.agentApp !== 'undefined') {
+    window.agentApp.getBackendUrl().then(url => {
+      App.backendUrl = url || '';
+      console.log('[App] 后端地址已设置:', App.backendUrl);
+    }).catch(err => {
+      console.error('[App] 获取后端地址失败:', err);
+    });
+    window.agentApp.getBackendApiKey().then(key => {
+      App.backendApiKey = key || '';
+    }).catch(() => {});
+  }
+
+  console.log('[App] 初始化完成, sessionId:', App.sessionId, 'backendUrl:', App.backendUrl);
 })();

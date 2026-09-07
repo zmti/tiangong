@@ -2,23 +2,7 @@
 App.Video = {};
 
 App.Video.init = function () {
-  const videoBtn = document.getElementById('videoBtn');
-  if (!videoBtn) return;
-
-  videoBtn.addEventListener('click', () => {
-    const input = document.getElementById('videoInput');
-    if (input) input.click();
-  });
-
-  const input = document.getElementById('videoInput');
-  if (input) {
-    input.addEventListener('change', async (e) => {
-      if (e.target.files.length > 0) {
-        await App.Video.upload(e.target.files[0]);
-        e.target.value = '';
-      }
-    });
-  }
+  // 视频按钮通过附件菜单触发
 };
 
 App.Video.upload = async function (file) {
