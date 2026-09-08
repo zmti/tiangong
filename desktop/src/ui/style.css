@@ -1505,8 +1505,6 @@ body.show-back #backToBottom { display: flex; }
   display: none;
 }
 #stopBtn:hover { transform: scale(1.05); box-shadow: 0 2px 8px var(--err-soft); }
-body.streaming #stopBtn { display: inline-flex; }
-body.streaming #sendBtn { display: none; }
 
 .composer-hint { display: none !important; }
 .composer-hint kbd {

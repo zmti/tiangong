@@ -15,7 +15,7 @@ async def list_tools() -> dict:
     registry = get_registry()
     dangerous = {s.strip() for s in settings.agent_dangerous_tools.split(",") if s.strip()}
     tools = []
-    for t in await registry.list():
+    for t in registry.list_sync():
         tools.append({
             "name": t.name,
             "description": t.description,
@@ -269,11 +269,11 @@ async def list_builtin_models(pid: str) -> dict:
     from app.core.provider_registry import BUILTIN_PROVIDERS, list_builtin_ext_models
 
     if pid not in BUILTIN_PROVIDERS:
-        raise HTTPException(status_code=400, detail=f"未知内置厂商: {req.pid}")
+        raise HTTPException(status_code=400, detail=f"未知内置厂商: {pid}")
     from app.api.chat import _PROVIDER_DEFAULT_MODELS
 
     models = list(_PROVIDER_DEFAULT_MODELS.get(pid, []))
-    for ext in list_builtin_ext_models(req.pid):
+    for ext in list_builtin_ext_models(pid):
         models.append({
             "id": ext.get("id"),
             "name": ext.get("name") or ext.get("id"),
@@ -289,9 +289,9 @@ async def add_builtin_ext_model(pid: str, req: ModelUpsert) -> dict:
     from app.core.provider_registry import add_builtin_model, BUILTIN_PROVIDERS
 
     if pid not in BUILTIN_PROVIDERS:
-        raise HTTPException(status_code=400, detail=f"未知内置厂商: {req.pid}")
+        raise HTTPException(status_code=400, detail=f"未知内置厂商: {pid}")
     try:
-        result = add_builtin_model(req.pid, req.id, req.name, req.context)
+        result = add_builtin_model(pid, req.id, req.name, req.context)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "result": result}
@@ -303,11 +303,11 @@ async def add_builtin_ext_models_batch(pid: str, req: ModelBatchUpsert) -> dict:
     from app.core.provider_registry import add_builtin_model, BUILTIN_PROVIDERS
 
     if pid not in BUILTIN_PROVIDERS:
-        raise HTTPException(status_code=400, detail=f"未知内置厂商: {req.pid}")
+        raise HTTPException(status_code=400, detail=f"未知内置厂商: {pid}")
     added, errors = [], []
     for m in req.models:
         try:
-            add_builtin_model(req.pid, m.id, m.name, m.context)
+            add_builtin_model(pid, m.id, m.name, m.context)
             added.append(m.id)
         except ValueError as exc:
             errors.append({"id": m.id, "error": str(exc)})
@@ -319,7 +319,7 @@ async def remove_builtin_ext_model(pid: str, mid: str) -> dict:
     from app.core.provider_registry import remove_builtin_model, BUILTIN_PROVIDERS
 
     if pid not in BUILTIN_PROVIDERS:
-        raise HTTPException(status_code=400, detail=f"未知内置厂商: {req.pid}")
+        raise HTTPException(status_code=400, detail=f"未知内置厂商: {pid}")
     return {"ok": remove_builtin_model(pid, mid)}
 
 

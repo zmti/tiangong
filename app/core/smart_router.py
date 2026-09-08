@@ -475,7 +475,7 @@ async def select_tools(
     if not selected:
         selected = await select_tools_by_embedding(user_input, registry, max_tools)
 
-    known = {t.name for t in await registry.list()}
+    known = {t.name for t in registry.list_sync()}
     valid = []
     for name in selected:
         name = name.strip()

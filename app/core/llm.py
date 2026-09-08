@@ -190,12 +190,13 @@ class LLMClient:
         proxy = get_httpx_proxy()
         client_kwargs = {}
         if proxy:
-            client_kwargs["http_client"] = httpx.AsyncClient(proxy=proxy)
+            client_kwargs["http_client"] = httpx.AsyncClient(proxy=proxy, timeout=httpx.Timeout(120.0, read=60.0))
         
         if self._custom:
             return AsyncOpenAI(
                 api_key=self._custom.get("api_key") or "sk-placeholder",
                 base_url=self._custom["base_url"],
+                timeout=httpx.Timeout(120.0, read=60.0),
                 **client_kwargs,
             ), self._model_override or self._custom.get("model") or ""
         p = self.provider
@@ -203,26 +204,30 @@ class LLMClient:
             return AsyncOpenAI(
                 api_key=settings.deepseek_api_key or "sk-placeholder",
                 base_url=settings.deepseek_base_url,
+                timeout=httpx.Timeout(120.0, read=60.0),
                 **client_kwargs,
             ), self._model_override or settings.deepseek_model
         if p == "qwen":
             return AsyncOpenAI(
                 api_key=settings.qwen_api_key or "sk-placeholder",
                 base_url=settings.qwen_base_url,
+                timeout=httpx.Timeout(120.0, read=60.0),
                 **client_kwargs,
             ), self._model_override or settings.qwen_model
         if p == "ollama":
             return AsyncOpenAI(
                 api_key="ollama",
                 base_url=settings.ollama_base_url,
+                timeout=httpx.Timeout(120.0, read=60.0),
                 **client_kwargs,
             ), self._model_override or settings.ollama_model
         if p == "openai":
-            return AsyncOpenAI(**client_kwargs), self._model_override or "gpt-4o-mini"
+            return AsyncOpenAI(timeout=httpx.Timeout(120.0, read=60.0), **client_kwargs), self._model_override or "gpt-4o-mini"
         # compat: 任意 OpenAI 兼容
         return AsyncOpenAI(
             api_key=settings.openai_compat_api_key or "sk-placeholder",
             base_url=settings.openai_compat_base_url,
+            timeout=httpx.Timeout(120.0, read=60.0),
             **client_kwargs,
         ), self._model_override or settings.openai_compat_model
 
@@ -648,6 +653,7 @@ class LLMClient:
         except Exception as e:  # noqa: BLE001
             self._trace("chat_stream", time.time(), None, ok=False, error=str(e))
             raise LLMError(f"LLM 流式调用失败: {e}") from e
+        logger.debug("[chat_stream_with_tools] stream loop ended, content_len=%d", len(content_buf))
         self._reasoning = reasoning
 
         # 构建最终结果

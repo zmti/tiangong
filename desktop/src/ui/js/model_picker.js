@@ -251,10 +251,13 @@ App.ModelPicker = (() => {
         if (isOpen()) closePop(); else openPop();
       });
     }
-    document.addEventListener('click', (e) => {
-      if (!popEl || popEl.hidden || popEl.contains(e.target)) return;
-      if (!App.els.modelPickerBtn || !App.els.modelPickerBtn.contains(e.target)) closePop();
-    });
+    if (!document._modelPickerClickBound) {
+      document._modelPickerClickBound = true;
+      document.addEventListener('click', (e) => {
+        if (!popEl || popEl.hidden || popEl.contains(e.target)) return;
+        if (!App.els.modelPickerBtn || !App.els.modelPickerBtn.contains(e.target)) closePop();
+      });
+    }
   }
 
   return { load, save, get, set, clear, init, isOpen, closePop, refreshBadge, onChange };

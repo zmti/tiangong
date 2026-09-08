@@ -128,6 +128,11 @@ class ToolRegistry:
                 tools = [t for t in tools if t.enabled]
             return tools
 
+    async def list(self, enabled_only: bool = True):
+        """异步兼容接口:返回异步迭代器(供 async for / await 调用)。"""
+        for tool in self.list_sync(enabled_only):
+            yield tool
+
     def to_openai_schemas(self) -> list[dict]:
         tools = self.list_sync()
         return [t.to_openai_schema() for t in tools]

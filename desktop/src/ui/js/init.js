@@ -9,6 +9,7 @@
     streaming: false,
     abortController: null,
     selectedImageFile: null,
+    _groupId: 0,
   };
 
   // 初始化 DOM 元素缓存

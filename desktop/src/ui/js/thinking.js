@@ -8,12 +8,15 @@
 
   // 找插入锚点:优先找 .answer-doc,其次找 bot msg wrapper,最后找 messages
   function _findInsertTarget() {
-    if (App._answerWrap) {
-      const doc = App._answerWrap.querySelector
-        ? App._answerWrap.querySelector('.answer-doc')
-        : null;
+    // _answerWrap 可能是 DOM 元素或 { _answer, _rail } 对象
+    const wrap = App._answerWrap;
+    if (!wrap) return null;
+    // 如果是带 _answer 属性的对象，取 _answer 元素
+    const el = wrap._answer || wrap;
+    if (el && el.nodeType === 1) {
+      const doc = el.querySelector ? el.querySelector('.answer-doc') : null;
       if (doc && doc.parentNode === App.els.messages) return doc;
-      if (App._answerWrap.parentNode === App.els.messages) return App._answerWrap;
+      if (el.parentNode === App.els.messages) return el;
     }
     return null;
   }

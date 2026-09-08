@@ -648,7 +648,7 @@ try {
             const thinkText = App.stripThinkingTags ? App.stripThinkingTags(rawContent) : rawContent;
             if (!thinkText.trim()) {
               App.updateRailStatus(App._currentBotMsg, 'thinking', '思考中...');
-              return;
+              continue;
             }
             // 使用规范渲染器
             if (App._currentBotMsg && App.addThinking) {

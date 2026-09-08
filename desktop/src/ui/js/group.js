@@ -115,8 +115,8 @@
       badge.className = 'rg-toggle';
       badge.textContent = '▼';
       badge.addEventListener('click', () => {
-        const open = g.body.style.display === 'block';
-        g.body.style.display = open ? 'none' : 'block';
+        const open = g.body.style.display !== 'none';
+        g.body.style.display = open ? 'none' : 'flex';
         badge.textContent = open ? '▼' : '▲';
       });
       g.head.appendChild(badge);

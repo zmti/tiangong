@@ -193,7 +193,7 @@ async def select_tools(
         selected = select_tools_by_embedding(user_input, registry, max_tools)
 
     # 只保留真实存在的工具;系统工具不需要路由器选择
-    known = {t.name for t in await registry.list()}
+    known = {t.name for t in registry.list_sync()}
     valid = []
     for name in selected:
         name = name.strip()

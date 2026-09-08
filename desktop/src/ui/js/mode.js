@@ -246,12 +246,15 @@ App.Mode = (() => {
       });
     }
     // 点击外部关闭
-    document.addEventListener('click', (e) => {
-      const pop = App.els.modePopover || document.getElementById('modePopover');
-      if (pop && !pop.hidden && !pop.contains(e.target) && !badge?.contains(e.target)) {
-        pop.hidden = true;
-      }
-    });
+    if (!document._modeClickOutsideBound) {
+      document._modeClickOutsideBound = true;
+      document.addEventListener('click', (e) => {
+        const pop = App.els.modePopover || document.getElementById('modePopover');
+        if (pop && !pop.hidden && !pop.contains(e.target)) {
+          pop.hidden = true;
+        }
+      });
+    }
   }
 
   // 暴露给 renderer.js 在 provider 数据就绪后调用

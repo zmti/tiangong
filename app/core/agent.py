@@ -83,7 +83,7 @@ from app.core.prompts import TOOL_CALL_PATTERN, build_system_prompt, build_tools
 from app.core.telemetry import _current_run_id, tracer
 from app.tools.categories import SYSTEM_TOOLS
 from app.tools.registry import ToolRegistry, get_registry
-import logging  # noqa: F401  # 保留供后续代码使用
+import logging
 
 logger = logging.getLogger(__name__)
 
@@ -180,7 +180,7 @@ class Agent:
                 from app.core.llm import LLMClient as _L
 
                 self.critic_llm = _L(critic_provider, critic_model or None)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 logger.warning("critic_llm 初始化失败,降级为单模型模式: %s", e)
                 self.critic_llm = None
         # 实例级评审/校验开关:single 关闭,review 强制开启,auto 跟随全局
@@ -444,15 +444,17 @@ class Agent:
         g.add_conditional_edge("finalize", self._route_finalize)
         g.add_conditional_edge("reflect", self._route_reflect)
         g.add_conditional_edge("verify", self._route_verify)
-        g.set_entry("prepare")
         return g
 
     async def _route_llm(self, state: AgentState) -> Optional[str]:
         """llm 节点之后的路由:给上限→giveup;有工具调用→tools;否则→finalize。"""
         if state.metadata.get("giveup"):
+            logger.debug("[_route_llm] → giveup")
             return "giveup"
         if state.metadata.get("tool_calls"):
+            logger.debug("[_route_llm] → tools (count=%d)", len(state.metadata["tool_calls"]))
             return "tools"
+        logger.debug("[_route_llm] → finalize")
         return "finalize"
 
     def _get_dynamic_max_steps(self, state: AgentState) -> int:
@@ -484,12 +486,14 @@ class Agent:
         """finalize 之后:简单回答跳过反思/校验;否则按预算进入反思→校验。"""
         answer = state.answer or ""
         has_tool_steps = any(s.get("type") == "tool" for s in state.steps)
+        logger.debug("[_route_finalize] answer_len=%d has_tools=%s consecutive_empty=%s",
+                     len(answer or ""), has_tool_steps, state.metadata.get("consecutive_empty_answers", 0))
         # 空答案:跟踪连续空答案次数，超过阈值则触发 giveup
         if not answer or not answer.strip():
             consecutive_empty = int(state.metadata.get("consecutive_empty_answers", 0)) + 1
             state.metadata["consecutive_empty_answers"] = consecutive_empty
-            # 改进：提高阈值到 5 次，避免复杂任务过早放弃
-            if consecutive_empty >= 5:
+            # 连续 2 次空答案即放弃(避免 LLM 只输出 thinking 标签导致无限循环)
+            if consecutive_empty >= 2:
                 state.metadata["giveup"] = True
                 return "giveup"
             return "llm"
@@ -582,8 +586,8 @@ class Agent:
         total_steps = len(state.steps)
         if rounds >= dynamic_max and total_steps >= dynamic_max:
             state.metadata["giveup"] = True
-            logger.warning("步骤耗尽: rounds=%d, total_steps=%d, dynamic_max=%d",
-                          rounds, total_steps, dynamic_max, effective_max)
+            logger.warning("steps exhausted: rounds=%d, total_steps=%d, dynamic_max=%d",
+                          rounds, total_steps, dynamic_max)
             return
         
         state.metadata["llm_rounds"] = rounds + 1
@@ -596,6 +600,7 @@ class Agent:
         state.metadata["tool_call_mode"] = tool_call_mode
         state.metadata["resp"] = resp or ""
         state.metadata["tool_calls"] = [tc.to_dict() for tc in tool_calls]
+        logger.debug("[_node_llm] resp_len=%d tool_calls=%d mode=%s", len(resp or ""), len(tool_calls), tool_call_mode)
 
         # 推理模型:先把思维链透出为 thinking 事件(与正文分离)
         reasoning = getattr(self.llm, "_reasoning", "") or ""
@@ -713,6 +718,7 @@ class Agent:
 
     async def _node_finalize(self, state: AgentState, graph: Graph) -> None:
         """最终回答:更新计划、产出答案、自动沉淀记忆。流式模式逐 token 输出。"""
+        logger.debug("[_node_finalize] START resp=%r", (state.metadata.get("resp") or "")[:100])
         step = int(state.metadata.get("llm_rounds", 1)) - 1
         evt = self._finalize_plan(state.steps, step)
         if evt:
@@ -1004,7 +1010,7 @@ class Agent:
             "review": "执行后由独立评审模型核查质量,适合校验与总结",
             "ensemble": "多模型并行生成再由评审模型择优,适合高可靠任务",
         }
-        tool_names = [t.name for t in await self.registry.list()]
+        tool_names = [t.name for t in self.registry.list_sync()]
         names = modes if modes else list(roster.keys())
         for name in names:
             if name not in roster:
@@ -1361,7 +1367,7 @@ class Agent:
         if len(cleaned) <= _TOOL_ROUTE_SHORT_INPUT_THRESHOLD and not any(kw in cleaned for kw in _TOOL_ROUTE_SHORT_INPUT_KEYWORDS):
             return None
         # 改进：增加默认预选工具数量，从 10 提高到 20
-        max_tools = min(int(settings.agent_max_tools or 20), len(await self.registry.list()))
+        max_tools = min(int(settings.agent_max_tools or 20), len(self.registry.list_sync()))
         # 改进：提高置信度阈值，从 0.10 提高到 0.30
         min_confidence = 0.30
 
@@ -1392,7 +1398,7 @@ class Agent:
                 await cache.set(user_input, selected, conf, reason)
                 steps.append({"step": step, "type": "tool_route", "tools": selected, "reason": reason})
                 return {"type": "tool_route", "tools": selected, "reason": reason}
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning("智能工具路由失败，回退到全量工具集: %s", e)
 
         return None
@@ -1466,7 +1472,7 @@ class Agent:
             if not tool_calls:
                 return "text", full, []
             return "text", full, tool_calls
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error("文本模式流式调用失败: %s", e)
             raise
     async def _execute_tool(self, name: str, arguments: str) -> str:
