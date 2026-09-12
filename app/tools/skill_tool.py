@@ -73,4 +73,5 @@ def _get_tool_executor():
     """获取工具执行器实例。"""
     from app.core.tool_executor import ToolExecutor
     from app.tools.registry import get_registry
-    return ToolExecutor(registry=get_registry())
+    from app.tools.project_context import get_project_path
+    return ToolExecutor(registry=get_registry(), project_path=get_project_path())

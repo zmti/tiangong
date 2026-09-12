@@ -184,6 +184,7 @@ async def delegate_task(
         session_id=parent.session_id if parent else "",
         temperature=0.4,
         approve_tools=getattr(parent, "approve_tools", None),
+        project_path=getattr(parent, "project_path", "") or "",
     )
     # 工具子集裁剪:指定了 tools 就只用这些;未指定则用全量工具
     if tools:
@@ -277,6 +278,7 @@ async def _run_subagent_task(
         session_id=parent.session_id if parent else "",
         temperature=0.4,
         approve_tools=getattr(parent, "approve_tools", None),
+        project_path=getattr(parent, "project_path", "") or "",
     )
     if tools:
         allowed = [t.strip() for t in tools.split(",") if t.strip()]

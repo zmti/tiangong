@@ -347,10 +347,17 @@ def index_text(text: str, source: str = "memory") -> dict:
     store = get_store()
     added = 0
     for chunk in chunks:
+        chunk["metadata"]["doc_id"] = doc_id
         vec = run_embed(embedder, [chunk["text"]])[0]
         cid = f"{doc_id}:{chunk['metadata']['chunk_index']}"
         store.add(cid, vec, {**chunk["metadata"], "text": chunk["text"], "doc_id": doc_id})
         added += 1
+    # 同步更新 BM25 倒排索引，确保多路召回能命中关键词
+    try:
+        from app.rag.retriever import get_multi_retriever
+        get_multi_retriever().update_index(chunks)
+    except Exception:  # noqa: BLE001
+        pass
     return {"doc_id": doc_id, "source": source, "chunks": added}
 
 

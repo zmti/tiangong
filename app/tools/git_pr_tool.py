@@ -15,6 +15,7 @@ from pydantic import Field
 
 from app.config import settings
 from app.tools.git_tool import _git, _find_repo
+from app.tools.project_context import resolve_cwd
 from app.tools.registry import tool
 
 
@@ -78,7 +79,7 @@ def git_create_branch(
     base_branch: str = Field("main", description="基于哪个分支创建(默认 main)"),
 ) -> dict:
     try:
-        repo = _find_repo(repo or os.getcwd())
+        repo = _find_repo(repo or resolve_cwd())
     except ValueError as e:
         return {"error": str(e)}
     branch = (branch or "").strip()
@@ -107,7 +108,7 @@ def git_push_and_create_pr(
     draft: bool = Field(False, description="是否为草稿 PR"),
 ) -> dict:
     try:
-        repo = _find_repo(repo or os.getcwd())
+        repo = _find_repo(repo or resolve_cwd())
     except ValueError as e:
         return {"error": str(e)}
 

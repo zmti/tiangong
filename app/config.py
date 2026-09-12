@@ -151,7 +151,7 @@ class Settings(BaseSettings):
     agent_code_heal_rounds: int = 2
 
     # ---- Agent ----
-    agent_max_steps: int = 20
+    agent_max_steps: int = 10
     # 同一 Agent 实例最大并发运行数(0=不限制);防止大量并发请求耗尽 LLM 配额和服务器资源
     agent_max_concurrent_runs: int = 5
     agent_temperature: float = 0.7
@@ -261,7 +261,11 @@ class Settings(BaseSettings):
     agent_tool_cache_size: int = 50
     # 仅对这些工具启用缓存(逗号分隔);其余带副作用工具(文件/数据库/网络)不缓存
     # 避免缓存过期导致返回陈旧数据
-    agent_tool_cache_safe_tools: str = "run_code,calculate,days_between,get_current_time"
+    agent_tool_cache_safe_tools: str = "run_code,calculate,days_between,get_current_time,web_search"
+
+    # ---- 搜索去重 ----
+    # 同一主题最大搜索次数,超过后拦截重复搜索(防止搜索循环)
+    agent_search_max_repeats: int = 3
 
     # ---- 最终答案事实校验(LLM-as-judge) ----
     # finalize 产出答案后,用评审模型交叉核对"答案中的断言 vs 工具结果",
@@ -304,6 +308,10 @@ class Settings(BaseSettings):
     agent_tool_timeout: int = 0
     # checkpoint 保留天数(0=不清理);超过天数的已完成/已取消 checkpoint 自动清理
     checkpoint_ttl_days: int = 7
+    # 批量写入刷新间隔(秒);0 = 关闭批量写入(每节点逐条落盘)
+    agent_checkpoint_batch_flush_interval: float = 2.0
+    # 批量写入最大缓冲条数;超过则立即强制刷新最旧条目
+    agent_checkpoint_batch_max_buffer: int = 10
 
     # ---- 模型路由(简单/复杂任务分流) ----
     agent_routing_enabled: bool = False

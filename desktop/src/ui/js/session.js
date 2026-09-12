@@ -136,7 +136,7 @@ App.Session.search = async function () {
   try {
     const res = await App.apiJSON(`/v1/chat/search?q=${encodeURIComponent(query)}`);
     if (!res.success || !res.data?.results?.length) {
-      historyEl.innerHTML = '<div style="padding:12px;text-align:center;color:var(--muted);font-size:12px;">未找到匹配内容</div>';
+      historyEl.innerHTML = '<div class="session-empty"><div class="se-title">未找到匹配内容</div></div>';
       return;
     }
     const results = res.data.results;
@@ -149,7 +149,7 @@ App.Session.search = async function () {
       item.addEventListener('click', () => App.Session.select(item.dataset.id));
     });
   } catch (_) {
-    historyEl.innerHTML = '<div style="padding:12px;text-align:center;color:var(--muted);font-size:12px;">网络错误</div>';
+    historyEl.innerHTML = '<div class="session-error">网络错误</div>';
   }
 };
 
@@ -260,7 +260,7 @@ App.Session.renderCards = async function () {
   try {
     const res = await App.apiJSON('/v1/chat/sessions');
     if (!res.success) {
-      listEl.innerHTML = '<div style="padding:48px;text-align:center;color:var(--muted);">加载失败</div>';
+      listEl.innerHTML = '<div class="session-error">加载失败</div>';
       return;
     }
     const sessions = res.data?.sessions || [];
@@ -270,7 +270,11 @@ App.Session.renderCards = async function () {
       !query || (s.title || '').toLowerCase().includes(query)
     );
     if (!filtered.length) {
-      listEl.innerHTML = '<div style="padding:12px;text-align:center;color:var(--muted);font-size:12px;"><div style="font-size:28px;margin-bottom:8px;">💬</div><div style="font-size:13px;font-weight:500;color:var(--text);margin-bottom:4px;">暂无会话</div><div style="font-size:11px;">点击"新建对话"开始</div></div>';
+      listEl.innerHTML = '<div class="session-empty">'
+        + '<div class="se-icon">💬</div>'
+        + '<div class="se-title">暂无会话</div>'
+        + '<div class="se-hint">点击"新建对话"开始</div>'
+        + '</div>';
       return;
     }
     const sorted = [...filtered].sort((a, b) => {
@@ -286,11 +290,15 @@ App.Session.renderCards = async function () {
       return `
         <div class="session-item ${isActive ? 'active' : ''} ${isPinned ? 'pinned' : ''}"
              data-id="${s.id}" data-title="${App.escapeHtml(s.title || '未命名')}">
-          <div class="s-title">${isPinned ? '📌 ' : ''}${App.escapeHtml(s.title || '新会话')}</div>
+          <div class="s-title">${App.escapeHtml(s.title || '新会话')}</div>
           <div class="s-meta">
             <span class="s-time">${timeStr}</span>
             <span class="s-count">${s.messages || 0} 条</span>
-            <span class="s-pin ${isPinned ? 'active' : ''}" title="${isPinned ? '取消置顶' : '置顶会话'}">📌</span>
+            <span class="s-actions">
+              <span class="s-pin ${isPinned ? 'active' : ''}" title="${isPinned ? '取消置顶' : '置顶会话'}" role="button">📌</span>
+              <span class="s-edit" title="重命名" role="button">✏️</span>
+              <span class="s-del" title="删除会话" role="button">🗑</span>
+            </span>
           </div>
         </div>
       `;
@@ -301,17 +309,27 @@ App.Session.renderCards = async function () {
         e.stopPropagation();
         App.Session.togglePin(item.dataset.id);
       });
+      item.querySelector('.s-edit')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        App.Session.enterRename(sorted.find(s => s.id === item.dataset.id), item);
+      });
+      item.querySelector('.s-del')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const sess = sorted.find(s => s.id === item.dataset.id);
+        App.Session.remove(item.dataset.id, (sess && sess.title) || '');
+      });
       item.querySelector('.s-title')?.addEventListener('dblclick', (e) => {
         e.stopPropagation();
         App.Session.enterRename(sorted.find(s => s.id === item.dataset.id), item);
       });
     });
   } catch (err) {
-    listEl.innerHTML = '<div style="padding:48px;text-align:center;color:var(--muted);">加载失败</div>';
+    listEl.innerHTML = '<div class="session-error">加载失败</div>';
     console.error('[Session] renderCards failed:', err);
   }
-  // 同步刷新侧边栏会话历史
-  if (typeof App._renderSidebarHistory === 'function') App._renderSidebarHistory();
+  // 注意: 此处不可再调用 App._renderSidebarHistory()。
+  // 该函数是本函数的别名(见文件末尾), 回调会形成 renderCards -> _renderSidebarHistory -> renderCards 的
+  // 无限递归, 导致无限次 /v1/chat/sessions 请求与会话列表无限重绘。
 };
 
 /* 进入重命名模式 */
@@ -366,9 +384,11 @@ App.Session.rename = async function (id, title) {
 };
 
 /* 删除会话 */
-App.Session.remove = async function (id) {
+App.Session.remove = async function (id, displayName) {
+  // 确认框展示会话标题而非原始 id(UUID), 否则用户无法辨认要删的是哪个会话
+  const label = displayName || id;
   const ok = await (App.confirm
-    ? App.confirm(`确定删除会话「${id}」的全部记录吗?此操作不可恢复。`, { danger: true, okText: '删除' })
+    ? App.confirm(`确定删除会话「${label}」的全部记录吗?此操作不可恢复。`, { danger: true, okText: '删除' })
     : true);
   if (!ok) return;
   try {

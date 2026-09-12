@@ -37,9 +37,10 @@ def _build_or_update_index(chunks: list[dict]) -> None:
     global _avgdl
     total_len = 0
     for chunk in chunks:
-        doc_id = chunk.get("metadata", {}).get("source", chunk.get("id", ""))
+        # Use chunk id as key (format: "doc_id:chunk_index"), matching _bm25_search lookups
+        doc_id = chunk.get("id") or chunk.get("metadata", {}).get("doc_id", "")
         text = chunk.get("text", "") or chunk.get("metadata", {}).get("text", "")
-        if not text:
+        if not text or not doc_id:
             continue
         tokens = _keyword_tokens(text)
         freq = Counter(tokens)
@@ -48,6 +49,14 @@ def _build_or_update_index(chunks: list[dict]) -> None:
         for t, c in freq.items():
             merged[t] = merged.get(t, 0) + c
         _inv_index[doc_id] = merged
+        # Also index by source for backward compatibility
+        source_id = chunk.get("metadata", {}).get("source", "")
+        if source_id and source_id != doc_id:
+            prev_src = _inv_index.get(source_id, {})
+            merged_src: dict[str, int] = dict(prev_src)
+            for t, c in freq.items():
+                merged_src[t] = merged_src.get(t, 0) + c
+            _inv_index[source_id] = merged_src
         total_len += len(text)
     _avgdl = total_len / max(len(_inv_index), 1)
 
@@ -217,15 +226,17 @@ class MultiPathRetriever:
                 self.store._close(conn)
             scored = []
             for row in rows:
-                doc_id = row["id"]
+                chunk_id = row["id"]
+                # Extract base doc_id from "doc_id:chunk_index" format
+                doc_id_key = chunk_id.rsplit(":", 1)[0]
                 meta = json.loads(row["meta"]) if isinstance(row["meta"], str) else row["meta"]
                 text = meta.get("text", "")
                 if not text:
                     continue
-                score = bm25_score(query, doc_id)
+                score = bm25_score(query, doc_id_key)
                 if score > 0:
                     scored.append({
-                        "id": doc_id,
+                        "id": chunk_id,
                         "score": score,
                         "vector_score": 0.0,
                         "keyword_score": 0.0,

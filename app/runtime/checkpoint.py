@@ -235,11 +235,20 @@ class CheckpointManager:
 
     async def rollback(self, run_id: str, version: int) -> Optional[AgentState]:
         """把最新指针回滚到历史版本(时间旅行分支起点)。"""
-        st = await self.load_version(run_id, version)
-        if st is None:
-            return None
-        
         async with _DB_LOCK:
+            rows = self._backend.select(
+                "checkpoint_versions",
+                "run_id = ? AND version = ?",
+                (run_id, int(version)),
+                limit=1
+            )
+            if not rows:
+                return None
+            try:
+                st = AgentState.from_json(rows[0]["state"])
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return None
+
             now = time.time()
             self._backend.upsert(
                 "checkpoints",

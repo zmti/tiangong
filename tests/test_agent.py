@@ -697,6 +697,36 @@ def test_agent_replan_after_repeated_failure():
 
 # ---- 工具结果去重缓存 ----
 
+def test_tool_cache_normalizes_json_key_order():
+    """工具结果去重缓存键归一化: 键序不同的相同逻辑调用命中同一缓存条目。
+
+    验证 _normalize_tool_args 改进: {"a":1,"b":2} 与 {"b":2,"a":1} 映射到同一缓存键,
+    避免参数排列差异导致缓存 miss。
+    """
+    from app.config import settings
+    from app.core.agent import Agent as _Agent
+    from app.tools.registry import Tool, _build_params_model
+
+    # 直接验证归一化函数行为
+    n1 = _Agent._normalize_tool_args('{"a": 1, "b": 2}')
+    n2 = _Agent._normalize_tool_args('{"b": 2, "a": 1}')
+    assert n1 == n2  # 键序不同但归一化后相同
+
+    # 数值 1 vs 1.0 归一化为整数
+    n3 = _Agent._normalize_tool_args('{"x": 1.0, "y": 2}')
+    n4 = _Agent._normalize_tool_args('{"x": 1, "y": 2}')
+    assert n3 == n4
+
+    # 非 JSON 字符串原样返回(保守)
+    assert _Agent._normalize_tool_args('not json') == 'not json'
+    assert _Agent._normalize_tool_args('') == ''
+
+    # 嵌套 dict 递归排序
+    n5 = _Agent._normalize_tool_args('{"a": {"b": 1, "c": 2}, "d": 3}')
+    n6 = _Agent._normalize_tool_args('{"d": 3, "a": {"c": 2, "b": 1}}')
+    assert n5 == n6
+
+
 def test_tool_cache_dedups_identical_calls():
     """同一运行内相同工具+参数只执行一次,第二次直接复用结果。"""
     from app.config import settings

@@ -2,13 +2,13 @@
    消息样式增强 — Modern Message UI v2
    ============================================= */
 
-/* ── 消息基础结构 ── */
+/* ── 消息基础结构 (P1-7: 间距 4px 网格; P1-11: avatar36+gap12=48px 缩进基准) ── */
 .msg {
   display: flex;
   align-items: flex-start;
-  gap: 10px;
-  margin: 0 0 2px;
-  max-width: 100%;
+  gap: 12px;
+  margin: 0 0 8px;
+  max-width: 860px;
   word-break: break-word;
   position: relative;
   animation: msgSlideIn 0.25s cubic-bezier(0.16, 1, 0.3, 1) both;
@@ -21,37 +21,41 @@
 .msg.bot { margin-right: auto; }
 
 .avatar {
-  flex: 0 0 32px; width: 32px; height: 32px;
+  flex: 0 0 36px; width: 36px; height: 36px;
   border-radius: var(--radius-md);
   display: flex; align-items: center; justify-content: center;
   font-size: 16px; flex-shrink: 0;
-  background: var(--primary); color: #fff;
-  box-shadow: 0 2px 8px rgba(124, 92, 252, 0.20);
+  background: var(--msg-user); color: #fff;
+  box-shadow: var(--msg-shadow);
 }
+.msg.bot .avatar { background: linear-gradient(135deg, var(--accent), #0ea5e9); }
 
 .msg-content {
   display: flex; flex-direction: column;
-  min-width: 0; max-width: 100%; gap: 1px; flex: 1;
+  min-width: 0; max-width: 100%; gap: 4px; flex: 1; /* P1-7: 1px → 4px 网格 */
 }
 
 .answer-doc {
   min-width: 0; max-width: 100%;
-  padding: 8px 10px; border-radius: var(--radius);
+  padding: 10px 14px; border-radius: var(--radius);
   line-height: 1.6; font-size: 14px;
-  border: 1px solid var(--border); background: var(--surface-card);
-  white-space: pre-wrap; word-break: break-word;
+  /* P0-1: 用主题感知的卡片令牌(深浅各定义), 不再依赖 --surface-card(深色下与 --bg 同色会"消失") */
+  border: 1px solid var(--msg-card-border); background: var(--msg-card);
+  box-shadow: var(--msg-shadow);
+  word-break: break-word;
 }
 .msg.user .answer-doc {
-  background: var(--primary); color: #fff;
+  background: var(--msg-user); color: #fff;
   border-radius: var(--radius) var(--radius) 4px var(--radius);
-  border: 1px solid rgba(255,255,255,0.15);
+  border: 1px solid var(--msg-user-border);
 }
 .msg.bot .answer-doc { border-radius: var(--radius) var(--radius) var(--radius) 4px; }
 
+/* P1-5: 10.5 → 11, 11.5 → 12 */
 .msg-header {
   display: flex; align-items: center; gap: 6px; padding: 0;
 }
-.msg-time { font-size: 10px; color: var(--muted); font-family: var(--mono); margin-left: auto; }
+.msg-time { font-size: 11px; color: var(--muted); font-family: var(--mono); margin-left: auto; }
 
 .process-rail {
   display: none; align-items: center; gap: 4px;
@@ -141,15 +145,15 @@
   overflow-y: auto;
   overflow-x: hidden;
 }
-.steps-flow::-webkit-scrollbar { width: 3px; }
+.steps-flow::-webkit-scrollbar { width: 6px; } /* P1-10: 统一 6px */
 .steps-flow::-webkit-scrollbar-track { background: transparent; }
-.steps-flow::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+.steps-flow::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 
 .step-row {
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 5px 8px;
+  gap: 8px;
+  padding: 6px 10px;
   cursor: pointer;
   transition: background 0.12s;
   user-select: none;
@@ -203,12 +207,12 @@
 
 .step-num {
   flex-shrink: 0;
-  width: 16px;
-  height: 16px;
+  width: 18px;
+  height: 18px;
   border-radius: 50%;
   background: var(--border);
   color: var(--text-secondary);
-  font-size: 8px;
+  font-size: 9px;
   font-weight: 600;
   display: flex;
   align-items: center;
@@ -222,15 +226,15 @@
 
 .step-icon {
   flex-shrink: 0;
-  font-size: 12px;
-  width: 14px;
+  font-size: 13px;
+  width: 16px;
   text-align: center;
 }
 
 .step-label {
   flex: 1;
   min-width: 0;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 500;
   color: var(--text);
   font-family: var(--mono);
@@ -269,21 +273,21 @@
 }
 
 .step-args-preview {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-secondary);
   font-family: var(--mono);
-  padding: 2px 4px;
+  padding: 3px 6px;
   line-height: 1.4;
   word-break: break-all;
 }
 
 .step-args-content {
   display: none;
-  font-size: 11px;
+  font-size: 12px;
   font-family: var(--mono);
   white-space: pre-wrap;
   word-break: break-all;
-  padding: 4px 6px;
+  padding: 6px 8px;
   line-height: 1.4;
   margin-top: 2px;
   max-height: 200px;
@@ -299,9 +303,9 @@
   font-family: var(--mono);
   white-space: pre-wrap;
   word-break: break-all;
-  font-size: 11px;
-  line-height: 1.4;
-  padding: 4px 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 6px 8px;
   background: var(--bg-elev);
   border-radius: var(--radius-sm);
   max-height: none;
@@ -345,8 +349,8 @@
 /* 工具步骤图片 */
 .step-img-result {
   display: block;
-  max-width: 280px;
-  max-height: 280px;
+  max-width: 300px;
+  max-height: 300px;
   object-fit: contain;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);

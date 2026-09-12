@@ -47,6 +47,22 @@ BLOCKED_COMMAND_PATTERNS: tuple[str, ...] = (
     "mkfs",              # 格式化文件系统
     "rd /s",             # 递归删除目录
     "rmdir /s",          # 递归删除目录
+    # 改进: 解释器/解码器嵌套执行(可绕过上面所有 blacklist 子串检测)
+    "python -c",         # python -c "..."
+    "python3 -c",
+    "node -e",
+    "node --eval",
+    "perl -e",
+    "ruby -e",
+    "php -r",
+    "base64 -d",         # 解码执行 payload
+    "base64 --decode",
+    "certutil -decode",
+    "powershell -command",
+    "powershell -enc",    # 编码命令
+    "/bin/sh -c",
+    "/bin/bash -c",
+    "sh -c",
 )
 
 # 需确认:命中时需用户确认后才执行(破坏性/影响面大,但不在硬黑名单内)

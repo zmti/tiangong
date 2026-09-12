@@ -24,6 +24,7 @@ from typing import Optional
 from pydantic import Field
 
 from app.config import settings
+from app.tools.project_context import resolve_cwd
 from app.tools.registry import tool
 
 
@@ -31,7 +32,7 @@ def _resolve_path(path: str, base_dir: Optional[str] = None) -> str:
     """解析文件路径:优先 base_dir,其次工作目录,绝对路径直接返回。"""
     if os.path.isabs(path):
         return path
-    base = base_dir or (settings.terminal_cwd or os.getcwd())
+    base = base_dir or resolve_cwd()
     return os.path.abspath(os.path.join(base, path))
 
 
@@ -42,7 +43,7 @@ def _sanitize_path(path: str, allowed_dirs: Optional[list[str]] = None) -> bool:
     bases = [os.path.realpath(d) for d in bases if d.strip()]
     if not bases:
         # 默认允许 data 目录和工作目录
-        bases = [settings.resolved_data_dir, os.getcwd()]
+        bases = [settings.resolved_data_dir, resolve_cwd()]
         bases = [os.path.realpath(d) for d in bases]
     return any(real.startswith(b) for b in bases)
 

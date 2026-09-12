@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+from typing import Optional
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
@@ -33,6 +35,16 @@ def _store():
         return session_store
 
 
+def _strip_thinking(text: str) -> str:
+    """Strip thinking and tool_call XML tags from LLM response."""
+    stripped = re.sub(r'<thinking[\s\S]*?</thinking>', '', text, flags=re.IGNORECASE)
+    stripped = re.sub(r'<tool_call[\s\S]*?</tool_call>', '', stripped, flags=re.IGNORECASE)
+    for tag in ('thinking', 'tool_call', 'function', 'parameter'):
+        stripped = re.sub(r'<' + tag + r'[^>]*>', '', stripped, flags=re.IGNORECASE)
+        stripped = re.sub(r'</' + tag + r'>', '', stripped, flags=re.IGNORECASE)
+    return stripped.strip()
+
+
 class ChatRequest(BaseModel):
     message: str = Field(..., min_length=1, description="用户消息")
     session_id: str = Field("default", description="会话 ID")
@@ -49,6 +61,7 @@ class ChatRequest(BaseModel):
     max_output_tokens: int = Field(0, ge=0, description="输出 token 配额硬控制,0=不限制(超过即截断)")
     orch_subtasks: int = Field(0, ge=0, description="编排模式(层级/共识/顺序)的子任务数或候选执行体数提示,0=自动")
     orch_candidates: list[str] = Field(default_factory=list, description="编排模式候选执行体清单(执行模式),如 ['auto','review','ensemble'];空=默认")
+    project_path: str = Field("", description="当前项目路径(前端选择的工作目录,工具将以此为默认工作目录)")
 
 
 def _with_attachments(req: ChatRequest, message: str) -> str:
@@ -161,23 +174,32 @@ async def _stream_with_heartbeat(agent_iter, interval: int = 15):
             await queue.put(("stop", None))
 
     prod_task = asyncio.ensure_future(_producer())
+    # 心跳间隔内复用同一个 sleep future, 避免每轮都 create 新 task
+    pending_hb: Optional[asyncio.Future] = None
     try:
         while True:
             get_q = asyncio.ensure_future(queue.get())
-            hb = asyncio.ensure_future(asyncio.sleep(interval))
-            done, _ = await asyncio.wait({get_q, hb}, return_when=asyncio.FIRST_COMPLETED)
+            if pending_hb is None:
+                pending_hb = asyncio.ensure_future(asyncio.sleep(interval))
+            done, _ = await asyncio.wait({get_q, pending_hb}, return_when=asyncio.FIRST_COMPLETED)
             if get_q in done:
-                hb.cancel()
                 kind, payload = get_q.result()
                 if kind == "stop":
                     break
-                if kind == "err":
+                elif kind == "err":
                     raise payload
-                yield payload
+                else:
+                    # 收到事件, 重置心跳计时器(取消旧 sleep, 下轮重建)
+                    pending_hb.cancel()
+                    pending_hb = None
+                    yield payload
             else:
-                # 静默达到一个间隔:发心跳(不取消 get_q,事件稍后照常到达)
+                # 静默达到一个间隔: 发心跳(不取消 get_q, 事件稍后照常到达)
+                pending_hb = None  # 重置, 下轮重新计时
                 yield {"type": "heartbeat"}
     finally:
+        if pending_hb is not None:
+            pending_hb.cancel()
         prod_task.cancel()
 
 
@@ -205,6 +227,7 @@ def _build_agent(req: ChatRequest) -> Agent:
         max_output_tokens=req.max_output_tokens,
         orch_subtasks=req.orch_subtasks,
         orch_candidates=req.orch_candidates,
+        project_path=req.project_path,
     )
 
 
@@ -220,6 +243,7 @@ class ChatResumeRequest(BaseModel):
     resume_value: object | None = Field(None, description="用户决定:工具名列表 或 {confirmation_id: {approved: bool}}")
     use_history: bool = Field(True, description="是否携带会话历史")
     stream: bool = Field(False, description="是否流式返回(SSE)")
+    project_path: str = Field("", description="当前项目路径")
 
 
 @router.post("/chat/resume")
@@ -228,7 +252,7 @@ async def chat_resume(req: ChatResumeRequest):
 
     支持非流式和流式两种返回模式。
     """
-    agent = _build_agent(ChatRequest(message=" ", session_id=req.session_id))
+    agent = _build_agent(ChatRequest(message=" ", session_id=req.session_id, project_path=req.project_path))
     try:
         gen = agent.resume(req.run_id, resume_value=req.resume_value, stream=req.stream)
         import types
@@ -266,7 +290,7 @@ async def chat_resume(req: ChatResumeRequest):
                 await _store().add_message(
                     req.session_id,
                     "tool",
-                    json.dumps(
+                    content=json.dumps(
                         {"name": step.get("tool", ""), "arguments": step.get("arguments", ""), "result": step.get("result", "")},
                         ensure_ascii=False,
                     ),
@@ -275,9 +299,9 @@ async def chat_resume(req: ChatResumeRequest):
                 await _store().add_message(
                     req.session_id,
                     "plan",
-                    json.dumps(step.get("plan"), ensure_ascii=False),
+                    content=json.dumps(step.get("plan"), ensure_ascii=False),
                 )
-        await _store().add_message(req.session_id, "assistant", result.answer)
+            await _store().add_message(req.session_id, "assistant", content=_strip_thinking(result.answer))
 
     resp = {
         "answer": result.answer,
@@ -293,6 +317,8 @@ async def chat_resume(req: ChatResumeRequest):
 
 @router.post("/chat/stream")
 async def chat_stream(req: ChatRequest) -> StreamingResponse:
+    import logging as _log
+    _log.getLogger("chat").info("chat_stream project_path=%s session=%s", req.project_path, req.session_id)
     agent = _build_agent(req)
     history = []
     if req.use_history:
@@ -300,46 +326,77 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
 
     async def event_gen():
         full_answer: list[str] = []
-        tool_events: list[dict] = []
-        plan_events: list[dict] = []
+        thinking_events: list[dict] = []
+        guardrail_overwrite: Optional[dict] = None  # 流式场景下护栏拦截的替换文本
+        user_saved = False
         injected_message, mm_parts = await _prepare_attachments(req, req.message)
         agent.with_multimodal(mm_parts)
         try:
+            # 先保存用户消息(即使后续中断也能保留)
+            await _store().add_message(req.session_id, "user", content=req.message)
+            user_saved = True
             async for event in _stream_with_heartbeat(agent.run_stream(injected_message, history=history)):
                 if event["type"] == "token":
                     full_answer.append(event["content"])
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 elif event["type"] == "plan":
-                    plan_events.append(event)
+                    # plan 实时保存
+                    await _store().add_message(
+                        req.session_id, "plan",
+                        content=json.dumps(event.get("plan"), ensure_ascii=False),
+                    )
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                elif event["type"] in ("tool", "thinking", "confirmation", "tool_start", "tool_done", "tool_chunk", "tool_call_start"):
+                elif event["type"] == "thinking":
+                    thinking_events.append(event)
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                elif event["type"] in ("tool", "confirmation", "tool_start", "tool_done", "tool_chunk", "tool_call_start"):
                     if event["type"] == "tool":
-                        tool_events.append(event)
+                        # tool 结果实时保存(不再依赖 finally)
+                        await _store().add_message(
+                            req.session_id, "tool",
+                            content=json.dumps(
+                                {"name": event.get("name", ""), "arguments": event.get("arguments", ""), "result": event.get("result", "")},
+                                ensure_ascii=False,
+                            ),
+                        )
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                elif event["type"] == "guardrail_overwrite":
+                    # 护栏拦截: 前端应清除已渲染正文, 用替换文本覆盖
+                    guardrail_overwrite = event
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 else:  # done
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            # 流正常结束:保存 assistant 回复(护栏拦截时存脱敏替换文本)
+            answer_to_store = "".join(full_answer)
+            if guardrail_overwrite is not None:
+                answer_to_store = guardrail_overwrite.get("content", "")
+            if answer_to_store:
+                meta = {}
+                if thinking_events:
+                    thinking_texts = [e.get("content", "") for e in thinking_events if e.get("content")]
+                    if thinking_texts:
+                        meta["thinking"] = "\n".join(thinking_texts)
+                if guardrail_overwrite is not None:
+                    meta["guardrail"] = guardrail_overwrite
+                await _store().add_message(
+                    req.session_id, "assistant",
+                    content=_strip_thinking(answer_to_store),
+                    meta=meta if meta else None,
+                )
         except LLMError as e:
-            yield f"data: {json.dumps({'type': 'error', 'message': _friendly_llm_error(str(e))}, ensure_ascii=False)}\n\n"
-            return
-        finally:
-            await _store().add_message(req.session_id, "user", req.message)
-            for evt in tool_events:
-                await _store().add_message(
-                    req.session_id,
-                    "tool",
-                    json.dumps(
-                        {"name": evt.get("name", ""), "arguments": evt.get("arguments", ""), "result": evt.get("result", "")},
-                        ensure_ascii=False,
-                    ),
-                )
-            for evt in plan_events:
-                await _store().add_message(
-                    req.session_id,
-                    "plan",
-                    json.dumps(evt.get("plan"), ensure_ascii=False),
-                )
-            if full_answer:
-                await _store().add_message(req.session_id, "assistant", "".join(full_answer))
+            err_msg = _friendly_llm_error(str(e))
+            yield f"data: {json.dumps({'type': 'error', 'message': err_msg}, ensure_ascii=False)}\n\n"
+            try:
+                await _store().add_message(req.session_id, "error", content=err_msg)
+            except Exception:
+                pass
+        except Exception as _err:
+            import logging as _lg
+            _lg.getLogger(__name__).warning('[event_gen] stream error: %s', _err)
+            try:
+                await _store().add_message(req.session_id, "error", content=f"流处理异常: {_err}")
+            except Exception:
+                pass
 
     return StreamingResponse(
         event_gen(),

@@ -7,8 +7,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 
 class MCPStdioClient:
@@ -62,7 +65,9 @@ class MCPStdioClient:
             )
         except Exception as e:  # noqa: BLE001
             return {"status": "error", "error": f"启动 MCP 进程失败: {e}"}
-        assert self._proc.stdin is not None and self._proc.stdout is not None
+        if self._proc.stdin is None or self._proc.stdout is None:
+            await self.close()
+            return {"status": "error", "error": "MCP 子进程 stdin/stdout 未正确建立"}
         self._writer = self._proc.stdin
         self._reader = self._proc.stdout
         self._read_task = asyncio.create_task(self._read_loop())

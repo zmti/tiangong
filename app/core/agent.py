@@ -19,13 +19,14 @@ from __future__ import annotations
 import asyncio
 import datetime
 import json
+import logging
 import re
 import time
 import uuid
 from typing import Optional
 
 from app.config import settings
-from app.core.constants import TEST_FAIL_MARKERS, TRANSIENT_PATTERNS
+from app.core.constants import TEST_FAIL_MARKERS, TRANSIENT_PATTERNS, NO_RETRY_TOOLS
 from app.runtime.graph import END, Graph, Node
 from app.runtime.state import AgentState
 
@@ -83,15 +84,11 @@ from app.core.prompts import TOOL_CALL_PATTERN, build_system_prompt, build_tools
 from app.core.telemetry import _current_run_id, tracer
 from app.tools.categories import SYSTEM_TOOLS
 from app.tools.registry import ToolRegistry, get_registry
-import logging
 
 logger = logging.getLogger(__name__)
 
 # 计划工具:在 ReAct 循环内被 Agent 拦截,维护私有计划状态
 PLAN_TOOLS = ("set_plan", "update_plan")
-
-# 不参与瞬态错误自动重试的工具(超时的终端命令不应被盲目重跑)
-NO_RETRY_TOOLS = ("run_terminal",)
 
 # 多智能体编排模式(Orchestration 层),与执行模式(single/auto/review/ensemble)正交
 ORCHESTRATION_MODES = ("sequential", "hierarchical", "consensual")
@@ -149,8 +146,16 @@ class Agent:
         orch_subtasks: int = 0,
         orch_candidates: Optional[list[str]] = None,
         task_config: Optional[dict] = None,
+        project_path: str = "",
     ):
         self.llm = llm or LLMClient()
+        # 项目路径:注入到 ContextVar,工具运行时可通过 resolve_cwd() 获取
+        self.project_path = project_path
+        if project_path:
+            import logging as _log
+            _log.getLogger("agent").info("Agent project_path=%s", project_path)
+            from app.tools.project_context import set_project_path
+            set_project_path(project_path)
         # 自动缩放配置:根据任务复杂度动态调整参数
         self._task_config = task_config
         if task_config:
@@ -242,9 +247,17 @@ class Agent:
         self._tool_cache_safe: set[str] = {
             t.strip() for t in safe_tools_str.split(",") if t.strip()
         }
+        # 搜索查询历史:用于检测重复/相似搜索,防止搜索循环
+        self._search_query_history: list[tuple[str, str]] = []  # (query, timestamp)
+        self._search_max_repeats: int = getattr(settings, 'agent_search_max_repeats', 3)
         # 图运行时
         self._graph: Optional[Graph] = None
         self._checkpoint = None
+        # 修复: 取消标志(asyncio.Event), 供 tasks.py 等调用方注入。
+        # 旧实现 tasks.py 写入 agent._cancel_flag 但 Agent 从不读取该属性,
+        # 导致取消形同虚设, 任务只能跑满 max_minutes 才停。
+        # 现在 _build_graph 把它传入 Graph, 在节点边界检查并抛 CancelledError。
+        self._cancel_flag: Optional[asyncio.Event] = None
         if settings.agent_checkpoint_enabled:
             from app.runtime.checkpoint import CheckpointManager
 
@@ -355,9 +368,16 @@ class Agent:
         graph = self._build_graph()
         state.metadata["history"] = history or []
         state.metadata["stream"] = True
+        cancelled = False
         try:
             async for evt in graph.arun_stream(state):
                 yield evt
+            # 修复: 取消标志命中时 state.status == "cancelled", 不再产出正常 done 事件,
+            # 改为产出 cancelled 事件并抛出 CancelledError 让调用方(如 tasks.py)终止
+            if state.status == "cancelled":
+                cancelled = True
+                yield {"type": "cancelled", "model": state.metadata.get("model", ""), "steps": state.steps}
+                raise asyncio.CancelledError(f"任务被取消 (run {run_id[:8]})")
             model = state.metadata.get("model") or self.llm.info["model"]
             interrupt = None
             if state.status == "interrupted" and state.interrupt:
@@ -366,6 +386,14 @@ class Agent:
             if interrupt is not None:
                 done["interrupt"] = interrupt
             yield done
+        except asyncio.CancelledError:
+            # 取消传播: 记录 trace 后向外抛出, 让调用方(任务管理器)感知并终止
+            if not cancelled:
+                logger.warning("run_stream 被外部取消: run_id=%s", run_id)
+                tracer.record({"type": "run_end", "run_id": run_id, "ok": False,
+                               "error": "cancelled", "duration": round(time.time() - t0, 3)})
+                _current_run_id.reset(token)
+            raise
         except Exception as e:  # noqa: BLE001
             logger.warning("run() 运行异常，记录 trace 后终止: %s", e)
             tracer.record({"type": "run_end", "run_id": run_id, "ok": False,
@@ -410,6 +438,10 @@ class Agent:
         interrupt = None
         if state.status == "interrupted" and state.interrupt:
             interrupt = state.interrupt.get("value")
+        # 修复: 取消标志命中时 state.status == "cancelled", 抛出 CancelledError
+        # 让调用方(如 tasks.py 非流式路径)感知并终止, 不再返回正常结果
+        if state.status == "cancelled":
+            raise asyncio.CancelledError(f"任务被取消 (run {run_id[:8]})")
         return AgentResult(answer=state.answer, steps=state.steps, model=model, interrupt=interrupt)
 
     def _sync_from_state(self, state: AgentState) -> None:
@@ -422,6 +454,21 @@ class Agent:
         else:
             self._plan = None
 
+    def _make_cancel_check(self):
+        """构造取消检查回调: 若 self._cancel_flag 已 set 则返回 True。
+
+        传入 Graph 后, 引擎在每个节点边界(含 arun/arun_stream 循环)
+        检查该回调, 命中即把 state 标记为 cancelled 并终止, 不再执行后续节点。
+        修复 tasks.py 取消形同虚设的问题: 用户 cancel() 后, 当前 LLM/工具调用
+        结束后下个节点边界立即中止, 不必等到 max_minutes 超时。
+        """
+        flag = self._cancel_flag
+        if flag is None:
+            return None
+        def _check() -> bool:
+            return flag.is_set()
+        return _check
+
     def _build_graph(self) -> Graph:
         # 每次调用创建新图,避免多次 run 复用同一图实例导致 state 残留
         # 动态计算初始步数:基于 task_config 中的 max_steps
@@ -429,7 +476,11 @@ class Agent:
         base_max = self.max_steps
         # Graph.max_iters 需要预留足够余量，实际检查在 _node_llm 中进行
         g = Graph(name="agent", checkpoint=self._checkpoint,
-                  max_iters=base_max + 100)  # 增加余量到100步
+                  max_iters=base_max + 100,  # 增加余量到100步
+                  cancel_check=self._make_cancel_check(),
+                  batch_checkpoint=True,
+                  batch_flush_interval=float(getattr(settings, "agent_checkpoint_batch_flush_interval", 2.0) or 2.0),
+                  batch_max_buffer=int(getattr(settings, "agent_checkpoint_batch_max_buffer", 10) or 10))
         g.add_node(Node("prepare", self._node_prepare))
         g.add_node(Node("llm", self._node_llm))
         g.add_node(Node("tools", self._node_tools))
@@ -449,23 +500,23 @@ class Agent:
     async def _route_llm(self, state: AgentState) -> Optional[str]:
         """llm 节点之后的路由:给上限→giveup;有工具调用→tools;否则→finalize。"""
         if state.metadata.get("giveup"):
-            logger.debug("[_route_llm] → giveup")
+            logger.warning("[_route_llm] → giveup (steps exhausted)")
             return "giveup"
         if state.metadata.get("tool_calls"):
-            logger.debug("[_route_llm] → tools (count=%d)", len(state.metadata["tool_calls"]))
+            logger.info("[_route_llm] → tools (count=%d)", len(state.metadata["tool_calls"]))
             return "tools"
-        logger.debug("[_route_llm] → finalize")
+        logger.info("[_route_llm] → finalize")
         return "finalize"
 
     def _get_dynamic_max_steps(self, state: AgentState) -> int:
         """根据计划进度动态计算最大步数。
 
-        规则:
-        1. 如果有计划且未完成,根据剩余步骤数动态调整上限
-        2. 每完成一步，剩余预算减少
-        3. 动态上限 = base_max + remaining * steps_per_step
+        规则: 基础步数 + 剩余步骤数 * 每步预算, 但设硬上限防止膨胀失控。
+        硬上限 = base_max + 30 (默认 40), 避免复杂计划导致单请求运行 50 步以上。
         """
         base_max = self.max_steps
+        # 动态扩张的硬上限: 基础值 + 最多 30 步额外预算
+        hard_cap = base_max + 30
         if not self._plan:
             return base_max
 
@@ -476,25 +527,27 @@ class Agent:
         if remaining <= 0:
             return base_max  # 计划已完成,使用基础步数
 
-        # 正确公式: 基础步数 + 剩余步骤 × 每步预算
-        # 随着任务完成，动态上限逐渐降低到 base_max
-        steps_per_plan_step = 8  # 每个计划步骤分配 8 步 (思考 + 执行 + 验证)
-        dynamic_max = base_max + remaining * steps_per_plan_step
+        # 动态上限 = 基础步数 + 剩余步骤 × 每步预算(受 hard_cap 约束)
+        steps_per_plan_step = 2  # 每个计划步骤分配 2 步(思考 + 执行)
+        dynamic_max = min(base_max + remaining * steps_per_plan_step, hard_cap)
         return int(dynamic_max)
 
     async def _route_finalize(self, state: AgentState) -> Optional[str]:
         """finalize 之后:简单回答跳过反思/校验;否则按预算进入反思→校验。"""
         answer = state.answer or ""
         has_tool_steps = any(s.get("type") == "tool" for s in state.steps)
-        logger.debug("[_route_finalize] answer_len=%d has_tools=%s consecutive_empty=%s",
+        # 提升日志级别以便更容易诊断问题
+        logger.info("[_route_finalize] answer_len=%d has_tools=%s consecutive_empty=%d",
                      len(answer or ""), has_tool_steps, state.metadata.get("consecutive_empty_answers", 0))
         # 空答案:跟踪连续空答案次数，超过阈值则触发 giveup
         if not answer or not answer.strip():
             consecutive_empty = int(state.metadata.get("consecutive_empty_answers", 0)) + 1
             state.metadata["consecutive_empty_answers"] = consecutive_empty
+            logger.warning("[_route_finalize] empty answer #%d, will retry", consecutive_empty)
             # 连续 2 次空答案即放弃(避免 LLM 只输出 thinking 标签导致无限循环)
             if consecutive_empty >= 2:
                 state.metadata["giveup"] = True
+                logger.warning("[_route_finalize] giving up after %d consecutive empty answers", consecutive_empty)
                 return "giveup"
             return "llm"
         # 有答案时重置计数器
@@ -589,7 +642,7 @@ class Agent:
             logger.warning("steps exhausted: rounds=%d, total_steps=%d, dynamic_max=%d",
                           rounds, total_steps, dynamic_max)
             return
-        
+
         state.metadata["llm_rounds"] = rounds + 1
 
         is_stream = state.metadata.get("stream", False)
@@ -600,7 +653,9 @@ class Agent:
         state.metadata["tool_call_mode"] = tool_call_mode
         state.metadata["resp"] = resp or ""
         state.metadata["tool_calls"] = [tc.to_dict() for tc in tool_calls]
-        logger.debug("[_node_llm] resp_len=%d tool_calls=%d mode=%s", len(resp or ""), len(tool_calls), tool_call_mode)
+        # 提升日志级别以便更容易诊断问题
+        logger.info("[_node_llm] round=%d resp_len=%d tool_calls=%d mode=%s",
+                    rounds, len(resp or ""), len(tool_calls), tool_call_mode)
 
         # 推理模型:先把思维链透出为 thinking 事件(与正文分离)
         reasoning = getattr(self.llm, "_reasoning", "") or ""
@@ -718,7 +773,7 @@ class Agent:
 
     async def _node_finalize(self, state: AgentState, graph: Graph) -> None:
         """最终回答:更新计划、产出答案、自动沉淀记忆。流式模式逐 token 输出。"""
-        logger.debug("[_node_finalize] START resp=%r", (state.metadata.get("resp") or "")[:100])
+        logger.info("[_node_finalize] START resp_len=%d", len(state.metadata.get("resp") or ""))
         step = int(state.metadata.get("llm_rounds", 1)) - 1
         evt = self._finalize_plan(state.steps, step)
         if evt:
@@ -751,22 +806,37 @@ class Agent:
         state.answer = answer
         # 剥离 <thinking>...</thinking> 标签,确保存储的答案不含思考内容
         if state.answer:
-            state.answer = re.sub(r'<thinking[^>]*>[\s\S]*?</thinking>', '', state.answer, flags=re.IGNORECASE).strip()
+            # 丢弃完整的 thinking 块（思考过程），保留正文
+            state.answer = re.sub(r'<thinking[^>]*>[\s\S]*?</thinking>', '', state.answer, flags=re.IGNORECASE)
+            # 清理可能残留的孤立标签
+            state.answer = re.sub(r'<thinking[^>]*>', '', state.answer, flags=re.IGNORECASE)
+            state.answer = re.sub(r'</thinking>', '', state.answer, flags=re.IGNORECASE)
+            # 规范化空白
+            state.answer = state.answer.strip()
             state.answer = re.sub(r'[ \t]+', ' ', state.answer)
             state.answer = re.sub(r'\n{3,}', '\n\n', state.answer)
         state.steps.append({"step": step + 1, "type": "answer", "content": state.answer})
 
-        # 输出护栏:敏感信息/提示词泄露检测(流式模式 token 已发出,仅记录;非流式可拦截)
+        # 输出护栏:敏感信息/提示词泄露检测(流式模式也强制拦截, 通过 guardrail_overwrite 事件更正)
         from app.core.guardrails import run_output_guardrails
 
         out_guard = run_output_guardrails(answer)
         if out_guard.blocked:
+            sanitized = next((v.sanitized for v in out_guard.violations if v.sanitized), None)
+            replacement = sanitized or "回答包含敏感信息, 已由安全护栏拦截并脱敏。"
             state.steps.append({"step": step + 1, "type": "guardrail", "content": out_guard.reasons()})
             state.metadata["guardrail_violations"] = [v.__dict__ for v in out_guard.violations]
-            if not state.metadata.get("stream"):
-                sanitized = next((v.sanitized for v in out_guard.violations if v.sanitized), None)
-                state.answer = sanitized or "回答包含敏感信息,已由安全护栏拦截。"
-                state.steps[-1]["content"] = out_guard.reasons()
+            state.answer = replacement
+            if state.metadata.get("stream"):
+                # 流式场景: token 已逐字发出, 发出 guardrail_overwrite 事件告知前端用替换文本
+                # 覆盖已渲染内容(前端收到此事件时应清除正文并替换, 或追加拦截提示)
+                state.emit({
+                    "type": "guardrail_overwrite",
+                    "content": replacement,
+                    "reasons": out_guard.reasons(),
+                    "stream_replaced": True,
+                })
+            # 非流式: answer 直接替换, 未发出任何 token, 护栏完全生效
 
         await self._maybe_auto_memory(state.user_input, state.answer, state.metadata.get("history", []) or [])
 
@@ -877,6 +947,7 @@ class Agent:
                 mode="single",  # 子模型只做不评,避免递归
                 critic_provider=(self.critic_llm.provider if self.critic_llm else ""),
                 critic_model=(self.critic_llm.model if self.critic_llm else ""),
+                project_path=self.project_path,
             )
             sub._active_tools = self._active_tools
             sub._schemas_cache = None
@@ -991,6 +1062,7 @@ class Agent:
             critic_model=(self.critic_llm.model if self.critic_llm else ""),
             ensemble_models=self.ensemble_models,
             max_output_tokens=self.max_output_tokens,
+            project_path=self.project_path,
         )
         # 子 Agent 继承父 Agent 的工具路由结果,避免调用无关工具
         sub._active_tools = active_tools or self._active_tools
@@ -1490,6 +1562,26 @@ class Agent:
             return result
 
     async def _execute_tool_once(self, name: str, arguments: str) -> str:
+        # 确保项目路径上下文在每次工具调用时都已设置(线程安全)
+        if self.project_path:
+            from app.tools.project_context import set_project_path
+            set_project_path(self.project_path)
+        # 搜索查询去重:检测重复/相似搜索,防止搜索循环
+        if name == "web_search":
+            try:
+                args = json.loads(arguments) if isinstance(arguments, str) and arguments.strip() else {}
+                query = args.get("query", "") if isinstance(args, dict) else ""
+                if query and self._is_similar_search_query(query):
+                    logger.warning("搜索查询过于相似,拦截重复搜索: %s", query[:50])
+                    return json.dumps({
+                        "error": f"搜索查询 '{query}' 与近期搜索过于相似,请不要重复搜索相同主题。"
+                                 f"请基于已有搜索结果进行分析,或使用完全不同的搜索词。",
+                        "blocked": True
+                    }, ensure_ascii=False)
+                if query:
+                    self._record_search_query(query)
+            except (json.JSONDecodeError, TypeError):
+                pass
         # 危险工具频率限制(与 ToolExecutor 行为一致)
         if name in self._dangerous_tools:
             allowed, limit_msg = self._dangerous_rate_limiter.allow(name)
@@ -1518,15 +1610,26 @@ class Agent:
             from app.core.security import decide
 
             decision = decide(name, arguments)
+            # 硬拦截: 命中 BLOCKED 命令时直接拒绝(模型无法绕过, 无需确认机会)
+            if not decision.allowed:
+                return json.dumps({
+                    "error": f"操作已被硬拦截: {decision.reason}",
+                    "blocked": True,
+                    "fatal": True,
+                    "ok": False,
+                }, ensure_ascii=False)
             if decision.confirm:
                 if settings.agent_confirm_interrupt:
-                    # interrupt 模式下不应到达这里(预扫描已先中断);
-                    # 兜底:返回拦截提示,避免绕过 pre-scan 的路径静默执行
+                    # interrupt 模式下预扫描已先中断; 此处为兜底路径(预扫描未覆盖的调用)
+                    # 返回 fatal 错误强制终止本次执行, 避免模型忽略"等待批准"提示继续调用
                     return json.dumps({
                         "error": f"操作已被拦截: {decision.reason}(等待用户批准)",
                         "blocked": True,
+                        "fatal": True,
                         "confirmation_required": True,
+                        "ok": False,
                     }, ensure_ascii=False)
+                # 阻塞轮询模式: 等待用户批准(原行为保留)
                 allowed, status = await self._await_confirmation(name, arguments, decision.reason)
                 if not allowed:
                     return json.dumps({
@@ -1534,6 +1637,7 @@ class Agent:
                         "blocked": True,
                         "confirmation_required": True,
                         "status": status,
+                        "ok": False,
                     }, ensure_ascii=False)
 
         try:
@@ -1547,8 +1651,9 @@ class Agent:
                        "result_len": len(result), "duration": round(time.time() - t0, 3),
                        "args_preview": (arguments or "")[:120]})
         # 缓存成功结果(去重缓存):仅安全工具缓存,失败/副作用工具不缓存
+        # 使用归一化 JSON 键(排序 key),避免 {"a":1,"b":2} 与 {"b":2,"a":1} 被视为不同键
         if self._tool_cache is not None and not self._is_tool_error(result) and name in self._tool_cache_safe:
-            key = (name, arguments)
+            key = (name, self._normalize_tool_args(arguments))
             async with self._tool_cache_lock:
                 if key not in self._tool_cache:
                     max_size = int(settings.agent_tool_cache_size or 0)
@@ -1557,6 +1662,33 @@ class Agent:
                         self._tool_cache.popitem(last=False)
                     self._tool_cache[key] = result
         return result
+
+    @staticmethod
+    def _normalize_tool_args(arguments: str) -> str:
+        """归一化工具参数 JSON,使相同逻辑调用无论键序/数值类型如何都映射到同一键。
+
+        - dict 按 key 排序
+        - 数值 1 vs 1.0 统一为整数形式
+        - 失败时回退到原始字符串(保守不改变行为)
+        """
+        if not isinstance(arguments, str) or not arguments.strip():
+            return arguments or ""
+        try:
+            parsed = json.loads(arguments)
+        except (json.JSONDecodeError, TypeError):
+            return arguments
+        try:
+            def _norm(v):
+                if isinstance(v, dict):
+                    return {k: _norm(x) for k, x in sorted(v.items())}
+                if isinstance(v, list):
+                    return [_norm(x) for x in v]
+                if isinstance(v, float) and v.is_integer():
+                    return int(v)
+                return v
+            return json.dumps(_norm(parsed), ensure_ascii=False, sort_keys=True)
+        except Exception:  # noqa: BLE001
+            return arguments
 
     def _scan_pending_confirmations(self, tool_calls: list[ToolCall]) -> list[tuple[ToolCall, object]]:
         """预扫描一批工具调用,返回需要人工确认且未批准的 (tool_call, decision)。
@@ -1741,6 +1873,20 @@ class Agent:
                 terminal = tc.name
         for name in error_names:
             failures[name] = failures.get(name, 0) + 1
+
+        # 搜索重复检测:检查是否在短时间内调用了过多搜索
+        search_calls = [tc for tc, _, _ in batch if tc.name == "web_search"]
+        if len(search_calls) > 0:
+            total_searches = len(self._search_query_history)
+            if total_searches >= self._search_max_repeats:
+                hint = (
+                    f"检测到已进行 {total_searches} 次搜索,请停止重复搜索。"
+                    "请基于已有的搜索结果进行综合分析和回答,不要再调用 web_search。"
+                    "如果现有信息不足,请直接说明哪些信息缺失,而不是继续搜索。"
+                )
+                messages.append({"role": "user", "content": hint})
+                return terminal
+
         if error_names:
             # 测试/构建失败:给出定向的"定位→修改→重跑"闭环提示
             name_to_result = {tc.name: result_str for tc, result_str, _e in batch}
@@ -1777,6 +1923,69 @@ class Agent:
         except (json.JSONDecodeError, TypeError):
             pass
         return False
+
+    # ---- 搜索查询去重 ----
+
+    def _normalize_search_query(self, query: str) -> str:
+        """归一化搜索查询:去除停用词、标点,提取核心关键词用于相似度比较。"""
+        import re
+        # 去除标点和空白:保留中文、英文、数字
+        q = re.sub(r'[^a-zA-Z0-9\u4e00-\u9fff]+', ' ', query)
+        # 常见停用词(搜索场景)
+        stop_words = {'的', '了', '在', '是', '我', '有', '和', '就', '不', '人', '都', '一',
+                      '一个', '上', '也', '很', '到', '说', '要', '去', '你', '会', '着',
+                      '没有', '看', '好', '自己', '这', '他', '她', '它', '们', '那',
+                      '最新', '新闻', '消息', '资讯', '信息', '搜索', '查找', '查询',
+                      '请问', '请', '帮我', '告诉', '了解', '查看'}
+        words = q.split()
+        filtered = [w for w in words if w not in stop_words]
+        return ' '.join(filtered)
+
+    def _is_similar_search_query(self, query: str) -> bool:
+        """检查搜索查询是否与近期查询过于相似,防止搜索循环。
+
+        改进: 引入时间衰减权重 + 提高阈值至 0.7 + 双向包含检测。
+        - 时间衰减: 越近的查询权重越高,避免 60 秒内所有查询等权累计导致误判
+        - 阈值 0.7: 避免"帮我查北京天气"与"北京明天天气"这类合理追问被拦截
+        - 双向包含: 短查询被长查询包含时也视为相似(中文分词不完整时的兜底)
+        """
+        import time
+        now = time.time()
+        normalized = self._normalize_search_query(query)
+        if not normalized:
+            return False
+        # 清理超过 60 秒的历史记录
+        self._search_query_history = [
+            (q, t) for q, t in self._search_query_history if now - t < 60
+        ]
+        # 检查相似度:核心关键词集合的 Jaccard 相似度(带时间衰减)
+        query_words = set(normalized.split())
+        repeat_score = 0.0
+        for hist_query, ts in self._search_query_history:
+            hist_words = set(self._normalize_search_query(hist_query).split())
+            if not query_words or not hist_words:
+                continue
+            # 双向包含: 一个词集合完全包含另一个(短查询被长查询包含)
+            if query_words <= hist_words or hist_words <= query_words:
+                similarity = 0.9  # 包含关系视为高度相似
+            else:
+                intersection = query_words & hist_words
+                union = query_words | hist_words
+                similarity = len(intersection) / len(union) if union else 0
+            if similarity >= 0.7:
+                # 时间衰减: 5 秒前权重 1.0, 60 秒前权重 0.1, 线性插值
+                age = now - ts
+                weight = max(0.1, 1.0 - (age / 60.0) * 0.9)
+                repeat_score += weight
+        return repeat_score >= self._search_max_repeats - 1
+
+    def _record_search_query(self, query: str) -> None:
+        """记录搜索查询到历史。"""
+        import time
+        self._search_query_history.append((query, time.time()))
+        # 限制历史长度
+        if len(self._search_query_history) > 20:
+            self._search_query_history = self._search_query_history[-20:]
 
     # ---- 测试/构建失败闭环 ----
 
@@ -2254,8 +2463,43 @@ class Agent:
         return None
 
     @staticmethod
+    def _extract_balanced_json(text: str, start: int) -> Optional[str]:
+        """从 text[start] 起提取一个平衡的 JSON 对象字符串(花括号配对)。
+
+        用于替代正则贪婪匹配, 正确处理参数值中含嵌套 {} 或引号字符串内含花括号的场景。
+        返回提取的 JSON 字符串(含最外层花括号), 失败返回 None。
+        """
+        if start >= len(text) or text[start] != "{":
+            return None
+        depth = 0
+        in_string = False
+        escape = False
+        i = start
+        while i < len(text):
+            ch = text[i]
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = not in_string
+            elif not in_string:
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        return text[start: i + 1]
+            i += 1
+        return None
+
+    @staticmethod
     def _parse_tool_calls(text: str) -> list[ToolCall]:
-        """从 LLM 回复中解析所有工具调用 JSON(支持单条和数组格式)。"""
+        """从 LLM 回复中解析所有工具调用 JSON(支持单条和数组格式)。
+
+        改进: 正则匹配失败时改用平衡花括号扫描提取 arguments 值, 避免参数
+        嵌套 JSON 导致贪婪匹配错位或参数丢失。
+        """
         if not text or not text.strip():
             return []
         stripped = text.strip()
@@ -2275,9 +2519,15 @@ class Agent:
                         return calls
             except json.JSONDecodeError:
                 pass
-        # 尝试正则匹配多条 JSON 对象
-        for m in re.finditer(TOOL_CALL_PATTERN, text, re.DOTALL):
-            calls.append(ToolCall(id="", name=m.group(1), arguments=m.group(2)))
+        # 正则逐块定位 {"tool": ..., "arguments": 起点, 再用平衡扫描提取完整 arguments JSON
+        for m in re.finditer(r'\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:', text):
+            arg_str = Agent._extract_balanced_json(text, m.end())
+            if arg_str is not None:
+                calls.append(ToolCall(id="", name=m.group(1), arguments=arg_str))
+        # 回退: 若平衡扫描未命中(非标准格式), 尝试原 TOOL_CALL_PATTERN 有限嵌套匹配
+        if not calls:
+            for m in re.finditer(TOOL_CALL_PATTERN, text, re.DOTALL):
+                calls.append(ToolCall(id="", name=m.group(1), arguments=m.group(2)))
         # 尝试宽松解析单条
         if not calls:
             parsed = Agent._parse_tool_call(text)

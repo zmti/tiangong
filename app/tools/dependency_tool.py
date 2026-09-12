@@ -9,6 +9,7 @@ from typing import Optional
 
 from pydantic import Field
 
+from app.tools.project_context import resolve_cwd
 from app.tools.registry import tool
 
 
@@ -138,7 +139,7 @@ def install_package(
     if not pkg_list:
         return {"ok": False, "error": "包名不能为空"}
 
-    root = os.path.abspath(os.path.expanduser(path or os.getcwd()))
+    root = os.path.abspath(os.path.expanduser(path or resolve_cwd()))
 
     # 检测包管理器
     files = set(os.listdir(root))
@@ -161,7 +162,7 @@ def list_packages(
     type: str = Field("all", description="列出类型: all/python/npm"),
 ) -> dict:
     """列出依赖包。"""
-    root = os.path.abspath(os.path.expanduser(path or os.getcwd()))
+    root = os.path.abspath(os.path.expanduser(path or resolve_cwd()))
     files = set(os.listdir(root))
 
     if type in ("all", "python"):

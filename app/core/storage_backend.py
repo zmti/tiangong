@@ -326,9 +326,19 @@ class InMemoryBackend(SqliteBackend):
 
 
 # =============== 后端工厂 ===============
-
-_backend_cache: StorageBackend | None = None
+# 按 (backend, db_path, memory_mode) 键缓存: 不同数据库文件的后端各自独立,
+# 避免旧实现"第一个后端覆盖全局"导致 sessions/checkpoints/memory 数据散落同一文件
+_backend_cache: dict[tuple, "StorageBackend"] = {}
 _backend_lock = threading.Lock()
+
+
+def _backend_key(backend: str, db_path: str | Path | None, memory_mode: bool) -> tuple:
+    """生成后端缓存键。db_path 归一化为绝对路径字符串, 避免相对/绝对路径不一致导致重复创建。"""
+    if db_path is None:
+        resolved = str(DEFAULT_DATA_DIR / "storage.db")
+    else:
+        resolved = str(Path(db_path).absolute())
+    return (backend, resolved, memory_mode)
 
 
 def get_storage_backend(
@@ -337,7 +347,11 @@ def get_storage_backend(
     *,
     memory_mode: bool = False,
 ) -> StorageBackend:
-    """获取存储后端实例（单例）
+    """获取存储后端实例(按 (backend, db_path, memory_mode) 键缓存复用)。
+
+    修复: 旧实现用单一全局单例, 第一次调用后缓存, 后续所有不同 db_path
+    的调用全部返回第一个后端, 导致 sessions.db / checkpoints.db / memory.db
+    数据散落到同一物理文件。现改为按 key 缓存, 不同数据库文件各自独立。
 
     Args:
         backend: "auto" | "sqlite" | "redis" | "postgresql"
@@ -349,49 +363,63 @@ def get_storage_backend(
     """
     global _backend_cache
 
-    if _backend_cache is not None:
-        return _backend_cache
+    if backend == "auto":
+        from app.config import settings
+        backend = (settings.storage_backend or "sqlite").lower()
+
+    key = _backend_key(backend, db_path, memory_mode)
+    cached = _backend_cache.get(key)
+    if cached is not None:
+        return cached
 
     with _backend_lock:
-        if _backend_cache is not None:
-            return _backend_cache
-
-        if backend == "auto":
-            from app.config import settings
-            backend = (settings.storage_backend or "sqlite").lower()
+        cached = _backend_cache.get(key)
+        if cached is not None:
+            return cached
 
         if backend == "redis":
             try:
                 from app.core.redis_backend import RedisBackend
                 from app.config import settings
-                _backend_cache = RedisBackend(settings.redis_url)
+                inst = RedisBackend(settings.redis_url)
+                _backend_cache[key] = inst
                 logger.info("使用 Redis 存储后端")
-                return _backend_cache
+                return inst
             except Exception as e:
                 logger.warning(f"Redis 不可用，回退 SQLite: {e}")
                 backend = "sqlite"
+                key = _backend_key(backend, db_path, memory_mode)
+                cached = _backend_cache.get(key)
+                if cached is not None:
+                    return cached
 
         if backend == "postgresql":
             try:
                 from app.core.postgres_backend import PostgresBackend
                 from app.config import settings
-                _backend_cache = PostgresBackend(settings.pgvector_client_dsn)
+                inst = PostgresBackend(settings.pgvector_client_dsn)
+                _backend_cache[key] = inst
                 logger.info("使用 PostgreSQL 存储后端")
-                return _backend_cache
+                return inst
             except Exception as e:
                 logger.warning(f"PostgreSQL 不可用，回退 SQLite: {e}")
                 backend = "sqlite"
+                key = _backend_key(backend, db_path, memory_mode)
+                cached = _backend_cache.get(key)
+                if cached is not None:
+                    return cached
 
         # 默认 SQLite
         if db_path is None:
             db_path = DEFAULT_DATA_DIR / "storage.db"
-        _backend_cache = SqliteBackend(db_path, memory_mode=memory_mode)
+        inst = SqliteBackend(db_path, memory_mode=memory_mode)
+        _backend_cache[key] = inst
         logger.info(f"使用 SQLite 存储后端: {db_path}")
-        return _backend_cache
+        return inst
 
 
 def reset_storage_backend() -> None:
     """重置后端缓存（测试用）"""
     global _backend_cache
     with _backend_lock:
-        _backend_cache = None
+        _backend_cache = {}

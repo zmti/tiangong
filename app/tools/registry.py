@@ -89,7 +89,13 @@ class Tool:
             if self.is_async:
                 result = await asyncio.wait_for(self.func(**args), timeout=self.timeout)
             else:
-                result = await asyncio.wait_for(asyncio.to_thread(self.func, **args), timeout=self.timeout)
+                # 复制当前 contextvars 到子线程(解决 asyncio.to_thread 不传播 ContextVar 的问题)
+                import contextvars
+                ctx = contextvars.copy_context()
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(ctx.run, self.func, **args),
+                    timeout=self.timeout,
+                )
         except asyncio.TimeoutError as exc:
             raise ToolError(f"工具 {self.name} 执行超时({self.timeout}s)") from exc
         except ToolError:

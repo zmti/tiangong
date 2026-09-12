@@ -8,6 +8,7 @@ import re
 from pydantic import Field
 
 from app.config import settings
+from app.tools.project_context import resolve_cwd
 from app.tools.registry import tool
 
 
@@ -30,7 +31,7 @@ def _allowed_write_roots() -> list[str]:
             roots.append(os.path.abspath(os.path.expanduser(d)))
     roots.append(settings.resolved_data_dir)
     try:
-        roots.append(os.path.abspath(os.getcwd()))
+        roots.append(os.path.abspath(resolve_cwd()))
     except Exception:  # noqa: BLE001
         pass
     return list(dict.fromkeys(roots))

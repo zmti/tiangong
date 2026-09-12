@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>智能体助手</title>
+  <title>天工</title>
   <link rel="stylesheet" href="style-new.css">
   <link rel="stylesheet" href="style-command.css">
   <link rel="stylesheet" href="style-message.css">
@@ -12,13 +12,13 @@
 <body data-theme="light">
   <!-- 顶部导航 -->
   <nav id="topNav">
-    <div class="nav-logo" title="智能体助手">
+    <div class="nav-logo" title="天工">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
         <path d="M12 2a4 4 0 0 1 4 4v2a4 4 0 0 1-8 0V6a4 4 0 0 1 4-4z"/>
         <path d="M16 14H8a4 4 0 0 0-4 4v2h16v-2a4 4 0 0 0-4-4z"/>
         <circle cx="12" cy="7" r="1" fill="currentColor"/>
       </svg>
-      <span>智能体助手</span>
+      <span>天工</span>
     </div>
 
     <div class="nav-separator"></div>
@@ -126,7 +126,7 @@
       <!-- 欢迎页 -->
       <div id="welcome" class="welcome">
         <div class="welcome-logo">🤖</div>
-        <h2>智能体助手</h2>
+        <h2>天工</h2>
         <p class="welcome-sub">多模型对话 · 知识库 · 工具调用 · 图片识别</p>
         <div class="welcome-chips">
           <button class="welcome-chip" data-q="帮我介绍这个项目能做什么">我能做什么？</button>
@@ -445,7 +445,12 @@
   <script src="js/messages.js"></script>
   <script src="js/group.js"></script>
   <script src="js/utils.js"></script>
-  <script src="js/common.js"></script>
+  <!-- 从 common.js 的 eval 兼容层拆出的独立模块(顺序: exec-trace → toast → lightbox → tts → confirm-dialog) -->
+  <script src="js/exec-trace.js"></script>
+  <script src="js/toast.js"></script>
+  <script src="js/lightbox.js"></script>
+  <script src="js/tts.js"></script>
+  <script src="js/confirm-dialog.js"></script>
   <script src="js/attachments.js"></script>
   <script src="js/session.js"></script>
   <script src="js/kb.js"></script>

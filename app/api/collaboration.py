@@ -52,7 +52,8 @@ async def run_orchestration(req: BaseModel) -> dict:
     max_parallel = getattr(req, "max_parallel", 5)
 
     registry = get_registry()
-    executor = ToolExecutor(registry)
+    from app.tools.project_context import get_project_path
+    executor = ToolExecutor(registry, project_path=get_project_path())
 
     async def _tool_exec(name: str, args: str) -> str:
         return await executor.execute_tool(name, args)

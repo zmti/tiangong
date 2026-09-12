@@ -156,9 +156,11 @@ OutputChecker = Callable[[str], GuardrailResult]
 def _contains_injection(text: str) -> Optional[str]:
     low = (text or "").lower()
     for pat in _INJECTION_PATTERNS:
-        # 通配符 * 转为正则 .* ,其他字符直接子串匹配
+        # 通配符 * 转为正则 .* ,其他正则特殊字符转义后做字面量匹配
         if "*" in pat:
-            regex_pat = pat.replace("*", ".*")
+            # 先转义除 * 外的所有正则特殊字符,再把 * 替换为 .*
+            base = re.escape(pat.replace("*", "\x00"))
+            regex_pat = base.replace("\x00", ".*")
             if re.search(regex_pat, low):
                 return pat
         elif pat.lower() in low:

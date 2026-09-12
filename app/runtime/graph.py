@@ -125,6 +125,7 @@ class Graph:
         cancel_check: Optional[Callable[[], bool]] = None,
         batch_checkpoint: bool = True,  # 启用批量写入
         batch_flush_interval: float = 2.0,  # 批量刷新间隔
+        batch_max_buffer: int = 10,  # 批量写入最大缓冲条数
     ):
         self.name = name
         self.checkpoint = checkpoint  # CheckpointManager 或 None
@@ -134,7 +135,8 @@ class Graph:
         self._cancel_check = cancel_check  # 可选: 取消检查回调 (返回 True 表示已取消)
         self._batch_checkpoint = batch_checkpoint
         self._batch_flush_interval = batch_flush_interval
-        self._batch_manager = None  # BatchCheckpointManager 实例
+        self._batch_max_buffer = batch_max_buffer
+        self._batch_manager = None  # BatchCheckpointManager 实例(懒加载, 进程级单例)
         # 流式运行时的实时事件转发器(arun_stream 挂载,节点内 emit 立即调用)
         self._stream_hook: Optional[Callable[[dict], None]] = None
         # 节点和边(必须在 _stream_hook 之后初始化,因为 add_node/add_edge 可能访问)
@@ -167,16 +169,38 @@ class Graph:
 
     # ---- 运行 ----
 
+    async def _init_batch_manager(self) -> None:
+        """懒加载批量 checkpoint 管理器(读取配置, 支持关闭)。
+
+        修复: 旧实现在每个 _checkpoint 调用时重复检查/重建, 且 arun_stream
+        结束时 stop 掉后 _batch_manager 置 None, 但下次 _checkpoint 又重建,
+        导致后台 flush 任务反复 start/stop 泄漏。
+        新实现: 首次调用时按配置一次性初始化, 后续复用; 仅在显式
+        shutdown 时释放。
+        """
+        if self.checkpoint is None or self._batch_manager is not None:
+            return
+        if not self._batch_checkpoint:
+            return
+        try:
+            from app.runtime.batch_checkpoint import get_batch_checkpoint_manager
+            self._batch_manager = await get_batch_checkpoint_manager(
+                self.checkpoint,
+                flush_interval=self._batch_flush_interval,
+                max_buffer_size=self._batch_max_buffer,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("批量 checkpoint 管理器初始化失败, 降级为逐节点写入: %s", exc)
+            self._batch_manager = None
+
     async def _checkpoint(self, state: AgentState) -> None:
         if self.checkpoint is None:
             return
         try:
-            # 如果启用了批量写入，使用批量管理器
+            # 如果启用了批量写入，使用批量管理器(一次性初始化, 复用)
             if self._batch_checkpoint and self._batch_manager is None:
-                from app.runtime.batch_checkpoint import get_batch_checkpoint_manager
-                self._batch_manager = await get_batch_checkpoint_manager(self.checkpoint)
-                await self._batch_manager.start()
-            
+                await self._init_batch_manager()
+
             if self._batch_manager is not None:
                 await self._batch_manager.save(state)
             else:
@@ -409,14 +433,12 @@ class Graph:
             except Exception:
                 # 后台泵的异常保持向外抛出,与旧实现的失败语义一致(调用方可感知)
                 raise
-            finally:
-                # 清理批量 checkpoint 管理器,防止后台任务泄漏
-                if self._batch_manager is not None:
-                    try:
-                        await self._batch_manager.stop()
-                    except Exception:
-                        pass
-                    self._batch_manager = None
+            # 注意: 不再在此处 stop 批量管理器。
+            # 批量管理器是进程级单例(后台 flush 任务), 由 main._shutdown 统一释放。
+            # 旧实现在每个 arun_stream 结束时 stop+重建, 导致后台任务反复启动泄漏。
+            # 保留 _batch_manager 引用供后续 _checkpoint 复用; 终止前最后的状态
+            # 已通过 status in (done/failed/interrupted) 触发 BatchCheckpointManager.save
+            # 内的立即 flush 保证落盘。
 
     async def aresume(self, state: AgentState, value=None, new_input: Optional[str] = None):
         """从中断处恢复运行(LangGraph Command(resume=...) 语义)。

@@ -16,9 +16,14 @@ from pydantic import Field
 
 from app.config import settings
 from app.tools.registry import tool
+from app.tools.code_sandbox import _safe_env
 
 MAX_OUTPUT_CHARS = 8000
 DEFAULT_TIMEOUT = 120
+
+# 修复: 终端命令在用户环境执行时也不应继承宿主机全量环境变量(含 API Key)。
+# 使用沙箱最小环境变量, 用户需手动 source 环境或使用交互式 shell 获取凭据。
+_TERMINAL_SAFE_ENV = _safe_env()
 
 # 从 security.py 导入统一的命令分类列表
 from app.core.security import BLOCKED_COMMAND_PATTERNS, _classify_command
@@ -34,17 +39,27 @@ def _blocked_reason(command: str) -> str:
         return f"命令包含危险操作已被拦截: {command.strip()[:100]}"
     # 额外检查: 禁止 shell 元字符组合(防止通过参数注入)
     # 虽然 _build_argv 使用列表传递，但检查命令内容可提前拦截
-    dangerous_meta = [';', '&&', '||', '|', '`', '$(', '${']
+    # 改进: 增加 ~$ 通配符转义绕过检测、命令解释器嵌套检测、base64 解码执行检测
+    dangerous_meta = [';', '&&', '||', '|', '`', '$(', '${', '>', '>>']
     low = command.strip().lower()
     for meta in dangerous_meta:
         # 排除合法用途(如管道在 ls | grep 中是合法的)
-        if meta in ('|', '&&', '||') and 'echo' in low or 'printf' in low:
+        if meta in ('|', '&&', '||') and ('echo' in low or 'printf' in low or 'grep' in low):
             continue
         if meta in low:
             # 检查是否在引号内(简单启发式)
             parts = command.split(meta)
             if len(parts) > 2:  # 多个分隔符说明是注入尝试
                 return f"命令包含危险字符 '{meta}' 被拦截"
+    # 改进: 检测编码/解释器嵌套绕过(blacklist 中 rm -rf / 子串检测可被 python -c 绕过)
+    _INTERPRETER_EXEC = (
+        "python -c", "python3 -c", "node -e", "node --eval", "perl -e", "ruby -e",
+        "php -r", "bash -c", "sh -c", "/bin/sh -c", "cmd /c", "powershell -command",
+        "base64 -d", "base64 --decode", "certutil -decode",
+    )
+    if any(marker in low for marker in _INTERPRETER_EXEC):
+        # 解释器嵌套执行: 内部 payload 可能绕过 blacklist, 一律需确认(返回非空 reason)
+        return f"命令通过解释器/解码器执行, 可能绕过安全检查, 已被拦截: {command.strip()[:100]}"
     return ""
 
 
@@ -99,12 +114,8 @@ def _resolve_cwd(cwd: str | None) -> str:
         if os.path.isdir(full):
             return full
         raise ValueError(f"工作目录不存在: {full}")
-    cfg = (settings.terminal_cwd or "").strip()
-    if cfg:
-        full = os.path.abspath(os.path.expanduser(cfg))
-        if os.path.isdir(full):
-            return full
-    return os.getcwd()
+    from app.tools.project_context import resolve_cwd
+    return resolve_cwd()
 
 
 def _run_command(command: str, cwd: str, timeout: int) -> dict:
@@ -117,7 +128,7 @@ def _run_command(command: str, cwd: str, timeout: int) -> dict:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=cwd,
-            env={**os.environ, "PYTHONIOENCODING": "utf-8"},
+            env=_TERMINAL_SAFE_ENV,
             creationflags=creationflags,
             start_new_session=sys.platform != "win32",
         )

@@ -9,6 +9,7 @@ import asyncio
 import json
 import os
 import time
+import uuid
 from typing import Optional
 
 from app.config import settings
@@ -92,77 +93,108 @@ class SessionStore:
         except Exception:
             pass  # 列已存在
 
-    async def get_or_create(self, session_id: str, tenant_id: Optional[str] = None):
+    async def _resolve_tid(self, tenant_id: Optional[str] = None) -> str:
+        """解析 tenant_id,无锁。"""
         from app.core.tenant_context import get_tenant
-        tid = tenant_id or get_tenant() or "default"
+        return tenant_id or get_tenant() or "default"
+
+    def _read_session(self, session_id: str, tid: str) -> dict:
+        """从后端读取会话,无锁(调用方须自行加锁)。"""
         now = time.time()
-        # 使用锁保护会话操作
-        async with self._lock:
-            rows = self._backend.select(
-                "sessions",
-                "id = ? AND tenant_id = ?",
-                (session_id, tid),
-                limit=1
-            )
-            if not rows:
-                self._backend.insert(
-                    "sessions",
-                    {
-                        "id": session_id,
-                        "tenant_id": tid,
-                        "messages": json.dumps([]),
-                        "created_at": now,
-                        "updated_at": now,
-                    }
-                )
-                messages = []
-                created = now
-            else:
-                row = rows[0]
-                messages = json.loads(row["messages"])
-                created = row["created_at"]
+        rows = self._backend.select(
+            "sessions",
+            "id = ? AND tenant_id = ?",
+            (session_id, tid),
+            limit=1
+        )
+        if not rows:
+            return {"id": session_id, "tenant_id": tid, "messages": [], "created_at": now, "updated_at": now, "_exists": False}
+        row = rows[0]
         return {
             "id": session_id,
             "tenant_id": tid,
-            "messages": messages,
-            "created_at": created,
-            "updated_at": now,
+            "messages": json.loads(row["messages"]),
+            "created_at": row["created_at"],
+            "updated_at": row.get("updated_at", now),
+            "_exists": True,
         }
+
+    def _ensure_session(self, session_id: str, tid: str) -> dict:
+        """确保会话存在(不存在则创建),无锁(调用方须自行加锁)。"""
+        now = time.time()
+        rows = self._backend.select(
+            "sessions",
+            "id = ? AND tenant_id = ?",
+            (session_id, tid),
+            limit=1
+        )
+        if not rows:
+            self._backend.insert(
+                "sessions",
+                {
+                    "id": session_id,
+                    "tenant_id": tid,
+                    "messages": json.dumps([]),
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
+            return {"id": session_id, "tenant_id": tid, "messages": [], "created_at": now, "updated_at": now}
+        row = rows[0]
+        return {
+            "id": session_id,
+            "tenant_id": tid,
+            "messages": json.loads(row["messages"]),
+            "created_at": row["created_at"],
+            "updated_at": row.get("updated_at", now),
+        }
+
+    async def get_or_create(self, session_id: str, tenant_id: Optional[str] = None):
+        tid = await self._resolve_tid(tenant_id)
+        async with self._lock:
+            return self._ensure_session(session_id, tid)
 
     async def add_message(self, session_id: str, role: str, kind: str = "text", content: Optional[str] = None, meta: Optional[dict] = None, tenant_id: Optional[str] = None):
-        session = await self.get_or_create(session_id, tenant_id)
-        messages = list(session["messages"])
-        # 结构化消息: {id, role, kind, content, meta}
-        msg = {
-            "id": str(time.time()) + str(id(self)),  # 简单基于时间的唯一标识
-            "role": role,
-            "kind": kind,
-            "content": content or "",
-        }
-        if meta:
-            msg["meta"] = meta
-        messages.append(msg)
-        if len(messages) > self._max_messages:
-            messages = messages[-self._max_messages:]
+        tid = await self._resolve_tid(tenant_id)
         now = time.time()
-        tid = tenant_id or session.get("tenant_id", "default")
-        self._backend.update(
-            "sessions",
-            {
-                "messages": json.dumps(messages, ensure_ascii=False),
-                "updated_at": now,
-            },
-            "id = ? AND tenant_id = ?",
-            (session_id, tid)
-        )
-        return session
+        async with self._lock:
+            session = self._ensure_session(session_id, tid)
+            messages = list(session["messages"])
+
+            msg = {
+                # 修复: 消息 ID 用 uuid4 保证全局唯一(旧实现 time.time()+id(self)
+                # 在同一 store 实例下 id(self) 恒定, 同一毫秒内多条消息 ID 相同,
+                # 导致去重/截断无法区分消息)
+                "id": uuid.uuid4().hex,
+                "role": role,
+                "kind": kind,
+                "content": content or "",
+                "timestamp": now,
+            }
+            if meta:
+                msg["meta"] = meta
+            messages.append(msg)
+            if len(messages) > self._max_messages:
+                messages = messages[-self._max_messages:]
+            self._backend.update(
+                "sessions",
+                {
+                    "messages": json.dumps(messages, ensure_ascii=False),
+                    "updated_at": now,
+                },
+                "id = ? AND tenant_id = ?",
+                (session_id, tid)
+            )
+        return {"id": session_id, "tenant_id": tid, "messages": messages, "created_at": now, "updated_at": now}
 
     async def get_history(self, session_id: str, last_n: Optional[int] = None) -> list[dict]:
-        session = await self.get_or_create(session_id)
-        messages = list(session["messages"])
-        if last_n is not None:
-            messages = messages[-last_n:]
-        return messages
+        tid = await self._resolve_tid()
+        async with self._lock:
+            session = self._read_session(session_id, tid)
+            messages = list(session["messages"])
+            if last_n is not None:
+                messages = messages[-last_n:]
+            return messages
 
     async def clear(self, session_id: str) -> None:
         """清空会话消息但保留会话记录。"""
@@ -243,8 +275,9 @@ class SessionStore:
 
     async def rename(self, session_id: str, title: str) -> None:
         """设置会话自定义名称(空串表示清除自定义名,回到自动标题)。"""
+        tid = await self._resolve_tid()
         async with self._lock:
-            await self.get_or_create(session_id)
+            self._ensure_session(session_id, tid)
             self._backend.update(
                 "sessions",
                 {
@@ -257,8 +290,9 @@ class SessionStore:
 
     async def set_category(self, session_id: str, category: str) -> None:
         """设置会话分类。"""
+        tid = await self._resolve_tid()
         async with self._lock:
-            await self.get_or_create(session_id)
+            self._ensure_session(session_id, tid)
             self._backend.update(
                 "sessions",
                 {
@@ -270,10 +304,12 @@ class SessionStore:
             )
 
     async def list_sessions(self, limit: int = 200) -> list[dict]:
-        """列出所有会话(含标题、消息数、更新时间、分类),按最近更新倒序。"""
+        """列出当前租户的所有会话(含标题、消息数、更新时间、分类),按最近更新倒序。"""
+        tid = await self._resolve_tid()
         rows = self._backend.select(
             "sessions",
-            "1 = 1",
+            "tenant_id = ?",
+            (tid,),
             order_by="updated_at DESC",
             limit=limit
         )
@@ -289,6 +325,13 @@ class SessionStore:
                 if m.get("role") == "user" and content:
                     auto = content.strip()[:30]
                     break
+            # 如果无自定义标题且无自动标题,用创建时间生成默认标题
+            if not custom and not auto:
+                ts = row.get("created_at", 0) or row.get("updated_at", 0) or 0
+                if ts:
+                    import datetime as _dt
+                    dt = _dt.datetime.fromtimestamp(ts)
+                    auto = dt.strftime("%m-%d %H:%M")
             out.append({
                 "id": row["id"],
                 "title": custom or auto or "新会话",
@@ -320,8 +363,8 @@ class SessionStore:
         max_age_days = max_age_days or float(getattr(settings, "session_retention_days", 90))
         cutoff = _time.time() - (max_age_days * 86400)
         
-        # 获取所有会话
-        rows = self._backend.select("sessions", "1 = 1", columns=["id", "updated_at", "messages"])
+        # 获取所有会话(注意: SqliteBackend.select 不支持 columns 参数, 需自行取需要的列)
+        rows = self._backend.select("sessions", "1 = 1")
         
         to_delete = []
         for row in rows:
@@ -364,8 +407,9 @@ class SessionStore:
         Returns:
             是否成功归档
         """
+        tid = await self._resolve_tid()
         async with self._lock:
-            session = await self.get_or_create(session_id)
+            session = self._read_session(session_id, tid)
             messages = session.get("messages", [])
             
             if not messages:

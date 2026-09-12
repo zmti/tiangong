@@ -118,7 +118,8 @@ async def execute_plan(req: ExecutePlanRequest) -> dict:
     plan = ExecutionPlan.from_dict(req.plan_json)
     llm = LLMClient()
     registry = get_registry()
-    executor = ToolExecutor(registry)
+    from app.tools.project_context import get_project_path
+    executor = ToolExecutor(registry, project_path=get_project_path())
 
     async def _tool_exec(tool_name: str, args: dict) -> str:
         return await executor.execute_tool(tool_name, json.dumps(args))

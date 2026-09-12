@@ -10,6 +10,14 @@ import sys
 venv_site = os.path.join(os.path.dirname(sys.executable), '..', 'Lib', 'site-packages')
 venv_site = os.path.normpath(venv_site)
 
+# 修复: 使用相对路径计算项目根目录, 不再硬编码 E:\dev\agent-service
+# 本 spec 文件位于 <project_root>/desktop/backend/agent-backend.spec
+# 项目根 = 本文件所在目录上溯两级
+_spec_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(_spec_dir, '..', '..'))
+backend_dir = os.path.join(project_root, 'desktop', 'backend')
+
+
 def _collect_dir(src):
     out = []
     if not os.path.isdir(src):
@@ -47,8 +55,8 @@ if os.path.isfile(_ffi_dlls):
     app_binaries.append((_ffi_dlls, '.'))
 
 a = Analysis(
-    [r'E:\dev\agent-service\desktop\backend\launcher.py'],
-    pathex=[r'E:\dev\agent-service', venv_site],
+    [os.path.join(backend_dir, 'launcher.py')],
+    pathex=[project_root, venv_site],
     binaries=app_binaries + uvicorn_binaries,
     datas=app_datas + uvicorn_datas,
     hiddenimports=[
@@ -67,12 +75,12 @@ a = Analysis(
         'numpy',
         'matplotlib',
         'matplotlib.backends.backend_agg',
-    'websockets',
-    'websockets.exceptions',
-    'croniter',
-    'croniter.croniter',
-  ] + app_hiddenimports + uvicorn_hiddenimports,
-    hookspath=[r'E:\dev\agent-service\desktop\backend\hooks'],
+        'websockets',
+        'websockets.exceptions',
+        'croniter',
+        'croniter.croniter',
+    ] + app_hiddenimports + uvicorn_hiddenimports,
+    hookspath=[os.path.join(backend_dir, 'hooks')],
     runtime_hooks=[],
     excludes=[
         'tkinter', 'scipy', 'pandas', 'IPython', 'notebook',

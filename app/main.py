@@ -8,10 +8,11 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 from app.api import attachments, chat, documents, project, files, mcp, mcp_server, runs, schedule, tasks, telemetry, tools, tts, user_profile, budget, advanced, analytics, assistants, plugins, safety, persistent_memory, planning, search, metrics, sessions, long_running, tenants, system, collaboration, reasoning, memory_cleanup, cross_session, collaboration_ui, artifacts, workflow, multimodal
 from app.api.security import require_api_key, require_admin
-from app.config import settings
+from app.config import settings, APP_VERSION
 from app.tools.registry import get_registry
 from app.api.chat import list_models
 
@@ -255,7 +256,7 @@ async def lifespan(app: FastAPI):
     await _shutdown()
 
 
-app = FastAPI(title="Agent Service", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Agent Service", version=APP_VERSION, lifespan=lifespan)
 
 # 桌面端渲染进程(file:// 源)需跨域访问本地后端
 # 生产环境建议通过环境变量配置允许的源列表
@@ -283,7 +284,7 @@ else:
     )
 
 _auth = [Depends(require_api_key)] if settings.agent_api_key else []
-app.include_router(project.router)
+app.include_router(project.router, dependencies=_auth)
 app.include_router(chat.router, dependencies=_auth)
 app.add_api_route('/v1/models', list_models, methods=['GET'], tags=['chat'])
 
@@ -329,18 +330,18 @@ os.makedirs(_images_dir, exist_ok=True)
 @app.get("/images/{filename}")
 async def get_image(filename: str):
     """提供本地生成的图片"""
-    import fastapi
+    from fastapi import HTTPException
     # 防路径穿越:规范化路径并严格校验
     real_images_dir = os.path.realpath(_images_dir)
     requested_path = os.path.realpath(os.path.join(real_images_dir, filename))
     # 严格检查:请求路径必须是图片目录的子路径
     if not (requested_path == real_images_dir or requested_path.startswith(real_images_dir + os.sep)):
-        raise fastapi.HTTPException(status_code=403, detail="访问被拒绝:路径穿越检测")
+        raise HTTPException(status_code=403, detail="访问被拒绝:路径穿越检测")
     # 额外安全检查:不允许路径中包含特殊字符
     if ".." in filename or "~" in filename or "\\" in filename or "/" in filename.replace(os.sep, ""):
-        raise fastapi.HTTPException(status_code=400, detail="非法文件名")
+        raise HTTPException(status_code=400, detail="非法文件名")
     if not os.path.isfile(requested_path):
-        raise fastapi.HTTPException(status_code=404, detail="File not found")
+        raise HTTPException(status_code=404, detail="File not found")
     # 检测 MIME 类型
     ext = os.path.splitext(filename)[1].lower()
     mime_types = {
@@ -352,9 +353,7 @@ async def get_image(filename: str):
         '.bmp': 'image/bmp',
     }
     mime_type = mime_types.get(ext, 'application/octet-stream')
-    with open(requested_path, 'rb') as f:
-        content = f.read()
-    return fastapi.responses.Response(content=content, media_type=mime_type)
+    return FileResponse(requested_path, media_type=mime_type)
 
 # 本地生成视频的静态目录(data/videos),供聊天与历史直接播放
 _videos_dir = os.path.join(settings.resolved_data_dir, "videos")
@@ -363,23 +362,21 @@ os.makedirs(_videos_dir, exist_ok=True)
 @app.get("/videos/{filename}")
 async def get_video(filename: str):
     """提供本地生成的视频"""
-    import fastapi
+    from fastapi import HTTPException
     real_videos_dir = os.path.realpath(_videos_dir)
     requested_path = os.path.realpath(os.path.join(real_videos_dir, filename))
     # 严格检查:请求路径必须是视频目录的子路径
     if not (requested_path == real_videos_dir or requested_path.startswith(real_videos_dir + os.sep)):
-        raise fastapi.HTTPException(status_code=403, detail="访问被拒绝:路径穿越检测")
+        raise HTTPException(status_code=403, detail="访问被拒绝:路径穿越检测")
     # 额外安全检查:不允许路径中包含特殊字符
     if ".." in filename or "~" in filename or "\\" in filename or "/" in filename.replace(os.sep, ""):
-        raise fastapi.HTTPException(status_code=400, detail="非法文件名")
+        raise HTTPException(status_code=400, detail="非法文件名")
     if not os.path.isfile(requested_path):
-        raise fastapi.HTTPException(status_code=404, detail="File not found")
+        raise HTTPException(status_code=404, detail="File not found")
     import mimetypes
     mime_type, _ = mimetypes.guess_type(filename)
     mime_type = mime_type or 'video/mp4'
-    with open(requested_path, 'rb') as f:
-        content = f.read()
-    return fastapi.responses.Response(content=content, media_type=mime_type)
+    return FileResponse(requested_path, media_type=mime_type)
 
 
 @app.get("/")
@@ -387,7 +384,7 @@ async def root() -> dict:
     return {
         "service": "agent-service",
         "provider": settings.agent_llm_provider,
-        "version": "1.0.0",
+        "version": APP_VERSION,
         "endpoints": {
             "chat": ["/v1/chat", "/v1/chat/stream", "/v1/stream"],
             "tools": ["/v1/tools"],
@@ -426,6 +423,7 @@ async def health() -> dict:
 
     # 2. 数据库连通性(Sessions + Checkpoints + Tasks)
     db_status = {}
+    _VALID_TABLE_NAMES = {"sessions", "checkpoints", "tasks", "memory"}
     for db_name, db_path in [
         ("sessions", _os.path.join(settings.resolved_data_dir, "sessions.db")),
         ("checkpoints", _os.path.join(settings.resolved_data_dir, "checkpoints.db")),
@@ -436,6 +434,9 @@ async def health() -> dict:
             if _os.path.isfile(db_path):
                 with _sqlite3.connect(db_path) as conn:
                     table_name = "checkpoints" if db_name == "checkpoints" else db_name
+                    if table_name not in _VALID_TABLE_NAMES:
+                        db_status[db_name] = {"connected": False, "error": "非法表名"}
+                        continue
                     rows = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
                     count = rows[0] if rows else 0
                 db_status[db_name] = {"connected": True, "records": count}

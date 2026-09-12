@@ -13,7 +13,6 @@ import asyncio
 import json
 import logging
 import os
-import sqlite3
 import threading
 import time
 from typing import Optional
@@ -30,8 +29,8 @@ class SessionArchiver:
         self._data_dir = data_dir or settings.resolved_data_dir
         self._archive_dir = os.path.join(self._data_dir, "session_archives")
         os.makedirs(self._archive_dir, exist_ok=True)
-        # 归档阈值:会话超过此字符数后触发归档
-        self._archive_threshold = int(getattr(settings, "session_archive_chars", 50000) or 50000)
+        # 归档阈值:会话超过此字符数后触发归档(默认200K,约400条中等长度消息)
+        self._archive_threshold = int(getattr(settings, "session_archive_chars", 200000) or 200000)
         # 保留天数:超过此天数的会话自动清理
         self._retention_days = int(getattr(settings, "session_retention_days", 90) or 90)
         # 自动清理间隔(秒)
@@ -39,24 +38,30 @@ class SessionArchiver:
         self._running = False
         self._task: Optional[asyncio.Task] = None
 
-    # ---- 会话列表（从 SQLite 读取）----
+    # ---- 会话列表（通过 SessionStore 读取）----
 
     def list_sessions(self) -> list[dict]:
-        """列出所有活跃会话及其基本信息。"""
+        """列出当前租户的活跃会话及其基本信息。"""
         sessions = []
         try:
-            from app.memory.session import SessionStore
-            store = SessionStore()
-            # 直接查 SQLite 获取所有 session 信息
-            db_path = store._db_path
-            if not db_path or not os.path.exists(db_path):
-                return sessions
-            conn = sqlite3.connect(db_path)
-            rows = conn.execute(
-                "SELECT id, messages, created_at, updated_at, title FROM sessions ORDER BY updated_at DESC"
-            ).fetchall()
-            conn.close()
-            for sid, msgs_json, created, updated, title in rows:
+            from app.memory.session import get_session_store
+            from app.core.tenant_context import get_tenant
+            store = get_session_store()
+            tid = get_tenant() or "default"
+            # 通过存储后端统一查询,兼容 SQLite/Redis/PostgreSQL,按租户过滤
+            rows = store._backend.select(
+                "sessions",
+                "tenant_id = ?",
+                (tid,),
+                order_by="updated_at DESC",
+                limit=500,
+            )
+            for row in rows:
+                sid = row["id"]
+                msgs_json = row.get("messages", "[]")
+                created = row.get("created_at", 0)
+                updated = row.get("updated_at", 0)
+                title = row.get("title", "")
                 try:
                     msgs = json.loads(msgs_json) if msgs_json else []
                 except Exception:
@@ -130,11 +135,11 @@ class SessionArchiver:
         return messages
 
     def delete_session(self, session_id: str) -> bool:
-        """从 SessionStore 中删除会话记录。"""
+        """从 SessionStore 中彻底删除会话记录。"""
         try:
-            from app.memory.session import SessionStore
-            store = SessionStore()
-            store.clear(session_id)
+            from app.memory.session import get_session_store
+            store = get_session_store()
+            store._backend.delete("sessions", "id = ?", (session_id,))
             return True
         except Exception as e:
             logger.warning("删除会话 %s 失败: %s", session_id, e)
@@ -155,21 +160,28 @@ class SessionArchiver:
         except Exception:
             pass
 
-        # 2. 清理过期活跃会话
+        # 2. 清理过期活跃会话(通过 SessionStore 删除,保证锁一致性)
         try:
-            from app.memory.session import SessionStore
-            store = SessionStore()
-            db_path = store._db_path
-            if db_path and os.path.exists(db_path):
-                conn = sqlite3.connect(db_path)
-                rows = conn.execute(
-                    "SELECT id, updated_at FROM sessions WHERE updated_at < ?",
-                    (cutoff,)
-                ).fetchall()
-                conn.close()
-                for sid, _ in rows:
-                    store.clear(sid)
+            from app.memory.session import get_session_store
+            store = get_session_store()
+            rows = store._backend.select(
+                "sessions",
+                "updated_at < ?",
+                (cutoff,),
+                columns=["id", "tenant_id"],
+            )
+            for row in rows:
+                sid = row["id"]
+                tid = row.get("tenant_id", "default")
+                try:
+                    store._backend.delete(
+                        "sessions",
+                        "id = ? AND tenant_id = ?",
+                        (sid, tid)
+                    )
                     cleaned += 1
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -179,18 +191,17 @@ class SessionArchiver:
         """执行完整自动清理:归档大会话 + 清理过期会话。返回清理数量。"""
         total_cleaned = 0
 
-        # 1. 归档超过大小阈值的活跃会话
+        # 1. 归档超过大小阈值的活跃会话(仅归档,不清空消息,避免丢失用户正在查看的内容)
         sessions = self.list_sessions()
         archived = 0
         for s in sessions:
             if s["total_chars"] >= self._archive_threshold:
                 try:
-                    from app.memory.session import SessionStore
-                    store = SessionStore()
+                    from app.memory.session import get_session_store
+                    store = get_session_store()
                     messages = await store.get_history(s["session_id"])
                     if messages:
                         self.archive_session(s["session_id"], messages)
-                        await store.clear(s["session_id"])
                         archived += 1
                         total_cleaned += 1
                         logger.info("已归档大会话 %s (%d 字符, %d 消息)",

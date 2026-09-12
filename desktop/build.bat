@@ -88,9 +88,10 @@ if exist "backend\dist\agent-backend\agent-backend.exe" (
 )
 copy /y "backend\dist\.env" "%DIST%\resources\backend\.env" >nul 2>&1
 
-REM 用 Python 压缩(只读共享模式,规避 Defender 锁定)
+REM 用 PowerShell Compress-Archive 压缩(与 build_app.ps1 一致, 产物字节级对齐)
+REM 旧实现用 Python zipfile(只读共享模式规避 Defender 锁定), 现统一为 PS 原生压缩
 cd ..
-..\.venv\Scripts\python.exe -c "import zipfile,os;zipf=zipfile.ZipFile('dist\AgentDesktop-win-x64.zip','w',zipfile.ZIP_DEFLATED,allowZip64=True);[zipf.write(os.path.join(r,f),os.path.relpath(os.path.join(r,f),'dist\\win-unpacked')) for r,d,fs in os.walk('dist\\win-unpacked') for f in fs];zipf.close()"
+powershell -NoProfile -Command "Compress-Archive -Path 'desktop\dist\win-unpacked\*' -DestinationPath 'desktop\dist\AgentDesktop-win-x64.zip' -Force"
 if errorlevel 1 (
     echo [错误] 打包 ZIP 失败
     pause

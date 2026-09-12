@@ -17,6 +17,7 @@ from typing import Optional
 
 from pydantic import Field
 
+from app.tools.project_context import resolve_cwd
 from app.tools.registry import tool
 
 
@@ -327,7 +328,7 @@ def project_scaffold(
         "pkg_name": pkg_name,
     }
 
-    root = os.path.abspath(os.path.expanduser(output_dir or os.getcwd()))
+    root = os.path.abspath(os.path.expanduser(output_dir or resolve_cwd()))
     project_root = os.path.join(root, name)
     os.makedirs(project_root, exist_ok=True)
 
@@ -367,7 +368,7 @@ def project_analyze(
     max_files: int = Field(200, description="最大分析的文件数"),
 ) -> dict:
     """分析项目结构。"""
-    root = os.path.abspath(os.path.expanduser(path or os.getcwd()))
+    root = os.path.abspath(os.path.expanduser(path or resolve_cwd()))
     if not os.path.isdir(root):
         return {"path": root, "ok": False, "error": f"目录不存在: {root}"}
 
@@ -438,7 +439,7 @@ def project_testgen(
     path: str = Field("", description="项目根目录,留空用当前工作目录"),
 ) -> dict:
     """为代码生成测试骨架。"""
-    root = os.path.abspath(os.path.expanduser(path or os.getcwd()))
+    root = os.path.abspath(os.path.expanduser(path or resolve_cwd()))
     target_full = os.path.join(root, target) if not os.path.isabs(target) else target
 
     # 检测测试框架
@@ -561,7 +562,7 @@ def project_docs(
     format: str = Field("markdown", description="输出格式: markdown / openapi"),
 ) -> dict:
     """生成项目文档。"""
-    root = os.path.abspath(os.path.expanduser(path or os.getcwd()))
+    root = os.path.abspath(os.path.expanduser(path or resolve_cwd()))
     if not os.path.isdir(root):
         return {"path": root, "ok": False, "error": f"目录不存在: {root}"}
 
@@ -668,7 +669,7 @@ def project_build(
     import subprocess
     import shutil
 
-    root = os.path.abspath(os.path.expanduser(path or os.getcwd()))
+    root = os.path.abspath(os.path.expanduser(path or resolve_cwd()))
     if not os.path.isdir(root):
         return {"path": root, "ok": False, "error": f"目录不存在: {root}"}
 

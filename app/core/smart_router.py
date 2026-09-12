@@ -218,7 +218,11 @@ async def select_tools_enhanced(
                 _keyword_index_key = tool_count
 
     # 1. 第一级:关键词精确匹配(快速路径)
-    q_words = re.findall(r"[a-z_]{3,}", user_input.lower())
+    # 改进: 使用 _smart_tokenize 提取关键词(支持中文), 替代原来的 ASCII-only 正则;
+    # 同时保留 ASCII 长词兜底, 使"帮我查天气"与"  帮我查天气! "命中同一缓存键
+    q_tokens = _smart_tokenize(user_input)
+    # 过滤长度 < 2 的 token(单字符如"的"/"是"区分度低, 避免误命中)
+    q_words = [t for t in q_tokens if len(t) >= 2]
     keyword_hits: dict[str, float] = {}
     for word in q_words:
         for tool_name in _KEYWORD_INDEX.get(word, []):

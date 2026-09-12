@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -19,6 +20,8 @@ import httpx
 
 from app.config import settings, get_httpx_proxy
 from app.core.telemetry import estimate_cost, tracer
+
+logger = logging.getLogger(__name__)
 
 # ChatCompletion message 类型定义
 Message = dict  # {"role": "user"/"assistant"/"system", "content": str}
@@ -228,6 +231,7 @@ class LLMClient:
             api_key=settings.openai_compat_api_key or "sk-placeholder",
             base_url=settings.openai_compat_base_url,
             timeout=httpx.Timeout(120.0, read=60.0),
+            default_headers={"User-Agent": "TianGong-Agent/1.0"},
             **client_kwargs,
         ), self._model_override or settings.openai_compat_model
 
@@ -295,6 +299,7 @@ class LLMClient:
         return AsyncOpenAI(
             api_key=settings.openai_compat_api_key or "sk-placeholder",
             base_url=settings.openai_compat_base_url,
+            default_headers={"User-Agent": "TianGong-Agent/1.0"},
             **client_kwargs,
         ), model or settings.openai_compat_model
 
@@ -307,6 +312,7 @@ class LLMClient:
         """
         specs = self._failover_specs()
         retries = max(0, int(settings.agent_llm_retries))
+        timeout = float(settings.agent_llm_timeout or 60)  # 单次 LLM 调用超时
         last_err: Optional[Exception] = None
         for idx, (provider, model) in enumerate(specs):
             if self._is_circuit_open(provider):
@@ -321,7 +327,11 @@ class LLMClient:
             for attempt in range(retries + 1):
                 t0 = time.time()
                 try:
-                    resp = await fn(client, resolved_model)
+                    # 添加超时保护,防止 API 挂起导致永久阻塞
+                    resp = await asyncio.wait_for(
+                        fn(client, resolved_model),
+                        timeout=timeout
+                    )
                     self._record_success(provider)
                     self.last_usage = self._usage_of(resp)
                     # 恢复主 provider(熔断冷却期后),保证下次优先用主 provider
@@ -331,6 +341,13 @@ class LLMClient:
                     self._trace(kind, t0, self.last_usage, tools_n=tools_n,
                                 **trace_extra)
                     return resp
+                except asyncio.TimeoutError:
+                    self._trace(kind, t0, None, ok=False, error=f"timeout ({timeout}s)", tools_n=tools_n)
+                    last_err = LLMError(f"LLM 调用超时 ({timeout}s)")
+                    if attempt < retries:
+                        await asyncio.sleep(settings.agent_llm_retry_delay * (2 ** attempt))
+                        continue
+                    break
                 except Exception as e:  # noqa: BLE001
                     self._trace(kind, t0, None, ok=False, error=str(e), tools_n=tools_n)
                     last_err = e
@@ -474,7 +491,11 @@ class LLMClient:
         resp = await self._invoke(_fn, "chat")
         msg = resp.choices[0].message
         self._reasoning = self._extract_reasoning(msg)
-        return msg.content or ""
+        # 推理模型:如果 content 为空但 reasoning_content 有内容,使用 reasoning 作为答案
+        content = msg.content or ""
+        if not content and self._reasoning:
+            content = self._reasoning
+        return content
 
     async def chat_stream(self, messages: list[Message], temperature: float = 0.7):
         """流式对话,逐个产出文本增量(str);推理模型先产出 thinking 增量。"""

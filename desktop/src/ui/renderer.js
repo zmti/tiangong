@@ -233,10 +233,17 @@
   }
 
   /* ---------- 聊天 ---------- */
+  /* P2-16: IME 安全 —— keyCode 229 已废弃, 部分 Chromium 版本 isComposing 为 false,
+     补 nativeEvent.isComposing 判断, 避免中文候选词确认时误发 */
+  const isImeComposing = (e) => {
+    return e.isComposing
+      || e.keyCode === 229
+      || (e.nativeEvent && e.nativeEvent.isComposing === true);
+  };
   App.els.sendBtn.addEventListener('click', () => App.Chat.send());
   App.els.stopBtn.addEventListener('click', () => App.Chat.stop(false));
   App.els.input.addEventListener('keydown', (e) => {
-    if (e.isComposing || e.keyCode === 229) return;
+    if (isImeComposing(e)) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       App.Chat.send();
@@ -313,6 +320,15 @@
     inp.style.height = 'auto';
     inp.style.height = Math.min(inp.scrollHeight, 164) + 'px';
     App.els.sendBtn.disabled = !inp.value.trim() || App.streaming;
+    /* P2-13: 把 footer 实际高度写入 --composer-h, backToBottom 按钮跟随定位,
+       避免 composer 增高时与输入框重叠(旧实现 bottom:120px 硬编码) */
+    try {
+      const footer = document.querySelector('#main footer');
+      if (footer) {
+        const h = footer.offsetHeight + 12; // 12px 缓冲
+        document.documentElement.style.setProperty('--composer-h', h + 'px');
+      }
+    } catch (_) { /* 非 DOM 环境忽略 */ }
   };
 
   /* ---------- 图片识别 ---------- */
@@ -358,7 +374,7 @@
   /* ---------- 待办 ---------- */
   App.els.todoAddBtn.addEventListener('click', () => App.Todo.add());
   App.els.todoInput.addEventListener('keydown', (e) => {
-    if (e.isComposing || e.keyCode === 229) return;
+    if (isImeComposing(e)) return;
     if (e.key === 'Enter') { e.preventDefault(); App.Todo.add(); }
   });
   const todoFilter = document.getElementById('todoFilter');
@@ -661,14 +677,15 @@
   /* ---------- 侧边栏会话历史 ---------- */
   async function renderSidebarHistory() {
     const el = document.getElementById('sidebarSessionHistory');
-    if (!el) return;
+    if (!el) return [];
     try {
       const res = await App.apiJSON('/v1/chat/sessions');
       if (!res.success || !res.data?.sessions?.length) {
         el.innerHTML = '<div style="padding:8px 12px;font-size:11px;color:var(--muted);">暂无会话</div>';
-        return;
+        return [];
       }
       const sessions = res.data.sessions.slice(0, 30);
+      const sessionIds = sessions.map(s => s.id);
       el.innerHTML = sessions.map(s => {
         const active = s.id === App.sessionId ? ' active' : '';
         const time = App.Session.formatTime(s.updated_at);
@@ -682,17 +699,29 @@
           App.Session.select(item.dataset.id);
         });
       });
+      return sessionIds;
     } catch (_) {
       el.innerHTML = '<div style="padding:8px 12px;font-size:11px;color:var(--muted);">加载失败</div>';
+      return [];
     }
   }
   // 暴露给 session.js 调用
   App._renderSidebarHistory = renderSidebarHistory;
 
   async function init() {
+    const splash = document.getElementById('splashScreen');
+    const splashStatus = document.getElementById('splashStatus');
+    const splashRetry = document.getElementById('splashRetry');
+    const sidebar = document.getElementById('sidebar');
+
+    function setSplashStatus(text) {
+      if (splashStatus) splashStatus.textContent = text;
+    }
+
     App.Settings.applyTheme(App.Settings.currentTheme());
     setupWelcomeChips();
 
+    setSplashStatus('解析后端地址...');
     try {
       App.backendUrl = await resolveBackendUrl();
     } catch (e) {
@@ -704,23 +733,58 @@
       App.backendApiKey = '';
     }
 
+    setSplashStatus('等待后端服务就绪...');
     const ok = await waitBackendReady();
-    if (ok) await loadAllData();
+    if (ok) {
+      setSplashStatus('加载数据...');
+      await loadAllData();
+    } else {
+      setSplashStatus('后端连接失败，请检查服务是否启动');
+      /* P2-18: 失败时保留 splash + 重试按钮, 不直接进空界面 */
+      if (splashRetry) splashRetry.classList.add('show');
+      if (splash) splash.classList.remove('hidden');
+      splashRetry && splashRetry.addEventListener('click', async () => {
+        splashRetry.classList.remove('show');
+        setSplashStatus('重新连接后端...');
+        App._dataLoaded = false;
+        const ok2 = await waitBackendReady();
+        if (ok2) {
+          setSplashStatus('加载数据...');
+          await loadAllData();
+          if (splash) splash.classList.add('hidden');
+          /* P2-14: 同步 class 写法 */
+          if (sidebar) sidebar.classList.remove('init-hidden');
+          const mainEl = document.getElementById('main');
+          if (mainEl) mainEl.classList.remove('init-hidden');
+          App.els.input.focus();
+          App.syncComposer();
+        } else {
+          setSplashStatus('后端连接失败，请检查服务是否启动');
+          splashRetry.classList.add('show');
+        }
+      }, { once: true });
+      return;
+    }
+
+    // 隐藏启动画面，显示主界面
+    if (splash) splash.classList.add('hidden');
+    /* P2-14: sidebar/main 改用 .init-hidden class 控制显隐(原 style="display:none") */
+    if (sidebar) sidebar.classList.remove('init-hidden');
+    const mainEl = document.getElementById('main');
+    if (mainEl) mainEl.classList.remove('init-hidden');
     App.els.input.focus();
     App.syncComposer();
 
-    // 每 1.5s 轮询待确认的高风险操作(安全门禁批准卡片)
-    setInterval(() => {
+    /* P2-17: 1.5s confirm 轮询 + 20s 上下文轮询, 提取到变量以便 visibilitychange 时暂停/恢复 */
+    let confirmPoll = setInterval(() => {
       if (App.Confirmation) App.Confirmation.poll();
     }, 1500);
-
-    // 每 20s 刷新上下文用量
-    setInterval(() => {
+    let ctxPoll = setInterval(() => {
       if (App.CtxMeter) App.CtxMeter.refresh();
     }, 20000);
 
     // 每 30s 刷新连接状态; 若首次未就绪而后端恢复, 补载全部数据
-    setInterval(async () => {
+    const backendPoll = setInterval(async () => {
       const okNow = await App.Settings.refreshBackend();
       if (okNow && !App._dataLoaded) {
         App._dataLoaded = true;
@@ -730,6 +794,31 @@
         if (App.Settings && App.Settings.loadProviders) await App.Settings.loadProviders();
       }
     }, 30000);
+
+    /* P2-17: 窗口失焦/隐藏时暂停高频轮询(confirm 1.5s + ctx 20s),
+       可见时恢复; 降低后台空转。后端 30s 状态轮询保留(轻量)。 */
+    document.addEventListener('visibilitychange', () => {
+      const hidden = document.hidden;
+      if (hidden) {
+        if (confirmPoll) { clearInterval(confirmPoll); confirmPoll = null; }
+        if (ctxPoll) { clearInterval(ctxPoll); ctxPoll = null; }
+      } else {
+        if (!confirmPoll) confirmPoll = setInterval(() => {
+          if (App.Confirmation) App.Confirmation.poll();
+        }, 1500);
+        if (!ctxPoll) ctxPoll = setInterval(() => {
+          if (App.CtxMeter) App.CtxMeter.refresh();
+        }, 20000);
+        /* 补做可见时立即刷新一次, 避免 20s 空窗 */
+        if (App.CtxMeter) App.CtxMeter.refresh();
+      }
+    });
+    /* 卸载时清理 */
+    window.addEventListener('beforeunload', () => {
+      if (confirmPoll) clearInterval(confirmPoll);
+      if (ctxPoll) clearInterval(ctxPoll);
+      if (backendPoll) clearInterval(backendPoll);
+    });
 
     // 初始化语音和视频模块
     if (App.Voice) App.Voice.init();

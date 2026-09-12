@@ -158,8 +158,11 @@
 
   // 创建项目选择按钮
   function createProjectButton() {
-    var leftGroup = document.querySelector('.composer-left');
-    if (!leftGroup) { LOG('createProjectButton: .composer-left not found!'); return; }
+    // 兼容: 旧版容器叫 .composer-left, 现版本已改名为 .composer-selects。
+    // 只认旧名会导致项目选择按钮永远创建不出来(静默 return), 故保留两者 fallback。
+    var leftGroup = document.querySelector('.composer-left')
+      || document.querySelector('.composer-selects');
+    if (!leftGroup) { LOG('createProjectButton: 容器未找到(.composer-left / .composer-selects)!'); return; }
 
     projectBtn = document.createElement('button');
     projectBtn.className = 'project-selector-btn';

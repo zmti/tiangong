@@ -22,6 +22,7 @@ from typing import Optional
 
 from pydantic import Field
 
+from app.tools.project_context import resolve_cwd
 from app.tools.registry import tool
 
 
@@ -96,7 +97,7 @@ def _run_build(build_info: dict, timeout: int = 120) -> dict:
 def detect_build_system(
     path: str = Field("", description="项目根目录,留空用当前工作目录"),
 ) -> dict:
-    root = os.path.abspath(os.path.expanduser(path or os.getcwd()))
+    root = os.path.abspath(os.path.expanduser(path or resolve_cwd()))
     if not os.path.isdir(root):
         return {"path": root, "error": f"目录不存在: {root}"}
     info = _detect_build_system(root)
@@ -120,7 +121,7 @@ def run_build(
     path: str = Field("", description="项目根目录,留空用当前工作目录"),
     timeout: int = Field(180, description="构建超时(秒)"),
 ) -> dict:
-    root = os.path.abspath(os.path.expanduser(path or os.getcwd()))
+    root = os.path.abspath(os.path.expanduser(path or resolve_cwd()))
     if not os.path.isdir(root):
         return {"path": root, "error": f"目录不存在: {root}"}
     info = _detect_build_system(root)
@@ -138,7 +139,7 @@ def run_test(
     path: str = Field("", description="项目根目录,留空用当前工作目录"),
     extra_args: str = Field("", description="额外传递给测试命令的参数"),
 ) -> dict:
-    root = os.path.abspath(os.path.expanduser(path or os.getcwd()))
+    root = os.path.abspath(os.path.expanduser(path or resolve_cwd()))
     if not os.path.isdir(root):
         return {"path": root, "error": f"目录不存在: {root}"}
     files = set(os.listdir(root))

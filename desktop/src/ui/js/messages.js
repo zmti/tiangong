@@ -173,6 +173,7 @@
     label.textContent = `🔧 工具调用: ${name}`;
     div.appendChild(label);
 
+    // 参数:JSON 高亮
     if (args) {
       let argsText = args;
       try {
@@ -182,12 +183,16 @@
       if (argsText && argsText !== '{}' && argsText !== '""') {
         const argsEl = document.createElement('div');
         argsEl.className = 'tool-args';
-        argsEl.textContent = String(argsText).slice(0, 200);
+        if (App.highlightJson) {
+          argsEl.innerHTML = App.highlightJson(String(argsText).slice(0, 300));
+        } else {
+          argsEl.textContent = String(argsText).slice(0, 300);
+        }
         div.appendChild(argsEl);
       }
     }
 
-    // 工具结果
+    // 工具结果:JSON 高亮
     let text = result || '';
     let parsedObj = null;
     try {
@@ -201,7 +206,12 @@
     if (text) {
       const body = document.createElement('div');
       body.className = 'tool-result';
-      body.textContent = text.slice(0, 400);
+      if (App.detectResultType && App.highlightJson && App.detectResultType(text) === 'json') {
+        body.classList.add('tool-result-json');
+        body.innerHTML = App.highlightJson(text.slice(0, 500));
+      } else {
+        body.textContent = text.slice(0, 400);
+      }
       div.appendChild(body);
     }
 

@@ -215,14 +215,37 @@ _batch_manager: Optional[BatchCheckpointManager] = None
 _batch_manager_lock = asyncio.Lock()
 
 
-async def get_batch_checkpoint_manager(base_manager: CheckpointManager) -> BatchCheckpointManager:
-    """获取批量 Checkpoint 管理器单例。"""
+async def get_batch_checkpoint_manager(
+    base_manager: CheckpointManager,
+    flush_interval: float = 2.0,
+    max_buffer_size: int = 10,
+) -> BatchCheckpointManager:
+    """获取批量 Checkpoint 管理器单例(参数可配置, 便于 graph 传入自定义值)。
+
+    首次调用或参数变更时重建管理器; 后续调用复用现有实例。
+    """
     global _batch_manager
     async with _batch_manager_lock:
         if _batch_manager is None or _batch_manager._base is not base_manager:
             if _batch_manager:
                 await _batch_manager.stop()
-            _batch_manager = BatchCheckpointManager(base_manager)
+            _batch_manager = BatchCheckpointManager(
+                base_manager,
+                flush_interval=flush_interval,
+                max_buffer_size=max_buffer_size,
+            )
+            await _batch_manager.start()
+        elif (
+            abs(_batch_manager._flush_interval - flush_interval) > 1e-6
+            or _batch_manager._max_buffer_size != max_buffer_size
+        ):
+            # 参数变更: 重建
+            await _batch_manager.stop()
+            _batch_manager = BatchCheckpointManager(
+                base_manager,
+                flush_interval=flush_interval,
+                max_buffer_size=max_buffer_size,
+            )
             await _batch_manager.start()
         return _batch_manager
 

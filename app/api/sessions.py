@@ -97,7 +97,7 @@ async def import_session(session_id: str, file_path: str = Query(..., descriptio
     from app.memory.session import SessionStore
     store = SessionStore()
     for m in messages:
-        await store.add_message(session_id, m.get("role", "user"), m.get("content", ""))
+        await store.add_message(session_id, m.get("role", "user"), content=m.get("content", ""))
     return {"session_id": session_id, "imported": len(messages)}
 
 

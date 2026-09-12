@@ -22,7 +22,7 @@
   width: min(600px, 90vw);
   background: var(--bg);
   border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
+  border-radius: var(--radius-lg); /* P0-3: 原 var(--radius-lg) 未定义回退 0, 现 :root 已补 12px */
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
   overflow: hidden;
   animation: paletteSlideIn 0.15s ease-out;
@@ -117,7 +117,7 @@
   background: var(--bg-elev);
   padding: 2px 6px;
   border-radius: 4px;
-  font-family: var(--font-mono);
+  font-family: var(--font-mono); /* P0-3: --font-mono 已在 :root 定义 */
 }
 
 /* ── 消息操作按钮 ── */

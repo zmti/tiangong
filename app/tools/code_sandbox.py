@@ -281,6 +281,33 @@ def run_in_subprocess(code: str, timeout: int = DEFAULT_TIMEOUT, language: str =
 
 # ---- 各语言执行器 ----
 
+def _safe_env() -> dict:
+    """构建沙箱子进程的最小安全环境变量(修复密钥泄露)。
+
+    旧实现继承宿主机全部 os.environ, 恶意/误执行的代码可直接
+    os.environ 读到 DEEPSEEK_API_KEY / OPENAI_API_KEY 等密钥并外传。
+    现仅保留解释器运行必需的变量, 显式剥离所有可能含凭据的变量。
+    各语言解释器(node/go/rust 等)需要 PATH 来定位依赖工具链,
+    由调用方按需追加。
+    """
+    allowed = {
+        "PATH": os.environ.get("PATH", ""),
+        "TEMP": os.environ.get("TEMP", ""),
+        "TMP": os.environ.get("TMP", ""),
+        "TMPDIR": os.environ.get("TMPDIR", ""),
+        "SystemRoot": os.environ.get("SystemRoot", ""),  # Windows 运行库定位
+        "WINDIR": os.environ.get("WINDIR", ""),
+        "COMSPEC": os.environ.get("COMSPEC", ""),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": "",  # 禁 PYTHONPATH, 防导入业务代码
+    }
+    # 仅保留非空值
+    return {k: v for k, v in allowed.items() if v}
+
+
 def _run_python(code: str, timeout: int, workdir: str) -> SandboxResult:
     python = _resolve_python()
     if not python:
@@ -293,7 +320,7 @@ def _run_python(code: str, timeout: int, workdir: str) -> SandboxResult:
         r = subprocess.run(
             [python, "-u", script], capture_output=True, text=True, timeout=timeout,
             cwd=workdir,
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": ""},
+            env=_safe_env(),
             creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
         )
         out = r.stdout
@@ -301,7 +328,8 @@ def _run_python(code: str, timeout: int, workdir: str) -> SandboxResult:
             out += "\n[stderr]\n" + r.stderr
         return SandboxResult(r.returncode == 0, out[:6000] or "(无输出)", r.returncode, "subprocess", time.time() - start)
     except subprocess.TimeoutExpired:
-        _kill_tree(r) if 'r' in locals() else None
+        # subprocess.run 在超时时已自动 kill 子进程, 无需额外 _kill_tree
+        # (旧实现误引用 terminal_tool._kill_tree, 本模块未定义, 会导致 NameError)
         return SandboxResult(False, f"[沙箱] 执行超时({timeout}s)", -1, "subprocess", time.time() - start)
     except Exception as e:
         return SandboxResult(False, f"[沙箱] 执行异常: {e}", -1, "subprocess", time.time() - start)
@@ -321,7 +349,8 @@ def _run_node(code: str, timeout: int, workdir: str, lang: str) -> SandboxResult
             try:
                 r = subprocess.run([cmd, "run", "--allow-all", script],
                                    capture_output=True, text=True, timeout=timeout,
-                                   cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                                   cwd=workdir, env=_safe_env(),
+                                   creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
                 out = r.stdout
                 if r.stderr.strip():
                     out += "\n[stderr]\n" + r.stderr
@@ -339,7 +368,8 @@ def _run_node(code: str, timeout: int, workdir: str, lang: str) -> SandboxResult
     start = time.time()
     try:
         r = subprocess.run([cmd, script], capture_output=True, text=True, timeout=timeout,
-                           cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                           cwd=workdir, env=_safe_env(),
+                           creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         out = r.stdout
         if r.stderr.strip():
             out += "\n[stderr]\n" + r.stderr
@@ -359,11 +389,13 @@ def _run_go(code: str, timeout: int, workdir: str) -> SandboxResult:
         f.write(textwrap.dedent(code))
     # 初始化 go module
     subprocess.run([go, "mod", "init", "sandbox"], capture_output=True, cwd=workdir,
+                   env=_safe_env(),
                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
     start = time.time()
     try:
         r = subprocess.run([go, "run", "."], capture_output=True, text=True, timeout=timeout,
-                           cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                           cwd=workdir, env=_safe_env(),
+                           creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         out = r.stdout
         if r.stderr.strip():
             out += "\n[stderr]\n" + r.stderr
@@ -385,9 +417,11 @@ def _run_rust(code: str, timeout: int, workdir: str) -> SandboxResult:
     start = time.time()
     try:
         subprocess.run([rustc, src, "-o", exe], capture_output=True, timeout=60,
+                       env=_safe_env(),
                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         r = subprocess.run([exe], capture_output=True, text=True, timeout=timeout,
-                           cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                           cwd=workdir, env=_safe_env(),
+                           creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         out = r.stdout
         if r.stderr.strip():
             out += "\n[stderr]\n" + r.stderr
@@ -413,9 +447,11 @@ def _run_java(code: str, timeout: int, workdir: str) -> SandboxResult:
     start = time.time()
     try:
         subprocess.run([javac, src], capture_output=True, timeout=60,
+                       env=_safe_env(),
                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         r = subprocess.run([java, class_name], capture_output=True, text=True, timeout=timeout,
-                           cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                           cwd=workdir, env=_safe_env(),
+                           creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         out = r.stdout
         if r.stderr.strip():
             out += "\n[stderr]\n" + r.stderr
@@ -447,9 +483,11 @@ def _run_c(code: str, timeout: int, workdir: str, lang: str) -> SandboxResult:
     start = time.time()
     try:
         subprocess.run(compile_cmd, capture_output=True, timeout=60,
+                       env=_safe_env(),
                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         r = subprocess.run([exe], capture_output=True, text=True, timeout=timeout,
-                           cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                           cwd=workdir, env=_safe_env(),
+                           creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         out = r.stdout
         if r.stderr.strip():
             out += "\n[stderr]\n" + r.stderr
@@ -467,8 +505,10 @@ def _run_shell(code: str, timeout: int, workdir: str) -> SandboxResult:
         cmd = ["/bin/sh", "-c"]
     start = time.time()
     try:
+        # 修复: shell 命令也不继承宿主机全量环境变量(含 API Key), 仅保留最小运行变量
         r = subprocess.run(cmd + [textwrap.dedent(code)], capture_output=True, text=True, timeout=timeout,
-                           cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                           cwd=workdir, env=_safe_env(),
+                           creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         out = r.stdout
         if r.stderr.strip():
             out += "\n[stderr]\n" + r.stderr
@@ -491,7 +531,8 @@ def _run_generic_interpreter(code: str, interpreter: str, ext: str, timeout: int
     run_cmd = [cmd] + (extra_args or []) + [script]
     try:
         r = subprocess.run(run_cmd, capture_output=True, text=True, timeout=timeout,
-                           cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                           cwd=workdir, env=_safe_env(),
+                           creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         out = r.stdout
         if r.stderr.strip():
             out += "\n[stderr]\n" + r.stderr
@@ -516,9 +557,11 @@ def _run_swift(code: str, timeout: int, workdir: str) -> SandboxResult:
     start = time.time()
     try:
         subprocess.run([swift, src, "-o", exe], capture_output=True, timeout=120,
+                       env=_safe_env(),
                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         r = subprocess.run([exe], capture_output=True, text=True, timeout=timeout,
-                           cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                           cwd=workdir, env=_safe_env(),
+                           creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         out = r.stdout
         if r.stderr.strip():
             out += "\n[stderr]\n" + r.stderr
@@ -542,12 +585,14 @@ def _run_kotlin(code: str, timeout: int, workdir: str) -> SandboxResult:
         out_dir = os.path.join(workdir, "kout")
         os.makedirs(out_dir, exist_ok=True)
         subprocess.run([kotlinc, src, "-d", out_dir], capture_output=True, timeout=120,
+                       env=_safe_env(),
                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         java = shutil.which("java")
         if not java:
             return SandboxResult(False, "[沙箱] 未找到 java,请先安装 JDK", -1, "subprocess", time.time() - start)
         r = subprocess.run([java, "-cp", out_dir, "Main"], capture_output=True, text=True, timeout=timeout,
-                           cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                           cwd=workdir, env=_safe_env(),
+                           creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         out = r.stdout
         if r.stderr.strip():
             out += "\n[stderr]\n" + r.stderr
@@ -569,7 +614,8 @@ def _run_csharp(code: str, timeout: int, workdir: str) -> SandboxResult:
         start = time.time()
         try:
             r = subprocess.run([ds, script], capture_output=True, text=True, timeout=timeout,
-                               cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                               cwd=workdir, env=_safe_env(),
+                               creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
             out = r.stdout
             if r.stderr.strip():
                 out += "\n[stderr]\n" + r.stderr
@@ -588,7 +634,8 @@ def _run_csharp(code: str, timeout: int, workdir: str) -> SandboxResult:
         start = time.time()
         try:
             r = subprocess.run([fsi, script], capture_output=True, text=True, timeout=timeout,
-                               cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                               cwd=workdir, env=_safe_env(),
+                               creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
             out = r.stdout
             if r.stderr.strip():
                 out += "\n[stderr]\n" + r.stderr
@@ -687,7 +734,8 @@ def _run_powerhell(code: str, timeout: int, workdir: str) -> SandboxResult:
         try:
             r = subprocess.run([pwsh, "-NoProfile", "-File", script],
                                capture_output=True, text=True, timeout=timeout,
-                               cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                               cwd=workdir, env=_safe_env(),
+                               creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
             out = r.stdout
             if r.stderr.strip():
                 out += "\n[stderr]\n" + r.stderr
@@ -711,7 +759,8 @@ def _run_zig(code: str, timeout: int, workdir: str) -> SandboxResult:
     start = time.time()
     try:
         subprocess.run([zig, "run", src], capture_output=True, text=True, timeout=timeout,
-                       cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                       cwd=workdir, env=_safe_env(),
+                       creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         # zig run 直接执行，不需要单独编译
         return SandboxResult(True, "(Zig 使用 zig run 直接执行，请检查上方输出)", 0, "subprocess", time.time() - start)
     except subprocess.TimeoutExpired:
@@ -731,7 +780,8 @@ def _run_v(code: str, timeout: int, workdir: str) -> SandboxResult:
     start = time.time()
     try:
         subprocess.run([v, "run", src], capture_output=True, text=True, timeout=timeout,
-                       cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                       cwd=workdir, env=_safe_env(),
+                       creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         return SandboxResult(True, "(V 使用 v run 直接执行，请检查上方输出)", 0, "subprocess", time.time() - start)
     except subprocess.TimeoutExpired:
         return SandboxResult(False, f"[沙箱] 执行超时({timeout}s)", -1, "subprocess", time.time() - start)

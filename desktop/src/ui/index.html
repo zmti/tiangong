@@ -3,7 +3,11 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>智能体助手</title>
+  <!-- CSP: Electron 桌面应用本地加载 + 内联 style + 后端 127.0.0.1 -->
+  <!-- eval 兼容层已拆为 5 个独立模块(exec-trace/toast/lightbox/tts/confirm-dialog), 故无需 unsafe-eval -->
+  <!-- unsafe-inline 仅为兼容 17 处内联 style, 后续收敛后应改为 nonce/hash -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:* blob: data:; media-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none';">
+  <title>天工</title>
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="style-command.css">
   <link rel="stylesheet" href="style-message.css">
@@ -11,11 +15,31 @@
   <link rel="stylesheet" href="style-workflow.css">
 </head>
 <body data-theme="dark">
+  <!-- 启动加载画面 -->
+  <div id="splashScreen" class="splash-screen">
+    <div class="splash-content">
+      <div class="splash-logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="color:#fff; width:48px; height:48px;">
+          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+          <circle cx="12" cy="7" r="4"></circle>
+        </svg>
+      </div>
+      <div class="splash-title">天工</div>
+      <div class="splash-subtitle">正在连接后端服务...</div>
+      <div class="splash-spinner">
+        <div class="spinner"></div>
+      </div>
+      <div class="splash-status" id="splashStatus">初始化中</div>
+      <!-- P2-18: 后端连接失败保留重试入口 -->
+      <button class="splash-retry" id="splashRetry">重试连接</button>
+    </div>
+  </div>
+
   <!-- 左侧可折叠侧边栏 -->
-  <aside id="sidebar" class="sidebar">
+  <aside id="sidebar" class="sidebar init-hidden">
     <div class="sidebar-inner">
       <div class="sidebar-header">
-        <div class="sidebar-logo" title="智能体助手">
+        <div class="sidebar-logo" title="天工">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="color:#fff; width:20px; height:20px;">
             <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
             <circle cx="12" cy="7" r="4"></circle>
@@ -112,7 +136,9 @@
   <aside id="sidePanel">
     <div class="side-content" id="todoPanel">
       <div class="panel-head">
-        <span class="panel-title">📋 待办</span>
+        <span class="panel-title">
+          <svg class="panel-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 11 12 14 22 4"></polyline><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path></svg>
+          待办</span>
         <div class="head-actions">
           <button class="mini-btn close-panel" title="关闭">×</button>
         </div>
@@ -131,7 +157,9 @@
     </div>
     <div class="side-content" id="kbPanel">
       <div class="panel-head">
-        <span class="panel-title">📚 知识库</span>
+        <span class="panel-title">
+          <svg class="panel-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path></svg>
+          知识库</span>
         <div class="head-actions">
           <button class="mini-btn" id="kbUploadBtn">上传</button>
           <button class="mini-btn danger" id="kbClearBtn">清空</button>
@@ -139,7 +167,9 @@
         </div>
       </div>
       <div id="dropZone">
-        <div class="dz-main">📚 拖拽文件到这里上传</div>
+        <div class="dz-main">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right:6px;vertical-align:-5px;"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path></svg>
+          拖拽文件到这里上传</div>
         <div class="dz-sub">支持 txt / md / pdf / docx / xlsx / pptx 等</div>
       </div>
       <div id="docStats" class="doc-stats"></div>
@@ -147,7 +177,9 @@
     </div>
     <div class="side-content" id="memoryPanel">
       <div class="panel-head">
-        <span class="panel-title">🧠 长期记忆</span>
+        <span class="panel-title">
+          <svg class="panel-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a10 10 0 1 0 10 10A10 10 0 0 0 12 2z"></path><path d="M12 16v-4"></path><path d="M12 8h.01"></path></svg>
+          长期记忆</span>
         <div class="head-actions">
           <button class="mini-btn" id="memoryRefreshBtn">刷新</button>
           <button class="mini-btn danger" id="memoryClearBtn">清空</button>
@@ -174,7 +206,9 @@
     </div>
     <div class="side-content" id="runsPanel">
       <div class="panel-head">
-        <span class="panel-title">🕘 运行记录</span>
+        <span class="panel-title">
+          <svg class="panel-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+          运行记录</span>
         <div class="head-actions">
           <button class="mini-btn" id="runsRefreshBtn">刷新</button>
           <button class="mini-btn close-panel" title="关闭">×</button>
@@ -184,7 +218,9 @@
     </div>
     <div class="side-content" id="telemetryPanel">
       <div class="panel-head">
-        <span class="panel-title">📊 用量统计</span>
+        <span class="panel-title">
+          <svg class="panel-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"></line><line x1="12" y1="20" x2="12" y2="4"></line><line x1="6" y1="20" x2="6" y2="14"></line></svg>
+          用量统计</span>
         <div class="head-actions">
           <button class="mini-btn" id="telRefreshBtn">刷新</button>
           <button class="mini-btn close-panel" title="关闭">×</button>
@@ -195,7 +231,9 @@
     </div>
     <div class="side-content" id="schedulePanel">
       <div class="panel-head">
-        <span class="panel-title">⏰ 定时任务</span>
+        <span class="panel-title">
+          <svg class="panel-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+          定时任务</span>
         <div class="head-actions">
           <button class="mini-btn" id="schedRefreshBtn">刷新</button>
           <button class="mini-btn close-panel" title="关闭">×</button>
@@ -221,7 +259,9 @@
     </div>
     <div class="side-content" id="promptsPanel">
       <div class="panel-head">
-        <span class="panel-title">📝 提示词库</span>
+        <span class="panel-title">
+          <svg class="panel-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line></svg>
+          提示词库</span>
         <div class="head-actions">
           <button class="mini-btn" id="promptAddBtn">新增</button>
           <button class="mini-btn close-panel" title="关闭">×</button>
@@ -236,7 +276,9 @@
     </div>
     <div class="side-content" id="toolsPanel">
       <div class="panel-head">
-        <span class="panel-title">🛠 可用工具</span>
+        <span class="panel-title">
+          <svg class="panel-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path></svg>
+          可用工具</span>
         <button class="mini-btn close-panel" title="关闭">×</button>
       </div>
       <div id="toolGrid" class="tool-grid"></div>
@@ -244,11 +286,13 @@
   </aside>
 
   <!-- 主内容区 -->
-  <main id="main">
+  <main id="main" class="init-hidden">
     <!-- 工作流视图 -->
     <div class="tab-content" id="tabWorkflow">
       <div class="panel-head">
-        <span class="panel-title">🔄 工作流</span>
+        <span class="panel-title">
+          <svg class="panel-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"></polyline><path d="M3 11V9a4 4 0 0 1 4-4h14"></path><polyline points="7 23 3 19 7 15"></polyline><path d="M21 13v2a4 4 0 0 1-4 4H3"></path></svg>
+          工作流</span>
         <div class="head-actions">
           <button class="mini-btn" id="wfRefreshBtn">刷新</button>
           <button class="mini-btn primary" id="wfNewBtn">新建工作流</button>
@@ -270,7 +314,9 @@
     <!-- 每日简报视图 -->
     <div class="tab-content" id="tabBriefing">
       <div class="panel-head">
-        <span class="panel-title">📊 每日简报</span>
+        <span class="panel-title">
+          <svg class="panel-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"></line><line x1="12" y1="20" x2="12" y2="4"></line><line x1="6" y1="20" x2="6" y2="14"></line></svg>
+          每日简报</span>
         <div class="head-actions">
           <button class="mini-btn" id="bfRefreshBtn">刷新</button>
         </div>
@@ -301,11 +347,25 @@
       </div>
     </div>
 
+    <!-- 项目管理视图 -->
+    <div class="tab-content" id="tabProjects">
+      <div class="panel-head">
+        <span class="panel-title">
+          <svg class="panel-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+          项目管理</span>
+        <div class="head-actions">
+          <button class="mini-btn" id="pjRefreshBtn">刷新</button>
+          <button class="mini-btn primary" id="pjNewBtn">新建项目</button>
+        </div>
+      </div>
+      <div id="projectGrid" class="project-grid"></div>
+    </div>
+
     <!-- 聊天视图 -->
     <div class="chat-view" id="chatView">
       <div class="main-head">
         <div class="session-title-wrap">
-          <button class="mini-btn" id="backToListBtn" title="返回会话列表" style="padding:4px 8px;">
+          <button class="mini-btn" id="backToListBtn" title="返回会话列表">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 18l-6-6 6-6"></path></svg>
           </button>
           <span class="title" id="sessionLabel">新会话</span>
@@ -314,10 +374,10 @@
           </button>
         </div>
         <div class="head-right">
-          <button class="mini-btn" id="clearSessionBtn" title="清空当前会话" style="padding:4px 8px;">
+          <button class="mini-btn" id="clearSessionBtn" title="清空当前会话">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
           </button>
-          <button class="mini-btn" id="exportBtn" title="导出当前会话" style="padding:4px 8px;">
+          <button class="mini-btn" id="exportBtn" title="导出当前会话">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"></path></svg>
           </button>
           <div class="ctx-meter" id="ctxMeter" title="当前会话上下文用量">
@@ -338,7 +398,8 @@
       <div id="imgPreviewBar">
         <span>已选图片:</span><img id="previewImg" title="点击预览">
         <span class="preview-name" id="previewName"></span>
-        <button class="lb-btn" id="previewCancel" style="padding:4px 12px;background:transparent;border-color:var(--border);color:var(--muted)">取消</button>
+        <!-- P2-14: 内联 style 收敛 → class="lb-btn preview-cancel" -->
+        <button class="lb-btn preview-cancel" id="previewCancel">取消</button>
       </div>
       <div id="attachBar" class="attach-bar">
         <span class="attach-label">📎 附件</span>
@@ -350,7 +411,7 @@
         <div class="composer">
           <div class="composer-top">
             <div class="composer-selects">
-              <button id="attachBtn" class="tool-btn" title="添加本地文件附件" style="width:24px; height:24px; padding:0;">
+              <button id="attachBtn" class="tool-btn tool-btn-sm" title="添加本地文件附件">
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
               </button>
               <div id="modeBadge" class="mode-badge-btn" title="Agent 设置">
@@ -359,11 +420,12 @@
                 <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
               </div>
               <button type="button" id="modelPickerBtn" class="picker-btn" title="选择模型">
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="color:var(--primary)"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect><rect x="9" y="9" width="6" height="6"></rect></svg>
+                <svg class="picker-btn-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect><rect x="9" y="9" width="6" height="6"></rect></svg>
                 <span id="modelPickerText">aqnes-2.0-flash</span>
                 <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"></polyline></svg>
               </button>
-              <select id="modeSelect" title="协作模式" style="display:none;">
+              <!-- P2-14: 隐藏用 class, 原 style="display:none" -->
+              <select id="modeSelect" class="mode-select-hidden" title="协作模式">
                 <option value="auto">自动</option>
               </select>
             </div>
@@ -398,8 +460,10 @@
 
       <div id="welcome" class="welcome">
         <div class="welcome-inner">
-          <div class="welcome-logo">🤖</div>
-          <h2>智能体助手</h2>
+          <div class="welcome-logo-wrap" title="天工">
+            <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>
+          </div>
+          <h2>天工</h2>
           <p class="welcome-sub">多模型对话 · 知识库 · 工具调用 · 图片识别 · 定时任务</p>
           <div class="welcome-chips">
             <button class="welcome-chip" data-q="帮我介绍这个项目能做什么,并列出可用的功能">了解我能做什么</button>
@@ -472,14 +536,16 @@
   <script src="js/dom-cache.js"></script>
   <script src="js/storage.js"></script>
   <script src="js/state.js"></script>
+  <!-- P2-15: common.js 的 eval() 已移除, 现在可安全去掉 CSP 的 'unsafe-eval' -->
   <script src="js/api.js"></script>
   <script src="js/markdown.js"></script>
   <script src="js/messages.js"></script>
+  <script src="js/message-renderer.js"></script>
   <script src="js/group.js"></script>
   <script src="js/utils.js"></script>
   <!-- 统一设置弹窗 -->
   <div class="modal-overlay" id="settingsModal" hidden>
-    <div class="modal-box settings-modal-box" style="width:720px; max-height:80vh;">
+    <div class="modal-box settings-modal-box settings-box-lg">
       <div class="modal-header">
         <span>设置</span>
         <button class="mini-btn close-modal" data-modal="settingsModal">×</button>
@@ -523,9 +589,9 @@
           <!-- 提示词设置 -->
           <div class="settings-section" data-section="prompt">
             <div class="settings-section-title">提示词</div>
-            <div class="setting-row" style="flex-direction:column; align-items:stretch; gap:4px;">
+            <div class="setting-row setting-row-col">
               <span class="setting-label">自定义 System Prompt</span>
-              <textarea id="sidebarSystemPrompt" placeholder="输入自定义 System Prompt..." rows="5" style="width:100%;"></textarea>
+              <textarea id="sidebarSystemPrompt" class="setting-textarea" placeholder="输入自定义 System Prompt..." rows="5"></textarea>
             </div>
           </div>
 
@@ -548,7 +614,7 @@
           <!-- 关于 -->
           <div class="settings-section" data-section="about">
             <div class="about">
-              <b>智能体助手 v2.0</b>
+              <b>天工 v2.0</b>
               <span class="muted">对话 · 知识库 · 工具 · 图片识别</span>
             </div>
           </div>
@@ -557,7 +623,12 @@
     </div>
   </div>
 
-  <script src="js/common.js"></script>
+  <!-- 从 common.js 的 eval 兼容层拆出的独立模块(顺序: exec-trace → toast → lightbox → tts → confirm-dialog) -->
+  <script src="js/exec-trace.js"></script>
+  <script src="js/toast.js"></script>
+  <script src="js/lightbox.js"></script>
+  <script src="js/tts.js"></script>
+  <script src="js/confirm-dialog.js"></script>
   <script src="js/attachments.js"></script>
   <script src="js/session.js"></script>
   <script src="js/kb.js"></script>
@@ -578,7 +649,6 @@
   <script src="js/workflow-designer.js"></script>
   <script src="js/workflow-ops.js"></script>
   <script src="js/workflow.js?v=2"></script>
-  <script src="js/message-renderer.js"></script>
   <script src="js/briefing.js"></script>
   <script src="js/projects.js"></script>
   <script src="js/confirm.js"></script>

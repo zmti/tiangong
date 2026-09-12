@@ -16,6 +16,7 @@ from typing import Optional
 
 from pydantic import Field
 
+from app.tools.project_context import resolve_cwd
 from app.tools.registry import tool
 
 CODE_SKIP_DIRS = {
@@ -82,7 +83,7 @@ def code_search(
     context_lines: int = Field(1, description="匹配行前后附带的上下文行数,0 为不带"),
     max_results: int = Field(50, description="最大匹配数"),
 ) -> str:
-    root = os.path.abspath(os.path.expanduser(path)) if path else os.getcwd()
+    root = os.path.abspath(os.path.expanduser(path)) if path else resolve_cwd()
     if not os.path.isdir(root):
         return {"path": root, "error": f"目录不存在: {root}"}
     q = (query or "").strip()
@@ -201,7 +202,7 @@ def code_symbols(
     path: str = Field("", description="代码库根目录,留空用当前工作目录"),
     max_symbols: int = Field(300, description="最大返回符号数"),
 ) -> str:
-    root = os.path.abspath(os.path.expanduser(path)) if path else os.getcwd()
+    root = os.path.abspath(os.path.expanduser(path)) if path else resolve_cwd()
     if not os.path.isdir(root):
         return {"path": root, "error": f"目录不存在: {root}"}
     symbols: list[dict] = []
@@ -235,7 +236,7 @@ def project_tree(
     depth: int = Field(3, description="目录递归深度,最大 6"),
     max_entries: int = Field(200, description="最大返回条目数"),
 ) -> str:
-    root = os.path.abspath(os.path.expanduser(path)) if path else os.getcwd()
+    root = os.path.abspath(os.path.expanduser(path)) if path else resolve_cwd()
     if not os.path.isdir(root):
         return {"path": root, "error": f"目录不存在: {root}"}
     depth = max(1, min(depth, 6))
@@ -335,7 +336,7 @@ def code_semantic_search(
     from app.rag.embeddings import HashEmbedding
     from app.rag.store import cosine_similarity
 
-    root = os.path.abspath(os.path.expanduser(path)) if path else os.getcwd()
+    root = os.path.abspath(os.path.expanduser(path)) if path else resolve_cwd()
     if not os.path.isdir(root):
         return {"path": root, "error": f"目录不存在: {root}"}
     q = (query or "").strip()

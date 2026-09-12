@@ -284,37 +284,58 @@ class LongRunningTaskManager:
         asyncio.create_task(self._execute_task(task))
 
     async def _execute_task(self, task: LongRunningTask) -> None:
-        """执行单个长时任务(异步,不阻塞循环)。"""
+        """执行单个长时任务(异步,不阻塞循环)。
+
+        修复: 旧实现调用 agent.run_stream(message=..., use_history=True),
+        但 run_stream 签名为 (user_input, history=None) 且是 async generator,
+        传错关键字参数直接 TypeError; 且 asyncio.wait_for 等待 generator 对象
+        本身立即完成, 超时机制完全失效。现改为迭代 async generator +
+        独立的整体超时守护。
+        """
         import asyncio
         from app.core.agent import Agent
         from app.core.telemetry import _current_run_id, tracer
 
         run_id = f"lr_{task.task_id}"
         _current_run_id.set(run_id)
-        tracer.start_run(run_id=run_id, message=task.prompt, session_id=task.session_id)
+        tracer.record({
+            "type": "run_start", "run_id": run_id,
+            "session_id": task.session_id, "input": task.prompt[:200],
+        })
 
+        timeout = task.max_duration_minutes * 60
+        steps: list[dict] = []
+        answer = ""
         try:
-            agent = Agent(session_id=task.session_id)
-            # 设置超时
-            timeout = task.max_duration_minutes * 60
+            agent = Agent(session_id=task.session_id, mode=task.mode)
+            # 迭代 async generator, 用整体超时守护防止无限挂起
+            async def _iter_stream():
+                async for event in agent.run_stream(task.prompt, history=[]):
+                    if event.get("type") == "tool":
+                        steps.append(event)
+                    if event.get("type") == "done":
+                        # done 事件携带完整 steps 与 model
+                        if event.get("steps"):
+                            steps.clear()
+                            steps.extend(event.get("steps", []))
+                        nonlocal answer
+                        # 最终答案从 steps 中的 answer 步骤取
+                        for s in reversed(event.get("steps", [])):
+                            if s.get("type") in ("answer", "verify_rewrite"):
+                                answer = s.get("content", "")
+                                break
+
             try:
-                result = await asyncio.wait_for(
-                    agent.run_stream(message=task.prompt, use_history=True),
-                    timeout=timeout,
-                )
-                task.answer = result.answer if hasattr(result, "answer") else str(result)
-                task.progress = {
-                    "step": "completed",
-                    "steps": len(result.steps) if hasattr(result, "steps") else 0,
-                    "message": "执行完成",
-                }
+                await asyncio.wait_for(_iter_stream(), timeout=timeout)
+                task.progress = {"step": "completed", "steps": len(steps), "message": "执行完成"}
                 task.status = "done"
-                tracer.end_run(run_id=run_id, ok=True)
+                task.answer = answer
+                tracer.record({"type": "run_end", "run_id": run_id, "ok": True})
             except asyncio.TimeoutError:
-                task.error = f"执行超时({timeout}s)"
+                task.error = f"执行超时({task.max_duration_minutes}分钟)"
                 task.progress = {"step": "timeout", "message": task.error}
                 task.status = "failed"
-                tracer.end_run(run_id=run_id, ok=False, error=task.error)
+                tracer.record({"type": "run_end", "run_id": run_id, "ok": False, "error": task.error})
             except Exception as e:
                 task.error = str(e)[:500]
                 task.retry_count += 1
@@ -331,7 +352,7 @@ class LongRunningTaskManager:
                 else:
                     task.progress = {"step": "failed", "message": task.error}
                     task.status = "failed"
-                    tracer.end_run(run_id=run_id, ok=False, error=task.error)
+                    tracer.record({"type": "run_end", "run_id": run_id, "ok": False, "error": task.error})
 
         except Exception as e:
             task.error = str(e)[:500]

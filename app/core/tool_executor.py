@@ -8,7 +8,7 @@ import time
 from typing import Optional
 
 from app.config import settings
-from app.core.constants import TEST_FAIL_MARKERS, TRANSIENT_PATTERNS
+from app.core.constants import TEST_FAIL_MARKERS, TRANSIENT_PATTERNS, NO_RETRY_TOOLS
 from app.core.llm import ToolCall
 from app.tools.registry import ToolRegistry
 
@@ -20,8 +20,6 @@ _TRANSIENT_PATTERN = TRANSIENT_PATTERNS
 _TEST_FAIL_MARKERS = TEST_FAIL_MARKERS
 # 计划工具(不由工具执行器处理)
 PLAN_TOOLS = {"set_plan", "update_plan", "get_plan"}
-# 不重试工具
-NO_RETRY_TOOLS = {"read_file", "write_file", "edit_file"}
 # 系统常驻工具
 SYSTEM_TOOLS = {"read_file", "write_file", "edit_file", "run_code", "run_terminal"}
 
@@ -54,10 +52,13 @@ class ToolExecutor:
         session_id: str = "",
         approve_tools: Optional[list[str]] = None,
         cancel_check=None,
+        project_path: str = "",
     ):
         self.registry = registry
         self.session_id = session_id
         self.approve_tools = list(approve_tools or [])
+        self._cancel_check = cancel_check
+        self.project_path = project_path
         self._cancel_check = cancel_check
         # 工具路由:预选后只把相关工具子集暴露给模型;None=未路由(全量)
         self._active_tools: Optional[list[str]] = None
@@ -224,6 +225,10 @@ class ToolExecutor:
 
     async def _execute_tool_once(self, name: str, arguments: str) -> str:
         self._check_cancel()
+        # 确保项目路径上下文在每次工具调用时都已设置
+        if self.project_path:
+            from app.tools.project_context import set_project_path
+            set_project_path(self.project_path)
         # 工具路由裁剪
         if self._active_tools is not None and name not in self._active_tools and name not in self._always_tools:
             return json.dumps({"error": f"工具 {name} 未在当前任务启用"}, ensure_ascii=False)

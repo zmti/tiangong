@@ -1,7 +1,7 @@
 {
   "name": "agent-desktop",
   "version": "1.0.0",
-  "description": "智能体桌面应用",
+  "description": "天工智能体",
   "main": "src/main.js",
   "author": "agent-service",
   "license": "MIT",
@@ -15,17 +15,17 @@
   },
   "build": {
     "appId": "com.agent.desktop",
-    "productName": "AgentDesktop",
+    "productName": "天工",
     "files": [
       "src/**/*"
     ],
     "extraResources": [
       {
-        "from": "../backend/dist/agent-backend/**/*",
+        "from": "backend/dist/agent-backend/**/*",
         "to": "backend/agent-backend"
       },
       {
-        "from": "../backend/dist/.env",
+        "from": "backend/dist/.env",
         "to": "backend/.env"
       }
     ],

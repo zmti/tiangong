@@ -24,57 +24,67 @@ class RedisSessionStore:
     def _key(self, session_id: str) -> str:
         return f"{self._prefix}:{session_id}"
 
-    async def get_or_create(self, session_id: str):
+    async def _read_session(self, session_id: str) -> dict:
+        """从 Redis 读取会话,无锁(调用方须自行加锁)。"""
         key = self._key(session_id)
         raw = await asyncio.to_thread(self._client.hget, key, "json")
         now = time.time()
         if raw is None:
-            # 用带 NX 的 setnx 初始化,并发安全
+            return {"id": session_id, "messages": [], "created_at": now, "updated_at": now, "_exists": False}
+        messages = json.loads(raw)
+        created = float((await asyncio.to_thread(self._client.hget, key, "created_at")) or now)
+        return {"id": session_id, "messages": messages, "created_at": created, "updated_at": now, "_exists": True}
+
+    async def _ensure_session(self, session_id: str) -> dict:
+        """确保会话存在(不存在则创建),无锁(调用方须自行加锁)。"""
+        key = self._key(session_id)
+        raw = await asyncio.to_thread(self._client.hget, key, "json")
+        now = time.time()
+        if raw is None:
             done = await asyncio.to_thread(
                 self._client.hsetnx, key, "json", json.dumps([])
             )
             if done:
                 await asyncio.to_thread(self._client.hset, key, "created_at", now)
-                messages = []
-                created = now
-            else:
-                raw = await asyncio.to_thread(self._client.hget, key, "json")
-                messages = json.loads(raw or "[]")
-                created = float((await asyncio.to_thread(self._client.hget, key, "created_at")) or now)
-        else:
-            messages = json.loads(raw)
-            created = float((await asyncio.to_thread(self._client.hget, key, "created_at")) or now)
+                return {"id": session_id, "messages": [], "created_at": now, "updated_at": now}
+            raw = await asyncio.to_thread(self._client.hget, key, "json")
+        messages = json.loads(raw or "[]")
+        created = float((await asyncio.to_thread(self._client.hget, key, "created_at")) or now)
         return {"id": session_id, "messages": messages, "created_at": created, "updated_at": now}
 
-    async def add_message(self, session_id: str, role: str, kind: str = "text", content: Optional[str] = None, meta: Optional[dict] = None):
-        session = await self.get_or_create(session_id)
-        messages = list(session["messages"])
-        # 结构化消息: {id, role, kind, content, meta}
-        msg = {
-            "id": str(time.time()) + str(id(self)),
-            "role": role,
-            "kind": kind,
-            "content": content or "",
-        }
-        if meta:
-            msg["meta"] = meta
-        messages.append(msg)
-        if len(messages) > self._max_messages:
-            messages = messages[-self._max_messages:]
-        key = self._key(session_id)
+    async def get_or_create(self, session_id: str):
         async with self._lock:
+            return await self._ensure_session(session_id)
+
+    async def add_message(self, session_id: str, role: str, kind: str = "text", content: Optional[str] = None, meta: Optional[dict] = None):
+        async with self._lock:
+            session = await self._ensure_session(session_id)
+            messages = list(session["messages"])
+            msg = {
+                "id": str(time.time()) + str(id(self)),
+                "role": role,
+                "kind": kind,
+                "content": content or "",
+            }
+            if meta:
+                msg["meta"] = meta
+            messages.append(msg)
+            if len(messages) > self._max_messages:
+                messages = messages[-self._max_messages:]
+            key = self._key(session_id)
             await asyncio.to_thread(
                 self._client.hset, key, "json", json.dumps(messages, ensure_ascii=False)
             )
             await asyncio.to_thread(self._client.hset, key, "updated_at", time.time())
-        return session
+            return session
 
     async def get_history(self, session_id: str, last_n: Optional[int] = None) -> list[dict]:
-        session = await self.get_or_create(session_id)
-        messages = list(session["messages"])
-        if last_n is not None:
-            messages = messages[-last_n:]
-        return messages
+        async with self._lock:
+            session = await self._read_session(session_id)
+            messages = list(session["messages"])
+            if last_n is not None:
+                messages = messages[-last_n:]
+            return messages
 
     async def clear(self, session_id: str) -> None:
         await asyncio.to_thread(self._client.delete, self._key(session_id))

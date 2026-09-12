@@ -12,6 +12,7 @@ import sys
 
 from pydantic import Field
 
+from app.tools.project_context import resolve_cwd
 from app.tools.registry import tool
 
 MAX_DIFF_CHARS = 8000
@@ -72,7 +73,7 @@ def git_status(
     repo: str = Field("", description="仓库路径,留空用当前工作目录"),
 ) -> str:
     try:
-        repo = _find_repo(repo or os.getcwd())
+        repo = _find_repo(repo or resolve_cwd())
     except ValueError as e:
         return {"error": str(e)}
     branch = _git(repo, "branch", "--show-current")
@@ -117,7 +118,7 @@ def git_log(
     with_stats: bool = Field(False, description="True 时附带每个提交的文件变更统计"),
 ) -> str:
     try:
-        repo = _find_repo(repo or os.getcwd())
+        repo = _find_repo(repo or resolve_cwd())
     except ValueError as e:
         return {"error": str(e)}
     count = max(1, min(count, 50))
@@ -143,7 +144,7 @@ def git_diff(
     max_chars: int = Field(8000, description="返回最大字符数"),
 ) -> str:
     try:
-        repo = _find_repo(repo or os.getcwd())
+        repo = _find_repo(repo or resolve_cwd())
     except ValueError as e:
         return {"error": str(e)}
     args = ["diff"]
@@ -170,7 +171,7 @@ def git_add(
     paths: str = Field("", description="要暂存的文件路径(逗号分隔);留空=暂存全部"),
 ) -> str:
     try:
-        repo = _find_repo(repo or os.getcwd())
+        repo = _find_repo(repo or resolve_cwd())
     except ValueError as e:
         return {"error": str(e)}
     args = ["add"]
@@ -195,7 +196,7 @@ def git_commit(
     message: str = Field(description="提交信息,建议简洁描述本次改动"),
 ) -> str:
     try:
-        repo = _find_repo(repo or os.getcwd())
+        repo = _find_repo(repo or resolve_cwd())
     except ValueError as e:
         return {"error": str(e)}
     msg = (message or "").strip()
@@ -219,7 +220,7 @@ def git_branch(
     create: str = Field("", description="要新建的分支名(留空仅列出)"),
 ) -> str:
     try:
-        repo = _find_repo(repo or os.getcwd())
+        repo = _find_repo(repo or resolve_cwd())
     except ValueError as e:
         return {"error": str(e)}
     if create.strip():
@@ -244,7 +245,7 @@ def git_checkout(
     ref: str = Field(description="要切换到的分支/提交/tag"),
 ) -> str:
     try:
-        repo = _find_repo(repo or os.getcwd())
+        repo = _find_repo(repo or resolve_cwd())
     except ValueError as e:
         return {"error": str(e)}
     ref = (ref or "").strip()

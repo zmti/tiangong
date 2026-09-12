@@ -315,8 +315,9 @@ def test_stats_aggregates_cache_hit_rate():
 
 def test_circuit_breaker_skips_failing_provider(monkeypatch):
     """连续失败达到阈值后,后续调用直接跳过该 provider(不再发起请求)。"""
-    LLMClient._circuit_fails.clear()
-    LLMClient._circuit_open_until.clear()
+    client = build_llm("deepseek")
+    client._circuit_fails.clear()
+    client._circuit_open_until.clear()
     client = build_llm("deepseek")
     client._api_key = "test-key"
     monkeypatch.setattr(settings, "agent_llm_retries", 0)
@@ -350,13 +351,14 @@ def test_circuit_breaker_skips_failing_provider(monkeypatch):
     with pytest.raises(LLMError):
         asyncio.run(client.chat([{"role": "user", "content": "x"}]))
     assert calls["n"] == 1  # 恢复后确实重新尝试了一次
-    LLMClient._circuit_fails.clear()
-    LLMClient._circuit_open_until.clear()
+    client._circuit_fails.clear()
+    client._circuit_open_until.clear()
 
 
 def test_circuit_breaker_success_resets_counter(monkeypatch):
-    LLMClient._circuit_fails.clear()
-    LLMClient._circuit_open_until.clear()
+    client = build_llm("deepseek")
+    client._circuit_fails.clear()
+    client._circuit_open_until.clear()
     client = build_llm("deepseek")
     client._api_key = "test-key"
     monkeypatch.setattr(settings, "agent_llm_retries", 0)

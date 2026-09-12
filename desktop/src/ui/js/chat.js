@@ -404,6 +404,7 @@ try {
             stream: true,
             provider: finalProvider,
             model: finalModel,
+            project_path: App.currentProject?.path || '',
             ...App.Chat.modeParams(),
           };
           res = await App.api('/v1/chat/stream', {
@@ -575,16 +576,15 @@ try {
               // 没有重复记录,才显示结果
               App.ExecTrace.updateStep(doneToolName, 'done', '');
               const imgUrl = App.parseImageUrl(evt.result);
-              let resultHtml = '';
               if (doneToolName === 'generate_image' && imgUrl) {
-                resultHtml = `<img class="tool-result-img" src="${App.escapeHtml(imgUrl)}" alt="生成图片">`;
+                const toolEl = document.createElement('div');
+                toolEl.className = 'tool-inline';
+                toolEl.innerHTML = `<img class="tool-result-img" src="${App.escapeHtml(imgUrl)}" alt="生成图片">`;
+                _insertBeforeAnswer(toolEl);
               } else if (evt.result) {
-                resultHtml = `<div class="tool-result">${App.escapeHtml(String(evt.result).slice(0, 300))}</div>`;
+                // 统一使用 addStep 渲染,保持与历史消息一致
+                App.addToolStepIfNew(App._currentBotMsg, doneToolName, evt.arguments || '', 'done', evt.result);
               }
-              const toolEl = document.createElement('div');
-              toolEl.className = 'tool-inline';
-              toolEl.innerHTML = `<div class="tool-label">🔧 ${App.escapeHtml(doneToolName)}</div>` + resultHtml;
-              _insertBeforeAnswer(toolEl);
               _showRail();
             } else {
               // 已有记录,仅更新轨迹状态

@@ -303,7 +303,8 @@ class TaskManager:
             session_id=rec.session_id,
             mode=rec.mode,
         )
-        # 注入取消标志(asyncio.Event),支持 LLM-call 级中断
+        # 修复: agent._cancel_flag 现在被 Agent 真正读取(旧实现写入但从不检查,取消形同虚设)。
+        # 取消后 run_stream 会在节点边界抛出 CancelledError, 由下方 except 捕获并标记 cancelled。
         cancel_event = self._cancel_flags.get(task_id)
         if cancel_event is not None:
             agent._cancel_flag = cancel_event
@@ -319,6 +320,8 @@ class TaskManager:
                 if cancel_flag is not None and cancel_flag.is_set():
                     rec.status = "cancelled"
                     rec.error = "任务已被用户取消"
+                    # 修复: 取消后不再继续消费流, 立即跳出; agent 侧 CancelledError
+                    # 会在下个节点边界抛出, 被下方 except 捕获, 避免空转
                     break
                 total += 1
                 # 累计本次 run_stream 过程中产生的 token 用量(增量模式,避免重复累加)
@@ -342,7 +345,7 @@ class TaskManager:
                     break
         except asyncio.CancelledError:
             rec.status = "cancelled"
-            rec.error = "任务已被用户取消(LLM-call 级中断)"
+            rec.error = "任务已被用户取消(agent 节点边界中断)"
         except Exception as e:  # noqa: BLE001
             rec.error = str(e)[:500]
             rec.status = "failed"
@@ -357,9 +360,9 @@ class TaskManager:
                 from app.memory.session import get_session_store
 
                 store = get_session_store()
-                await store.add_message(rec.session_id, "user", f"[后台任务] {rec.message}")
+                await store.add_message(rec.session_id, "user", content=f"[后台任务] {rec.message}")
                 if rec.answer:
-                    await store.add_message(rec.session_id, "assistant", rec.answer)
+                    await store.add_message(rec.session_id, "assistant", content=rec.answer)
         except Exception:  # noqa: BLE001
             pass
 
@@ -415,12 +418,18 @@ class TaskManager:
         return True
 
     def cleanup_task(self, task_id: str) -> None:
-        """清理任务相关资源(取消标志、队列),防止内存泄漏。"""
+        """清理任务资源(取消标志、队列),防止内存泄漏。
+
+        修复: 旧实现同时 pop 了 _tasks 记录,导致任务完成后:
+        - subscribe() 查 rec 为 None, SSE 订阅者拿不到 task_done 收尾
+        - list() 看不到历史任务
+        - _reload 后内存与磁盘状态不一致
+        现仅清理运行时资源(队列/取消标志), 保留任务记录供查询。
+        """
         with self._lock:
             self._cancel_flags.pop(task_id, None)
             self._queues.pop(task_id, None)
-            # 同时清理内存中的任务记录,防止长时间运行积累
-            self._tasks.pop(task_id, None)
+            # 保留 _tasks 记录(历史可查), 仅清理运行时资源
 
 
 _task_manager: Optional[TaskManager] = None

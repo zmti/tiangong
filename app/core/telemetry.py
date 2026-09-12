@@ -18,13 +18,17 @@ OTLP 导出在导入 SDK 失败/端点异常时静默降级,不影响本地记�
 """
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import json
+import logging
 import os
 import threading
 import time
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 # 当前 Agent 运行 id:LLM/工具埋点据此归属到对应 trace
 _current_run_id: contextvars.ContextVar[str] = contextvars.ContextVar("agent_run_id", default="")
@@ -85,10 +89,6 @@ class Tracer:
         """停止后台清理任务。"""
         if self._cleanup_task:
             self._cleanup_task.cancel()
-            try:
-                asyncio.get_running_loop().run_until_complete(self._cleanup_task)
-            except RuntimeError:
-                pass
             self._cleanup_task = None
             logger.info("Telemetry 后台清理已停止")
 
@@ -211,26 +211,6 @@ class Tracer:
             return otel_trace.get_tracer("agent-service")
         except Exception:  # noqa: BLE001  # SDK 缺失/端点异常,静默降级
             return None
-
-    def record(self, event: dict) -> None:
-        if not settings.agent_tracing_enabled:
-            return
-        event = dict(event)
-        event.setdefault("ts", time.time())
-        event.setdefault("run_id", _current_run_id.get())
-        with self._lock:
-            self._buffer.append(event)
-            if len(self._buffer) > self._max_buffer:
-                self._buffer = self._buffer[-self._max_buffer:]
-            try:
-                self._append_file(event)
-            except Exception:  # noqa: BLE001  写盘失败不影响主流程
-                pass
-        if self._otlp is not None:
-            try:
-                self._export_otlp(event)
-            except Exception:  # noqa: BLE001  OTLP 失败静默
-                pass
 
     def _export_otlp(self, event: dict) -> None:
         """把事件映射为 OTel span 导出。"""

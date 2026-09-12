@@ -253,7 +253,8 @@ def orchestrate_tools(
     from app.core.tool_executor import ToolExecutor
 
     registry = get_registry()
-    executor = ToolExecutor(registry)
+    from app.tools.project_context import get_project_path
+    executor = ToolExecutor(registry, project_path=get_project_path())
 
     async def _tool_exec(tool_name: str, args_str: str) -> str:
         return await executor.execute_tool(tool_name, args_str)

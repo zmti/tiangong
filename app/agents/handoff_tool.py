@@ -97,6 +97,7 @@ async def handoff_to_role(
         system_prompt=role_def.system_prompt,
         session_id=parent.session_id if parent else "",
         temperature=0.4,
+        project_path=getattr(parent, "project_path", "") or "",
     )
     if role_def.tools:
         sub._active_tools = list(role_def.tools)

@@ -42,6 +42,9 @@ terminal_command.txt
 build.log
 backend-debug.log
 backend-full.log
+backend_err.log
+backend_out.log
+backend.pid
 debug_md.html
 nul
 
@@ -57,6 +60,16 @@ desktop/build-work/
 desktop/backend/
 desktop/node_modules/
 desktop/dist/
+desktop/app.asar
+desktop/app.asar.bak2
+desktop/build_app/
+desktop/build_pyinstaller/
+desktop/_asar_bak2/
+desktop/_asar_dist/
+desktop/_asar_tmp/
+desktop/electron_*.log
+# 桌面端调试时常用的临时脚本(以下划线开头), 一律不入库
+desktop/_*.js
 
 dist/
 
