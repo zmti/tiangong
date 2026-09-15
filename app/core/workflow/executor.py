@@ -550,6 +550,15 @@ class WorkflowExecutor:
         """增强型循环节点。"""
         config = node.loop_config or {}
         loop_type = config.get("type", "foreach")
+        # 兼容 UI 里 loop_config.max 字段(前端保存的是 max, 不是 max_iterations)
+        if "max_iterations" not in config and "max" in config:
+            config["max_iterations"] = config["max"]
+        # 兼容 UI 里把子图节点 ID 直接存在 node.subgraph_ids 的情况
+        if not config.get("subgraph_ids") and node.subgraph_ids:
+            config["subgraph_ids"] = node.subgraph_ids
+        # 顺序/并行两种循环模式(loop_mode)映射到 batch_size
+        if node.loop_mode and str(node.loop_mode).lower() == "parallel":
+            config.setdefault("batch_size", len(config.get("subgraph_ids") or [0]) or 10)
 
         # 构建动态边评估器
         evaluator = DynamicEdgeEvaluator(

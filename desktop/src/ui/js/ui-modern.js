@@ -15,15 +15,11 @@ App.UI.Nav = {
   },
   
   bindEvents: function() {
-    // 导航按钮点击
-    document.querySelectorAll('.nav-btn').forEach(btn => {
-      btn.addEventListener('click', () => {
-        const view = btn.dataset.view;
-        if (view) {
-          this.navigate(view);
-        }
-      });
-    });
+    /* 修复"左侧栏点击错乱/白屏": 移除 .nav-btn → navigate 绑定。
+       旧实现把 kb/memory/todo/tools/prompts/schedule 当 tabContent(找 tabKb 等
+       不存在的 id), 且 navigate 无脑隐藏 chatView + 所有 .tab-content →
+       点左侧后主区空白。左侧导航统一交给 renderer.js 的 showView(panelMap)
+       (开右面板 + 保持聊天视图)。 */
 
     // 侧边栏折叠/展开
     const sidebarToggle = document.getElementById('sidebarToggle');
@@ -42,27 +38,36 @@ App.UI.Nav = {
   },
   
   navigate: function(view) {
+    /* 修复白屏 + 让 workflow/projects/briefing 可达: 仅当目标在 .tab-content 中
+       真实存在时才切换 tab 并隐藏 chatView; kb/memory/todo 等无对应 tabContent
+       (它们是右面板 side-content, 由 renderer.showView 处理), 此处直接返回不动主区 */
+    const targetView = document.getElementById('tab' + view.charAt(0).toUpperCase() + view.slice(1));
+    if (!targetView && view !== 'chat') return;
     // 隐藏所有 tab-content
     document.querySelectorAll('.tab-content').forEach(el => {
       el.classList.remove('active');
       el.style.display = 'none';
     });
-    // 隐藏 chat-view
+    // 聊天视图特殊处理
     const chatView = document.getElementById('chatView');
+    if (view === 'chat') {
+      if (chatView) { chatView.style.display = 'flex'; chatView.classList.add('active'); }
+      document.querySelectorAll('.nav-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.view === view);
+      });
+      this.currentView = view;
+      window.dispatchEvent(new CustomEvent('viewChange', { detail: { view } }));
+      return;
+    }
     if (chatView) chatView.style.display = 'none';
-
     // 显示目标视图
-    const targetView = document.getElementById('tab' + view.charAt(0).toUpperCase() + view.slice(1));
     if (targetView) {
       targetView.classList.add('active');
       targetView.style.display = 'flex';
-    }
-    // 聊天视图特殊处理
-    if (view === 'chat') {
-      if (chatView) {
-        chatView.style.display = 'flex';
-        chatView.classList.add('active');
-      }
+      /* 修复"切到工作流/简报/项目后内容不刷新": 触发对应模块加载 */
+      if (view === 'workflow' && App.Workflow && App.Workflow.loadList) App.Workflow.loadList();
+      if (view === 'projects' && App.Projects && App.Projects.load) App.Projects.load();
+      if (view === 'briefing' && App.Briefing && App.Briefing.load) App.Briefing.load();
     }
 
     // 更新导航状态
@@ -258,27 +263,10 @@ App.UI.Panel = {
 };
 
 // ========== 回到顶部按钮 ==========
+// 已在 renderer.js 中实现，避免重复的 scroll 事件监听器
 App.UI.BackToBottom = {
   init: function() {
-    const btn = document.getElementById('backToBottom');
-    if (!btn) return;
-    
-    const messages = document.getElementById('messages');
-    if (!messages) return;
-    
-    messages.addEventListener('scroll', () => {
-      const scrollTop = messages.scrollTop;
-      const scrollHeight = messages.scrollHeight;
-      const clientHeight = messages.clientHeight;
-      
-      // 当滚动超过高度的 80% 时显示按钮
-      const shouldShow = scrollTop + clientHeight < scrollHeight - 300;
-      document.body.classList.toggle('show-back', shouldShow);
-    });
-    
-    btn.addEventListener('click', () => {
-      messages.scrollTo({ top: messages.scrollHeight, behavior: 'smooth' });
-    });
+    // 空函数，实际实现在 renderer.js 中
   }
 };
 

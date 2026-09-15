@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends
@@ -174,6 +175,53 @@ async def _init_tool_route_cache():
         logger.warning("工具路由缓存初始化失败(不影响主服务): %s", e)
 
 
+async def _init_workflow_schedules():
+    """启动工作流定时调度后台循环"""
+    try:
+        from app.api.workflow import _schedules, _load_workflow, _ensure_executor
+        from app.core.workflow.db import get_db
+        import asyncio
+
+        async def _schedule_runner():
+            while True:
+                try:
+                    now = time.time()
+                    for sched_id, sched in list(_schedules.items()):
+                        if not sched.get("enabled", True):
+                            continue
+                        next_run = sched.get("next_run_at", 0)
+                        if next_run and now >= next_run:
+                            wf_id = sched["workflow_id"]
+                            wf = _load_workflow(wf_id)
+                            if wf:
+                                executor = _ensure_executor(wf_id)
+                                run_id = f"run_{int(now * 1000)}_{uuid.uuid4().hex[:6]}"
+                                await executor.run(
+                                    wf, sched.get("inputs", {}),
+                                    run_id=run_id, session_id=sched.get("session_id", "default"),
+                                )
+                                logger.info(f"定时调度执行完成: {sched_id} -> {wf_id}")
+                            # 计算下次运行时间
+                            try:
+                                from croniter import croniter
+                                import datetime
+                                cron = croniter(sched["cron_expr"], datetime.datetime.now())
+                                next_run_ts = cron.get_next(datetime.datetime).timestamp()
+                                _schedules[sched_id]["next_run_at"] = next_run_ts
+                                get_db().update_schedule(sched_id, next_run_at=next_run_ts,
+                                                        last_run_at=now)
+                            except Exception as e2:
+                                logger.warning(f"调度时间计算失败 {sched_id}: {e2}")
+                except Exception as e:
+                    logger.warning(f"调度循环异常: {e}")
+                await asyncio.sleep(10)  # 每10秒检查一次
+
+        asyncio.get_running_loop().create_task(_schedule_runner())
+        logger.info("工作流调度器已启动")
+    except Exception as e:
+        logger.warning("工作流调度器启动失败(不影响主服务): %s", e)
+
+
 # ===== 停止函数定义 =====
 
 async def _stop_webhook_queue():
@@ -225,6 +273,7 @@ async def _startup():
     await _init_mcp()
     await _init_long_running()
     await _init_tool_route_cache()
+    await _init_workflow_schedules()
 
 
 async def _shutdown():

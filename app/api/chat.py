@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from app.core.agent import Agent
 from app.core.llm import LLMClient, LLMError
+from app.core.telemetry import tracer
 from app.config import settings
 from app.memory.session import get_session_store
 from app.tools.registry import get_registry
@@ -325,48 +326,158 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
         history = await _store().get_history(req.session_id)
 
     async def event_gen():
+        """SSE 流式生成器。
+
+        关键设计:agent 作为独立后台任务运行,与 SSE 连接解耦。
+        客户端断开(超时/手动停止)后,agent 继续执行并保存结果到数据库。
+        用户稍后刷新会话即可看到完整回复。
+        """
+        q: asyncio.Queue = asyncio.Queue(maxsize=10000)
         full_answer: list[str] = []
         thinking_events: list[dict] = []
-        guardrail_overwrite: Optional[dict] = None  # 流式场景下护栏拦截的替换文本
-        user_saved = False
+        guardrail_overwrite: Optional[dict] = None
+        assistant_msg_id: Optional[str] = None
+        token_count = 0
+
+        def _fire_save(sid: str, msg_id: str, content: str):
+            """fire-and-forget: 后台更新消息内容。"""
+            async def _do():
+                try:
+                    await _store().update_message(sid, msg_id, content=content)
+                except Exception:
+                    pass
+            asyncio.create_task(_do())
+
+        async def _bg_agent_run():
+            """独立后台任务:运行 agent,所有事件写入队列。客户端断开后此任务继续。
+
+            注意:不使用 _stream_with_heartbeat,心跳由 SSE consumer 自己处理。
+            避免双层队列+yield 导致的死锁风险。
+            """
+            nonlocal assistant_msg_id, guardrail_overwrite
+            import logging as _log
+            _log.getLogger("chat").info("[bg_agent] start session=%s", req.session_id)
+            try:
+                async for event in agent.run_stream(injected_message, history=history):
+                    try:
+                        q.put_nowait(event)
+                    except asyncio.QueueFull:
+                        try:
+                            q.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                        q.put_nowait(event)
+            except Exception as exc:
+                _log.getLogger("chat").warning("[bg_agent] error: %s", exc)
+                _friendly = _friendly_llm_error(str(exc))
+                try:
+                    q.put_nowait({"type": "error", "message": _friendly})
+                except asyncio.QueueFull:
+                    pass
+                # 确保异常时也发送 done 事件,防止前端永远等待
+                try:
+                    q.put_nowait({"type": "done", "model": "", "steps": []})
+                except asyncio.QueueFull:
+                    pass
+            finally:
+                try:
+                    q.put_nowait(None)
+                except asyncio.QueueFull:
+                    pass
+                _log.getLogger("chat").info("[bg_agent] done session=%s", req.session_id)
+
+        async def _heartbeat_loop():
+            """后台心跳:每 30 秒向队列写入心跳事件,保持 SSE 连接活跃。
+
+            agent 执行期间(工具调用、LLM 等待)可能长时间无事件输出,
+            导致代理/Nginx 的 read timeout 关闭连接。心跳解决此问题。
+            """
+            try:
+                while True:
+                    await asyncio.sleep(30)
+                    try:
+                        q.put_nowait({"type": "heartbeat"})
+                    except asyncio.QueueFull:
+                        pass
+            except asyncio.CancelledError:
+                pass
+
         injected_message, mm_parts = await _prepare_attachments(req, req.message)
         agent.with_multimodal(mm_parts)
+        heartbeat_task = None
         try:
-            # 先保存用户消息(即使后续中断也能保留)
             await _store().add_message(req.session_id, "user", content=req.message)
-            user_saved = True
-            async for event in _stream_with_heartbeat(agent.run_stream(injected_message, history=history)):
-                if event["type"] == "token":
-                    full_answer.append(event["content"])
+
+            # 启动独立后台 agent 任务(不绑定 SSE 连接生命周期)
+            agent_task = asyncio.create_task(_bg_agent_run())
+            # 后台心跳:agent 执行期间每 30 秒向队列写入心跳,防止代理/Nginx read timeout 断连
+            heartbeat_task = asyncio.create_task(_heartbeat_loop())
+
+            # SSE 消费循环:从队列读事件并 yield 给客户端
+            # 客户端断开后此循环停止,但 agent_task 继续运行
+            import logging as _log
+            _log.getLogger("chat").info("[sse_consumer] start session=%s", req.session_id)
+            tracer.record({"type": "sse_start", "session_id": req.session_id})
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=60)
+                except asyncio.TimeoutError:
+                    yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
+                    continue
+                if event is None:
+                    tracer.record({"type": "sse_end", "session_id": req.session_id, "reason": "agent_done"})
+                    break
+
+                evt_type = event.get("type", "")
+                tracer.record({"type": "sse_evt", "session_id": req.session_id, "evt_type": evt_type, "qsize": q.qsize()})
+                if evt_type == "token":
+                    full_answer.append(event.get("content", ""))
+                    token_count += 1
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                elif event["type"] == "plan":
-                    # plan 实时保存
-                    await _store().add_message(
-                        req.session_id, "plan",
-                        content=json.dumps(event.get("plan"), ensure_ascii=False),
-                    )
-                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                elif event["type"] == "thinking":
+                    # 实时保存: 每 80 个 token 后台更新
+                    if assistant_msg_id and token_count % 80 == 0:
+                        _fire_save(req.session_id, assistant_msg_id,
+                                   _strip_thinking("".join(full_answer)))
+                    elif assistant_msg_id is None and token_count == 1:
+                        # 首次 token:后台创建消息拿 msg_id
+                        async def _create_msg():
+                            nonlocal assistant_msg_id
+                            try:
+                                r = await _store().add_message(
+                                    req.session_id, "assistant",
+                                    content=_strip_thinking("".join(full_answer)),
+                                )
+                                assistant_msg_id = r["messages"][-1]["id"]
+                            except Exception:
+                                pass
+                        asyncio.create_task(_create_msg())
+                elif evt_type == "thinking":
                     thinking_events.append(event)
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                elif event["type"] in ("tool", "confirmation", "tool_start", "tool_done", "tool_chunk", "tool_call_start"):
-                    if event["type"] == "tool":
-                        # tool 结果实时保存(不再依赖 finally)
-                        await _store().add_message(
-                            req.session_id, "tool",
-                            content=json.dumps(
-                                {"name": event.get("name", ""), "arguments": event.get("arguments", ""), "result": event.get("result", "")},
-                                ensure_ascii=False,
-                            ),
-                        )
-                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                elif event["type"] == "guardrail_overwrite":
-                    # 护栏拦截: 前端应清除已渲染正文, 用替换文本覆盖
+                elif evt_type == "guardrail_overwrite":
                     guardrail_overwrite = event
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-                else:  # done
+                else:
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-            # 流正常结束:保存 assistant 回复(护栏拦截时存脱敏替换文本)
+
+            # agent 正常完成:等待创建任务,做最终保存
+            # (agent 异常/取消由 finally 处理)
+        except Exception as _err:
+            import logging as _lg
+            _lg.getLogger(__name__).warning('[event_gen] stream error: %s', _err)
+            try:
+                await _store().add_message(req.session_id, "error", content=f"流处理异常: {_err}")
+            except Exception:
+                pass
+        finally:
+            # 停止后台心跳任务
+            if heartbeat_task and not heartbeat_task.done():
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+            # 最终保存 assistant 回复
             answer_to_store = "".join(full_answer)
             if guardrail_overwrite is not None:
                 answer_to_store = guardrail_overwrite.get("content", "")
@@ -378,25 +489,20 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                         meta["thinking"] = "\n".join(thinking_texts)
                 if guardrail_overwrite is not None:
                     meta["guardrail"] = guardrail_overwrite
-                await _store().add_message(
-                    req.session_id, "assistant",
-                    content=_strip_thinking(answer_to_store),
-                    meta=meta if meta else None,
-                )
-        except LLMError as e:
-            err_msg = _friendly_llm_error(str(e))
-            yield f"data: {json.dumps({'type': 'error', 'message': err_msg}, ensure_ascii=False)}\n\n"
-            try:
-                await _store().add_message(req.session_id, "error", content=err_msg)
-            except Exception:
-                pass
-        except Exception as _err:
-            import logging as _lg
-            _lg.getLogger(__name__).warning('[event_gen] stream error: %s', _err)
-            try:
-                await _store().add_message(req.session_id, "error", content=f"流处理异常: {_err}")
-            except Exception:
-                pass
+                final_content = _strip_thinking(answer_to_store)
+                try:
+                    if assistant_msg_id is not None:
+                        await _store().update_message(
+                            req.session_id, assistant_msg_id,
+                            content=final_content, meta=meta if meta else None,
+                        )
+                    else:
+                        await _store().add_message(
+                            req.session_id, "assistant",
+                            content=final_content, meta=meta if meta else None,
+                        )
+                except Exception:
+                    pass
 
     return StreamingResponse(
         event_gen(),

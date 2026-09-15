@@ -111,9 +111,15 @@ function renderMarkdown(md) {
     let cleaned = text.replace(/<thinking[\s\S]*?<\/thinking>/gi, '').trim();
     // 也剥离无对应关闭标签的残留 open/close tag
     cleaned = cleaned.replace(/<thinking[^>]*>/gi, '').replace(/<\/thinking>/gi, '').trim();
+    // 剥离 LLM 输出的 summary/details 等 HTML 标签(不渲染)
+    cleaned = cleaned.replace(/<\/?summary[^>]*>/gi, '')
+      .replace(/<\/?details[^>]*>/gi, '')
+      .replace(/<detailsopen>/gi, '')
+      .replace(/<detailsclosed>/gi, '')
+      .trim();
     // thinking 块被移除后通常会前后各留一个空行, 先合并多余的空行(4+ → 2)
     cleaned = cleaned.replace(/\n[ \t]*\n[ \t]*\n[ \t]*\n+/g, '\n\n');
-    // 然后清理行首行尾空白 + 合并重复空行
+    // 合并行首行尾空白
     cleaned = cleaned.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
     const lines = cleaned.replace(/\r\n/g, '\n').split('\n');
     let html = '';
@@ -151,10 +157,19 @@ function renderMarkdown(md) {
     }
 
     let i = 0;
+    let paraBuf = [];  // 收集连续段落行,GFM 软换行合并为一个 <p>
+
+    function flushPara() {
+      if (!paraBuf.length) return;
+      const text = paraBuf.join(' ');
+      paraBuf = [];
+      html += `<p>${renderInline(text)}</p>`;
+    }
+
     while (i < lines.length) {
       const line = lines[i].replace(/\s+$/, '');
       if (line.startsWith('```')) {
-        flushList();
+        flushPara(); flushList();
         if (!inCode) {
           inCode = true;
           codeLang = line.slice(3).trim();
@@ -170,30 +185,33 @@ function renderMarkdown(md) {
       if (inCode) { codeBuf.push(line); i++; continue; }
 
       if (/^\s{0,3}#{1,6}\s/.test(line)) {
-        flushList();
+        flushPara(); flushList();
         const level = line.match(/^#{1,6}/)[0].length;
         html += `<h${level}>${renderInline(line.replace(/^#{1,6}\s+/, ''))}</h${level}>`;
       } else if (/^\s*[-*+]\s+/.test(line)) {
+        flushPara();
         listType = 'ul';
         listBuf.push(line.replace(/^\s*[-*+]\s+/, ''));
       } else if (/^\s*\d+[.)]\s+/.test(line)) {
+        flushPara();
         listType = 'ol';
         listBuf.push(line.replace(/^\s*\d+[.)]\s+/, ''));
       } else if (/^\s*>\s?/.test(line)) {
-        flushList();
+        flushPara(); flushList();
         html += `<blockquote>${renderInline(line.replace(/^\s*>\s?/, ''))}</blockquote>`;
       } else if (/^\s*---+\s*$/.test(line)) {
-        flushList();
+        flushPara(); flushList();
         html += '<hr>';
       } else if (line.trim() === '') {
-        flushList();
+        flushPara(); flushList();
       } else {
         flushList();
-        html += `<p>${renderInline(line)}</p>`;
+        // GFM 软换行: 连续非空行合并为一个段落
+        paraBuf.push(line);
       }
       i++;
     }
-    flushList();
+    flushPara(); flushList();
     if (inCode) flushCodeBlock();
     return html;
   }

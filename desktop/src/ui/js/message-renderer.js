@@ -100,16 +100,47 @@
     return 'text';
   }
 
+  // ── 结果内容预处理:还原 JSON 字符串中的转义字符 ──
+  function unescapeResult(text) {
+    if (!text) return '';
+    let s = String(text);
+    // 尝试 JSON 解析:如果整个结果是 JSON 字符串，先解析还原
+    try {
+      const parsed = JSON.parse(s);
+      if (typeof parsed === 'string') {
+        s = parsed; // JSON.parse 已自动还原 \n \t \" 等
+      } else if (parsed && typeof parsed === 'object' && parsed.content) {
+        // 结果是对象且包含 content 字段:直接使用 content 并还原转义
+        s = String(parsed.content);
+      }
+    } catch (_) {
+      // 非 JSON:手动还原常见转义序列
+      s = s.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\'/g, "'");
+    }
+    return s;
+  }
+
   // ── 渲染结果内容 ──
   function renderResultContent(result, type) {
     if (!result) return '';
     if (type === 'json') {
+      // 先尝试还原转义再高亮
+      const unescaped = unescapeResult(result);
+      // 如果还原后包含换行,说明是多行内容,用代码块展示
+      if (unescaped.includes('\n') && unescaped.split('\n').length > 3) {
+        return `<pre class="step-result-pre">${esc(unescaped)}</pre>`;
+      }
       return highlightJson(result);
     }
     if (type === 'html') {
       return renderHtmlPreview(result);
     }
-    return esc(result);
+    // 纯文本:先还原转义
+    const unescaped = unescapeResult(result);
+    if (unescaped.includes('\n') && unescaped.split('\n').length > 3) {
+      return `<pre class="step-result-pre">${esc(unescaped)}</pre>`;
+    }
+    return esc(unescaped);
   }
 
   // ── 消息包装 ──
@@ -234,7 +265,9 @@
     content.appendChild(answer);
     wrap._answer = answer;
 
-    // 操作按钮
+    // 操作按钮（放在 answer-doc 外部，用 CSS 让背景延伸覆盖）
+    const footer = document.createElement('div');
+    footer.className = 'msg-footer';
     const actions = document.createElement('div');
     actions.className = 'msg-actions';
     actions.appendChild(createActionBtn('复制', '复制回答', async (btn) => {
@@ -255,7 +288,9 @@
       const txt = (answer.textContent || '').trim();
       if (txt && App.speak) App.speak(txt);
     }));
-    content.appendChild(actions);
+    footer.appendChild(actions);
+    footer.appendChild(createTime());
+    content.appendChild(footer);
 
     wrap.appendChild(content);
     App.els.messages.appendChild(wrap);
@@ -264,7 +299,7 @@
   }
 
   function scrollBottom() {
-    App.els.messages.scrollTop = App.els.messages.scrollHeight;
+    App.scrollMessagesToBottom();
   }
 
   function createTime() {
@@ -447,8 +482,17 @@
     if (!wrap || !wrap._thinkingBody) return;
     wrap._thinkingSection.style.display = 'block';
     const body = wrap._thinkingBody;
+    // Strip thinking tags from content
+    let cleanContent = content || '';
+    if (App.stripThinkingTags) {
+      cleanContent = App.stripThinkingTags(cleanContent);
+    } else {
+      cleanContent = cleanContent.replace(/<thinking[\s\S]*?<\/thinking>/gi, '')
+        .replace(/<\/?thinking[^>]*>/gi, '').trim();
+    }
+    if (!cleanContent.trim()) return;
     const text = body.textContent;
-    body.textContent = text + (text ? '\n' : '') + content;
+    body.textContent = text + (text ? '\n' : '') + cleanContent;
     // 修复: open类应加在section上，CSS选择器是 .thinking-section.open .thinking-body
     wrap._thinkingSection.classList.add('open');
     if (wrap._railSummary) {

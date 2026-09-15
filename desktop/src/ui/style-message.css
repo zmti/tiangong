@@ -8,17 +8,24 @@
   align-items: flex-start;
   gap: 12px;
   margin: 0 0 8px;
-  max-width: 860px;
+  max-width: 100%;
   word-break: break-word;
   position: relative;
+}
+/* 动画仅对非历史消息启用 */
+.msg:not(.no-animation) {
   animation: msgSlideIn 0.25s cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 @keyframes msgSlideIn {
   from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: translateY(0); }
 }
-.msg.user { flex-direction: row-reverse; margin-left: auto; }
-.msg.bot { margin-right: auto; }
+/* 批量加载历史消息时禁用动画 */
+.msg.no-animation {
+  animation: none !important;
+}
+.msg.user, .msg.msg-user { flex-direction: row-reverse; margin-left: auto; max-width: 100%; }
+.msg.bot, .msg.msg-bot { margin-right: auto; max-width: 100%; }
 
 .avatar {
   flex: 0 0 36px; width: 36px; height: 36px;
@@ -32,30 +39,40 @@
 
 .msg-content {
   display: flex; flex-direction: column;
-  min-width: 0; max-width: 100%; gap: 4px; flex: 1; /* P1-7: 1px → 4px 网格 */
+  min-width: 0; max-width: 100%; gap: 0; flex: 1;
+}
+
+/* 用户消息：背景色放在 msg-content 上，让 footer 自然包含在内 */
+.msg.user .msg-content, .msg.msg-user .msg-content {
+  background: var(--msg-user); color: var(--text);
+  border: 1px solid var(--msg-user-border);
+  border-radius: var(--radius) var(--radius) 4px var(--radius);
+  padding: 10px 14px 6px;
+  box-shadow: var(--msg-shadow);
+}
+/* 机器人消息：背景色放在 msg-content 上 */
+.msg.bot .msg-content, .msg.msg-bot .msg-content {
+  border: 1px solid var(--msg-card-border); background: var(--msg-card);
+  border-radius: var(--radius) var(--radius) var(--radius) 4px;
+  padding: 10px 14px 6px;
+  box-shadow: var(--msg-shadow);
 }
 
 .answer-doc {
   min-width: 0; max-width: 100%;
-  padding: 10px 14px; border-radius: var(--radius);
   line-height: 1.6; font-size: 14px;
-  /* P0-1: 用主题感知的卡片令牌(深浅各定义), 不再依赖 --surface-card(深色下与 --bg 同色会"消失") */
-  border: 1px solid var(--msg-card-border); background: var(--msg-card);
-  box-shadow: var(--msg-shadow);
   word-break: break-word;
+  overflow-wrap: break-word;
 }
-.msg.user .answer-doc {
-  background: var(--msg-user); color: #fff;
-  border-radius: var(--radius) var(--radius) 4px var(--radius);
-  border: 1px solid var(--msg-user-border);
-}
-.msg.bot .answer-doc { border-radius: var(--radius) var(--radius) var(--radius) 4px; }
+.msg.user .answer-doc, .msg.msg-user .answer-doc { color: var(--text); }
+.msg.bot .answer-doc, .msg.msg-bot .answer-doc { color: var(--text); }
 
 /* P1-5: 10.5 → 11, 11.5 → 12 */
 .msg-header {
   display: flex; align-items: center; gap: 6px; padding: 0;
 }
-.msg-time { font-size: 11px; color: var(--muted); font-family: var(--mono); margin-left: auto; }
+.msg-time { font-size: 11px; color: var(--muted); font-family: var(--mono); margin-left: auto; white-space: nowrap; }
+.msg.user .msg-time, .msg.msg-user .msg-time { color: var(--muted); }
 
 .process-rail {
   display: none; align-items: center; gap: 4px;
@@ -73,7 +90,7 @@
 .thinking-section {
   border-left: 2px solid var(--primary);
   padding: 0 0 0 8px;
-  margin: 0;
+  margin: 4px 0;
   background: transparent;
 }
 .thinking-label {
@@ -82,6 +99,7 @@
   font-size: 11px; font-weight: 600; color: var(--primary);
   cursor: pointer; border-radius: var(--radius-sm);
   transition: background 0.15s;
+  user-select: none;
 }
 .thinking-label:hover { background: var(--primary-soft); }
 .thinking-label::after {
@@ -97,14 +115,17 @@
 .thinking-body {
   padding: 4px 4px 4px 8px; font-size: 12px; color: var(--text-secondary);
   line-height: 1.5; white-space: pre-wrap; word-break: break-word;
-  max-height: 160px; overflow-y: auto; display: none;
+  max-height: 200px; overflow-y: auto; display: none;
+  background: var(--bg-elev);
+  border-radius: var(--radius-sm);
+  margin-top: 2px;
 }
 .thinking-section.open .thinking-body { display: block; }
 
 .msg-actions {
   display: flex; align-items: center; gap: 2px; padding: 0;
 }
-.msg.user .msg-actions { justify-content: flex-end; }
+.msg.user .msg-actions, .msg.msg-user .msg-actions { justify-content: flex-end; }
 .msg-action {
   font-size: 11px; background: var(--bg-elev);
   border: 1px solid var(--border); border-radius: var(--radius-sm);
@@ -118,6 +139,7 @@
 .msg-footer {
   display: flex; align-items: center; justify-content: flex-end;
   gap: 2px; padding: 0;
+  margin-top: 4px;
 }
 
 /* ── 执行步骤区域 ── */
@@ -139,7 +161,7 @@
 .steps-flow {
   display: flex;
   flex-direction: column;
-  gap: 1px;
+  gap: 2px;
   padding: 0;
   max-height: 400px;
   overflow-y: auto;
@@ -157,6 +179,11 @@
   cursor: pointer;
   transition: background 0.12s;
   user-select: none;
+  border-bottom: 1px solid var(--border);
+}
+
+.step-row:last-child {
+  border-bottom: none;
 }
 
 .step-row:hover {
@@ -172,6 +199,7 @@
 .step-row.step-done {
   border-left: 2px solid var(--ok);
   padding-left: 6px;
+  background: var(--ok-soft);
 }
 
 .step-row.step-fail {
@@ -185,24 +213,29 @@
 }
 
 .step-row::after {
-  content: '▸';
-  font-size: 12px;
-  color: var(--muted);
+  content: '▸ 展开';
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--primary);
   margin-left: auto;
-  padding-left: 4px;
+  padding: 2px 8px;
   flex-shrink: 0;
-  transition: transform 0.15s, color 0.15s;
+  transition: all 0.15s;
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  white-space: nowrap;
 }
 .step-row:hover::after {
-  color: var(--text);
+  background: var(--primary-soft);
+  border-color: var(--primary-border);
+  color: var(--primary);
 }
 .step-row.step-open::after {
-  transform: rotate(90deg);
+  content: '▾ 收起';
 }
 .step-row.step-running::after,
 .step-row.step-fail::after {
-  display: inline;
-  opacity: 0.4;
+  opacity: 1;
 }
 
 .step-num {
@@ -355,4 +388,36 @@
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   background: var(--bg-elev);
+}
+
+/* ── 工具结果多行文本预格式化 ── */
+.step-result-pre {
+  margin: 0;
+  padding: 8px 10px;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  max-height: 240px;
+  overflow-y: auto;
+  color: var(--text);
+}
+.step-result-pre::-webkit-scrollbar { width: 4px; }
+.step-result-pre::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+/* ── 思考与工具步骤视觉分隔 ── */
+.thinking-section + .step-counter,
+.thinking-section + .steps-flow {
+  margin-top: 6px;
+}
+.steps-flow {
+  border-top: 1px solid var(--divider);
+  padding-top: 4px;
+}
+.step-row:first-child {
+  margin-top: 0;
 }

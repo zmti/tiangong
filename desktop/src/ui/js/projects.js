@@ -3,16 +3,24 @@
   'use strict';
 
   const $ = (sel, ctx) => (ctx || document).querySelector(sel);
-  const api = () => window.App?.api;
-
+  /* 修复"项目管理不可用": 旧实现调 GET /v1/projects + 裸 fetch 不带鉴权,
+     但后端 project.py 路由前缀是 /v1/project(单数), 列表端点是 /v1/project/list,
+     返回 {"projects":[...]} 而非裸数组 → 旧代码 404/解析失败 → 永远空态。
+     现改走 App.apiJSON(带 Authorization) + 正确端点 + 正确字段。 */
   async function loadProjects() {
     try {
-      const resp = await api()('/v1/projects');
-      if (!resp || !resp.ok) {
-        showEmptyState();
-        return;
+      const res = window.App?.apiJSON ? await window.App.apiJSON('/v1/project/list') : null;
+      let projects = [];
+      if (res && res.success) {
+        projects = res.data?.projects || [];
+      } else {
+        /* 后端可能未启动该路由, 回退到旧 /v1/projects(兼容) */
+        const resp = await window.App?.api?.('/v1/projects');
+        if (resp && resp.ok) {
+          const data = await resp.json();
+          projects = Array.isArray(data) ? data : (data.projects || []);
+        }
       }
-      const projects = await resp.json();
       renderProjects(projects);
     } catch (e) {
       console.error('[projects] Failed to load:', e);
@@ -101,14 +109,31 @@
 
   async function createProject(name) {
     try {
-      const resp = await api()('/v1/projects', {
+      /* 修复: 后端是 /v1/project/switch(单数), 旧调 /v1/projects POST 404 */
+      const resp = await window.App?.api?.('/v1/project/switch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name })
+        body: JSON.stringify({ path: name })
       });
       if (resp && resp.ok) {
-        loadProjects();
-        if (window.App?.toast) window.App.toast('项目创建成功', 'ok');
+        const data = await resp.json();
+        if (data.ok) {
+          loadProjects();
+          if (window.App?.toast) window.App.toast('项目创建成功', 'ok');
+        } else {
+          if (window.App?.toast) window.App.toast(data.error || '创建失败', 'err');
+        }
+      } else {
+        /* 回退旧端点 */
+        const r2 = await window.App?.api?.('/v1/projects', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name })
+        });
+        if (r2 && r2.ok) {
+          loadProjects();
+          if (window.App?.toast) window.App.toast('项目创建成功', 'ok');
+        }
       }
     } catch (e) {
       console.error('[projects] Failed to create:', e);

@@ -1107,3 +1107,105 @@ def test_mode_ensemble_runs_multiple_models_and_judges(monkeypatch):
         assert any(s["type"] == "ensemble_judge" for s in result.steps)
     finally:
         settings.agent_ensemble_max = old_max
+
+
+def test_sanitize_history_for_llm():
+    """sanitize_history_for_llm 必须把自定义角色/孤立 tool 消息降级为 user,
+    保留合法 tool_call 配对。"""
+    from app.memory.session import sanitize_history_for_llm
+
+    history = [
+        {"role": "user", "content": "你好"},
+        {"role": "error", "content": "连接失败", "kind": "error", "id": "x", "timestamp": 1},
+        {"role": "plan", "content": "步骤..."},
+        {"role": "tool", "content": '{"name": "read_file", "result": "ok"}'},  # 孤立 tool
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_9", "type": "function", "function": {"name": "add", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "call_9", "content": "5"},  # 合法 tool
+    ]
+    out = sanitize_history_for_llm(history)
+    assert out[0] == {"role": "user", "content": "你好"}
+    # error → user, 剥掉 kind/id/timestamp
+    assert out[1]["role"] == "user"
+    assert "kind" not in out[1] and "timestamp" not in out[1]
+    # plan → user
+    assert out[2]["role"] == "user"
+    # 孤立 tool → user + 前缀
+    assert out[3]["role"] == "user"
+    assert out[3]["content"].startswith("[工具")
+    # 合法 assistant.tool_calls 保留
+    assert out[4]["role"] == "assistant" and out[4]["tool_calls"][0]["id"] == "call_9"
+    # 合法 tool 保留 tool_call_id
+    assert out[5]["role"] == "tool" and out[5]["tool_call_id"] == "call_9"
+
+
+def test_build_messages_sanitizes_invalid_roles():
+    """历史里的自定义角色(error/plan)和无 tool_call_id 的 tool 消息必须降级为 user,
+    避免 OpenAI 网关 400 (unknown variant 'error' / missing field 'tool_call_id')。"""
+    reg = make_registry()
+    mock = MockLLM(["好的"])
+
+    class CaptureLLM(MockLLM):
+        async def chat(self, messages, temperature=0.7):
+            self.captured_messages = list(messages)
+            return "好的"
+
+    cap = CaptureLLM(["好的"])
+    agent = Agent(llm=cap, registry=reg, max_steps=2)
+    history = [
+        {"role": "user", "content": "你好"},
+        {"role": "assistant", "content": "你好"},
+        {"role": "error", "content": "连接失败"},
+        {"role": "plan", "content": "计划...", "kind": "plan"},
+        {"role": "tool", "content": json.dumps({"name": "read_file", "result": "ok"})},
+        {"role": "assistant", "content": "完成"},
+    ]
+    __import__("asyncio").run(agent.run("测试", history=history))
+
+    msgs = cap.captured_messages
+    # 所有消息的 role 必须都是 OpenAI 合法角色
+    for m in msgs:
+        assert m["role"] in ("system", "user", "assistant", "tool", "function", "developer"), \
+            f"非法角色残留: {m['role']}"
+    # 没有孤立 tool 消息(缺 tool_call_id 的必须已降级)
+    for m in msgs:
+        if m["role"] == "tool":
+            assert m.get("tool_call_id"), "tool 消息缺 tool_call_id"
+    # error/plan 角色已降级为 user
+    assert not any(m["role"] in ("error", "plan") for m in msgs)
+    # 剥掉了 kind/timestamp/meta 等非 OpenAI 字段
+    for m in msgs:
+        assert "kind" not in m, f"非 OpenAI 字段残留: {list(m.keys())}"
+        assert "timestamp" not in m
+
+
+def test_build_messages_preserves_valid_tool_calls():
+    """带合法 tool_call_id 且前面有 assistant.tool_calls 的 tool 消息必须保留。"""
+    reg = make_registry()
+
+    class CaptureLLM(MockLLM):
+        async def chat(self, messages, temperature=0.7):
+            self.captured_messages = list(messages)
+            return "好的"
+
+    cap = CaptureLLM(["好的"])
+    agent = Agent(llm=cap, registry=reg, max_steps=2)
+    history = [
+        {"role": "user", "content": "加一下"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "add", "arguments": "{}"}}],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "5"},
+    ]
+    __import__("asyncio").run(agent.run("继续", history=history))
+
+    msgs = cap.captured_messages
+    # 合法的 tool 消息应保留 tool_call_id
+    tool_msgs = [m for m in msgs if m["role"] == "tool"]
+    assert any(m.get("tool_call_id") == "call_1" for m in tool_msgs), "合法 tool 消息被误降级"
+

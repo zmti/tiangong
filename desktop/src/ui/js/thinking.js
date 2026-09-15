@@ -14,8 +14,10 @@
     // 如果是带 _answer 属性的对象，取 _answer 元素
     const el = wrap._answer || wrap;
     if (el && el.nodeType === 1) {
+      // 新结构: .answer-doc 在 .msg-content 内,不在 messages 直接子级
+      if (el.classList && el.classList.contains('answer-doc')) return el;
       const doc = el.querySelector ? el.querySelector('.answer-doc') : null;
-      if (doc && doc.parentNode === App.els.messages) return doc;
+      if (doc) return doc;
       if (el.parentNode === App.els.messages) return el;
     }
     return null;
@@ -48,7 +50,7 @@
     }
     const body = App._thinkingWrap.querySelector('.think-body');
     body.textContent = App.stripThinkingTags(content).slice(0, 2000);
-    App.els.messages.scrollTop = App.els.messages.scrollHeight;
+    App.scrollMessagesToBottom();
     return App._thinkingWrap;
   }
 
@@ -84,7 +86,7 @@
         App.els.messages.appendChild(div);
       }
     }
-    App.els.messages.scrollTop = App.els.messages.scrollHeight;
+    App.scrollMessagesToBottom();
     return div;
   }
 

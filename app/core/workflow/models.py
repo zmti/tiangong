@@ -87,6 +87,9 @@ class WorkflowNode:
     # 输出 schema 校验
     output_schema: Optional[dict] = None
 
+    # 设计器手动排版位置(持久化,供前端恢复节点摆放)
+    position: Optional[dict] = None  # {"x": float, "y": float}
+
     # 运行时状态
     status: NodeStatus = NodeStatus.PENDING
     result: Any = None

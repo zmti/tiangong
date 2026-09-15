@@ -32,9 +32,14 @@ async def summarize_messages_async(llm, messages: list[dict], max_chars: Optiona
     clipped = []
     for m in messages:
         content = str(m.get("content", ""))
-        if m.get("role") in ("tool", "error"):
+        # 修复: 自定义角色(error/plan 等)与孤立 tool 消息不进摘要 LLM
+        role = m.get("role", "")
+        if role in ("tool", "error"):
             continue
-        clipped.append({"role": m.get("role", "user"), "content": content[: settings.message_char_cap]})
+        if not str(content).strip():
+            continue
+        llm_role = role if role in ("system", "user", "assistant", "tool", "function", "developer") else "user"
+        clipped.append({"role": llm_role, "content": content[: settings.message_char_cap]})
     if not clipped:
         return ""
 

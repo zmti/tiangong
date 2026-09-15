@@ -25,11 +25,8 @@
         wrap.style.display = 'none';
       }
       const avatar = makeAvatar(type);
-      const rail = document.createElement('div');
-      rail.className = 'process-rail';
-      rail.innerHTML = '<span class="rail-summary">⚙ 已完成</span>';
-      rail.title = '点击展开过程';
-      rail.addEventListener('click', () => rail.classList.toggle('open'));
+      const content = document.createElement('div');
+      content.className = 'msg-content';
       const answer = document.createElement('div');
       answer.className = 'answer-doc';
       if (type === 'bot') {
@@ -38,6 +35,8 @@
       } else {
         answer.textContent = text;
       }
+      const footer = document.createElement('div');
+      footer.className = 'msg-footer';
       const act = document.createElement('div');
       act.className = 'msg-actions';
       const timeEl = document.createElement('div');
@@ -78,16 +77,14 @@
         mk('编辑这条消息并重新发送', '编辑', () => { if (App.Chat) App.Chat.editMessage(wrap, answer); });
       }
 
+      footer.appendChild(act);
+      footer.appendChild(timeEl);
+      content.appendChild(footer);
+      content.appendChild(answer);
       wrap.appendChild(avatar);
-      const body = document.createElement('div');
-      body.className = 'msg-body';
-      body.appendChild(rail);
-      body.appendChild(answer);
-      body.appendChild(act);
-      body.appendChild(timeEl);
-      wrap.appendChild(body);
+      wrap.appendChild(content);
       App.els.messages.appendChild(wrap);
-      App.els.messages.scrollTop = App.els.messages.scrollHeight;
+      App.scrollMessagesToBottom();
       if (type === 'user') App.refreshWelcomePage();
       if (answer) answer._wrap = wrap;
       return answer;
@@ -99,7 +96,7 @@
       el.className = 'msg error';
       el.textContent = text || '';
       App.els.messages.appendChild(el);
-      App.els.messages.scrollTop = App.els.messages.scrollHeight;
+      App.scrollMessagesToBottom();
       return el;
     }
     if (type === 'system') {
@@ -107,7 +104,7 @@
       el.className = 'msg system';
       el.textContent = text || '';
       App.els.messages.appendChild(el);
-      App.els.messages.scrollTop = App.els.messages.scrollHeight;
+      App.scrollMessagesToBottom();
       return el;
     }
     // thinking / tool / plan
@@ -140,7 +137,7 @@
     return fb;
   }
 
-  // 工具事件渲染
+  // 工具事件渲染(与实时渲染统一使用 step-row 结构)
   function appendToolEvent(name, args, result, appendTo = null) {
     // 图片生成特殊处理
     if (name === 'generate_image') {
@@ -150,7 +147,7 @@
         wrap.className = 'msg bot';
         const avatar = makeAvatar('bot');
         const body = document.createElement('div');
-        body.className = 'msg-body';
+        body.className = 'msg-content';
         body.innerHTML = `<div class="img-gen-bubble img-gen-history"><img class="img-gen-result" src="${App.escapeHtml(url)}" alt="生成结果"></div>`;
         wrap.appendChild(avatar);
         wrap.appendChild(body);
@@ -159,21 +156,35 @@
           else appendTo.appendChild(wrap);
         } else {
           App.els.messages.appendChild(wrap);
-          App.els.messages.scrollTop = App.els.messages.scrollHeight;
+          App.scrollMessagesToBottom();
         }
         return wrap;
       }
     }
 
-    const div = document.createElement('div');
-    div.className = 'msg tool';
+    const ok = !String(result || '').includes('Error') && !String(result || '').includes('failed');
+    const row = document.createElement('div');
+    row.className = `step-row step-done step-open`;
 
-    const label = document.createElement('div');
-    label.className = 'tool-label';
-    label.textContent = `🔧 工具调用: ${name}`;
-    div.appendChild(label);
+    const num = document.createElement('span');
+    num.className = 'step-num';
+    num.textContent = '✓';
+    row.appendChild(num);
 
-    // 参数:JSON 高亮
+    const icon = document.createElement('span');
+    icon.className = 'step-icon';
+    icon.textContent = ok ? '✓' : '✗';
+    row.appendChild(icon);
+
+    const label = document.createElement('span');
+    label.className = 'step-label';
+    label.textContent = name;
+    row.appendChild(label);
+
+    const detail = document.createElement('div');
+    detail.className = 'step-detail';
+
+    // 参数
     if (args) {
       let argsText = args;
       try {
@@ -181,48 +192,68 @@
         if (obj && typeof obj === 'object') argsText = JSON.stringify(obj, null, 2);
       } catch (_) {}
       if (argsText && argsText !== '{}' && argsText !== '""') {
-        const argsEl = document.createElement('div');
-        argsEl.className = 'tool-args';
-        if (App.highlightJson) {
-          argsEl.innerHTML = App.highlightJson(String(argsText).slice(0, 300));
+        const argsWrap = document.createElement('div');
+        argsWrap.className = 'step-args';
+        const argsLabel = document.createElement('span');
+        argsLabel.className = 'step-args-label';
+        argsLabel.textContent = '参数';
+        const argsPreview = document.createElement('div');
+        argsPreview.className = 'step-args-preview';
+        if (App.highlightJsonSummary) {
+          argsPreview.innerHTML = App.highlightJsonSummary(String(argsText));
+        } else if (App.highlightJson) {
+          argsPreview.innerHTML = App.highlightJson(String(argsText).slice(0, 200));
         } else {
-          argsEl.textContent = String(argsText).slice(0, 300);
+          argsPreview.textContent = String(argsText).slice(0, 200);
         }
-        div.appendChild(argsEl);
+        const argsContent = document.createElement('div');
+        argsContent.className = 'step-args-content';
+        if (App.highlightJson) {
+          argsContent.innerHTML = App.highlightJson(String(argsText).slice(0, 500));
+        } else {
+          argsContent.textContent = String(argsText).slice(0, 500);
+        }
+        argsWrap.appendChild(argsLabel);
+        argsWrap.appendChild(argsPreview);
+        argsWrap.appendChild(argsContent);
+        detail.appendChild(argsWrap);
       }
     }
 
-    // 工具结果:JSON 高亮
+    // 结果
     let text = result || '';
-    let parsedObj = null;
     try {
       const obj = typeof result === 'string' ? JSON.parse(result) : result;
-      if (obj && typeof obj === 'object') {
-        parsedObj = obj;
-        text = JSON.stringify(obj, null, 2).slice(0, 600);
-      }
+      if (obj && typeof obj === 'object') text = JSON.stringify(obj, null, 2).slice(0, 600);
     } catch (_) {}
 
     if (text) {
-      const body = document.createElement('div');
-      body.className = 'tool-result';
-      if (App.detectResultType && App.highlightJson && App.detectResultType(text) === 'json') {
-        body.classList.add('tool-result-json');
-        body.innerHTML = App.highlightJson(text.slice(0, 500));
+      const resultEl = document.createElement('div');
+      resultEl.className = 'step-result';
+      const resultType = App.detectResultType ? App.detectResultType(text) : 'text';
+      if (resultType === 'json' && App.highlightJson) {
+        resultEl.innerHTML = App.highlightJson(text.slice(0, 500));
       } else {
-        body.textContent = text.slice(0, 400);
+        resultEl.textContent = text.slice(0, 400);
       }
-      div.appendChild(body);
+      detail.appendChild(resultEl);
     }
 
+    row.appendChild(detail);
+
+    // 点击展开/收起
+    row.addEventListener('click', () => {
+      row.classList.toggle('step-open');
+    });
+
     if (appendTo) {
-      if (Array.isArray(appendTo)) appendTo.push(div);
-      else appendTo.appendChild(div);
+      if (Array.isArray(appendTo)) appendTo.push(row);
+      else appendTo.appendChild(row);
     } else {
-      App.els.messages.appendChild(div);
-      App.els.messages.scrollTop = App.els.messages.scrollHeight;
+      App.els.messages.appendChild(row);
+      App.scrollMessagesToBottom();
     }
-    return div;
+    return row;
   }
 
   // 打字指示器
@@ -232,7 +263,7 @@
     wrap.id = 'typing';
     const avatar = makeAvatar('bot');
     const body = document.createElement('div');
-    body.className = 'msg-body';
+    body.className = 'msg-content';
     const bubble = document.createElement('div');
     bubble.className = 'answer-doc';
     bubble.innerHTML = '<div class="typing-indicator"><span></span><span></span><span></span></div>';
@@ -240,7 +271,7 @@
     wrap.appendChild(avatar);
     wrap.appendChild(body);
     App.els.messages.appendChild(wrap);
-    App.els.messages.scrollTop = App.els.messages.scrollHeight;
+    App.scrollMessagesToBottom();
   }
 
   function removeTyping() {

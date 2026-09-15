@@ -108,8 +108,8 @@ class Settings(BaseSettings):
     agent_task_max_tokens: int = 0
 
     # ---- 上下文配额硬控制 ----
-    # 请求级 max_output_tokens 上限;0 = 不限制。达到上限后停止生成并以截断提示结束。
-    agent_default_max_output_tokens: int = 0
+    # 请求级 max_output_tokens 上限;0 = 使用合理默认值(16384)。超过上限后停止生成。
+    agent_default_max_output_tokens: int = 16384
 
     # ---- 工作流生成服务地址 ----
     # Agent 通过 create_workflow_from_desc 工具调用此地址生成工作流。
@@ -176,6 +176,11 @@ class Settings(BaseSettings):
     agent_llm_retries: int = 2
     # 重试基础延迟(秒),按 2^n 指数退避
     agent_llm_retry_delay: float = 0.5
+    # 流式调用空闲超时(秒): 流内相邻 chunk 间隔超过该值视为上游卡死,立即中断
+    # 并给出可操作提示;0 = 不限制(不建议,provider 中途停顿会导致前端"一直卡")
+    agent_llm_stream_idle_timeout: int = 90
+    # 流式调用总时长上限(秒): 从建连到流结束的整体硬超时,0 = 不限制
+    agent_llm_stream_total_timeout: int = 600
     # 故障转移:主 provider 连续失败耗尽重试后,自动切换到备用 provider(留空 = 不切换)
     agent_llm_failover_provider: str = ""
     # 备用 provider 使用的模型(留空 = 该 provider 默认模型)
@@ -185,9 +190,9 @@ class Settings(BaseSettings):
     # 同一 provider 连续失败达到阈值后,进入冷却窗口,期间所有新调用直接跳过
     # 该 provider(不再等待重试超时),避免对故障上游反复发起请求拖慢整体。
     # 0 = 关闭熔断(仅靠重试+故障转移)
-    agent_llm_circuit_threshold: int = 3
+    agent_llm_circuit_threshold: int = 5
     # 熔断冷却时间(秒),冷却结束后计数清零,允许再次尝试
-    agent_llm_circuit_cooldown: float = 60.0
+    agent_llm_circuit_cooldown: float = 30.0
 
     # ---- Prompt 缓存控制 ----
     # 在 system 消息注入 cache_control 断点(OpenAI 兼容厂商多支持自动前缀缓存)。

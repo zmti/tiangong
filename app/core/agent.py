@@ -43,6 +43,9 @@ def _clip_history_for_json(history: list[dict]) -> str:
 
     避免直接对 json.dumps 结果做字符截断导致 JSON 结构损坏。
     """
+    # 修复: 记忆抽取 LLM 只认 OpenAI 合法角色, 先降级 error/plan/孤立tool
+    from app.memory.session import sanitize_history_for_llm
+    history = sanitize_history_for_llm(history)
     clipped = []
     total_bytes = 0
     for m in history:
@@ -54,8 +57,8 @@ def _clip_history_for_json(history: list[dict]) -> str:
         if len(s.encode("utf-8")) > 500:
             s = s.encode("utf-8")[:497].decode("utf-8", errors="ignore")
             s = s + "…"
-        clipped.append({**m, "content": s})
-        total_bytes += len(json.dumps({"role": m.get("role"), "content": s}, ensure_ascii=False).encode("utf-8"))
+        clipped.append({"role": m.get("role", "user"), "content": s})
+        total_bytes += len(json.dumps({"role": m.get("role", "user"), "content": s}, ensure_ascii=False).encode("utf-8"))
         if total_bytes > 5500:
             break
     return json.dumps(clipped, ensure_ascii=False)
@@ -78,7 +81,7 @@ def _truncate_to_token_budget(text: str, max_tokens: int, llm=None) -> tuple[str
     keep_chars = max(1, int(len(text) * max_tokens / max(1, tokens)))
     cut = text[:keep_chars].rstrip()
     return cut, True
-from app.core.llm import LLMClient, ToolCall
+from app.core.llm import LLMClient, ToolCall, LLMError
 from app.core.planner import TaskPlan, _normalize_steps, apply_plan_tool, generate_plan
 from app.core.prompts import TOOL_CALL_PATTERN, build_system_prompt, build_tools_description
 from app.core.telemetry import _current_run_id, tracer
@@ -147,8 +150,14 @@ class Agent:
         orch_candidates: Optional[list[str]] = None,
         task_config: Optional[dict] = None,
         project_path: str = "",
+        fast_mode: bool = False,
     ):
         self.llm = llm or LLMClient()
+        # fast_mode: 轻量交互模式。置 True 时 _node_prepare 跳过任务规划/工具路由/
+        # 记忆注入等"重 LLM 准备阶段"(各自带 AGENT_LLM_TIMEOUT 重试窗口),只做纯问答,
+        # 适合 CLI/交互多轮对话——简单问答不必为每个问题跑一遍规划+记忆,避免 LLM
+        # 限流/故障时每个问题都卡满超时。默认 False,API/后台任务路径行为不变。
+        self.fast_mode = fast_mode
         # 项目路径:注入到 ContextVar,工具运行时可通过 resolve_cwd() 获取
         self.project_path = project_path
         if project_path:
@@ -228,6 +237,10 @@ class Agent:
         self._always_tools = list(SYSTEM_TOOLS)
         # 原生工具调用开关:初始化时探测 LLM 是否支持
         self._native_enabled = settings.agent_native_tools and hasattr(self.llm, "chat_with_tools")
+        # 基线值: 该实例"意图"的原生工具开关。_reset_run_state 每轮恢复到基线,
+        # 而非无条件用全局 settings —— 允许调用方(CLI)通过覆盖 _native_enabled
+        # 一次性关闭原生路径, 且多轮复用实例时不被 _reset_run_state 重置回去。
+        self._native_baseline = self._native_enabled
         self._schemas_cache = None
         # 任务计划状态(Plan-then-Execute)
         self._plan: Optional[TaskPlan] = None
@@ -267,10 +280,55 @@ class Agent:
                 logger.warning("checkpoint 加载失败,降级为无持久化模式: %s", e)
                 self._checkpoint = None
 
+    def _disable_native(self) -> None:
+        """关闭原生工具路径(当前运行 + 后续轮次基线), 降级为文本模式。
+
+        同时更新 _native_baseline, 使 _reset_run_state 跨轮恢复时也保持关闭 ——
+        一旦某次原生调用失败/不支持, 后续复用同实例的多轮都走文本路径, 不再反复
+        触碰原生路径(欠费/限流账号下原生调用更易失败)。
+        """
+        self._native_enabled = False
+        self._native_baseline = False
+
+    def _reset_run_state(self) -> None:
+        """清空 Agent 级"跨任务"状态,使同一实例的多次 run() 互不串味。
+
+        每个 run() 都会新建 AgentState(消息/步骤/计划快照是隔离的),但下列
+        Agent 级字段在 __init__ 后不会自动重置:一旦某次运行设置过,会泄漏到
+        下一次运行,导致模型带着上一问的 plan/工具路由/记忆/搜索历史去作答,
+        表现为"换个问题答案还是上一问的"。服务器端每请求新建 Agent 实例故无感;
+        CLI/交互端复用同一实例跨多轮提问时必然踩到,故在 run/run_stream 入口统一清零。
+
+        保留:配置型字段(llm/registry/max_steps/system_prompt/temperature/route/
+        context_budget/token_budget/session_id/approve_tools/multimodal_parts/
+        _dangerous_tools/_dangerous_rate_limiter/_always_tools/_schemas_cache=初始值/
+        _tool_cache_safe/_search_max_repeats/_graph/_checkpoint)——这些是实例配置,
+        不随单次任务变化。
+        """
+        # 任务计划
+        self._plan = None
+        self._plan_dirty = False
+        # 工具路由:恢复为"未路由(全量)"
+        self._active_tools = None
+        self._schemas_cache = None
+        # 原生工具开关:恢复为该实例的基线意图(而非全局 settings),使调用方
+        # 一次性关闭原生路径的意图在跨轮复用实例时不被重置回去。
+        self._native_enabled = self._native_baseline
+        # 工具结果去重缓存:清空,避免上一问的缓存命中下一问
+        if isinstance(self._tool_cache, dict):
+            self._tool_cache.clear()
+        # 搜索去重历史:清空
+        self._search_query_history = []
+        # 记忆注入提示块:清空(下一次 _node_prepare 会重新检索)
+        self._memory_note = ""
+        # 运行中批准集合:清空(仅当次运行有效)
+        self._runtime_approved = set()
+
     # ---- 对外接口 ----
 
     async def run(self, user_input: str, history: list[dict] | None = None) -> AgentResult:
         """执行 Agent,返回结果和完整执行步骤。带 trace 记录。"""
+        self._reset_run_state()
         if self.mode == "ensemble":
             return await self._run_ensemble(user_input, history or [])
         if self.mode in ORCHESTRATION_MODES:
@@ -343,6 +401,7 @@ class Agent:
           {"type": "token", "content": "..."}
           {"type": "done", "model": ..., "steps": [...]}
         """
+        self._reset_run_state()
         if self.mode == "ensemble":
             result = await self._run_ensemble(user_input, history or [])
             for ch in result.answer:
@@ -385,6 +444,8 @@ class Agent:
             done = {"type": "done", "model": model, "steps": state.steps}
             if interrupt is not None:
                 done["interrupt"] = interrupt
+            if state.status == "failed" and state.error:
+                done["error"] = state.error
             yield done
         except asyncio.CancelledError:
             # 取消传播: 记录 trace 后向外抛出, 让调用方(任务管理器)感知并终止
@@ -595,29 +656,104 @@ class Agent:
             state.metadata["guardrail_violations"] = [v.__dict__ for v in guard.violations]
             return END
 
-        # 准备阶段超时保护
-        prepare_timeout = max(30, int(getattr(settings, "agent_llm_timeout", 60) or 60))
+        # 准备阶段逐段超时保护:旧实现对整个 _run_prepare 套一层
+        # max(30, agent_llm_timeout) 的 wait_for —— 路由 LLM + 摘要 LLM + 规划 LLM +
+        # 记忆检索叠加时,单段耗时正常(各 <30s)但总和经常超 60s,一旦整体超时
+        # 就丢弃全部准备结果回退到 [{role:user}] 裸消息,且 UI 在等待期间
+        # 看不到任何事件(前端表现为"发送后一直卡")。现改为逐段限时,
+        # 任一段超时跳过该段继续,保留已成功段落的结果。
+        llm_step_timeout = max(20, int(getattr(settings, "agent_llm_timeout", 60) or 60))
+
+        # 1) 模型路由(快)
         try:
-            await asyncio.wait_for(
-                self._run_prepare(state, user_input, history, state.steps, 0),
-                timeout=prepare_timeout
+            await asyncio.wait_for(self._maybe_route(user_input), timeout=10)
+        except asyncio.TimeoutError:
+            logger.warning("模型路由超时,沿用默认模型")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("模型路由失败,沿用默认模型: %s", e)
+
+        state.metadata["model"] = self.llm.info["model"]
+        if state.metadata.get("stream"):
+            state.emit({"type": "thinking", "content": f"准备中: 模型 {state.metadata['model']}", "phase": "prepare"})
+
+        # 轻量交互模式: 跳过工具路由/任务规划/记忆注入(各自带 AGENT_LLM_TIMEOUT 的
+        # 重 LLM 调用)。多轮简单问答只需主 LLM 应答,省掉这些准备段即可秒级响应,
+        # 且 LLM 限流/故障时不会为每个问题空转满超时。
+        # 注意: 多轮会话下历史随轮次增长, _prepare_history 会触发摘要 LLM 压缩(带
+        # AGENT_LLM_TIMEOUT*2 的超时窗口)——这正是"多轮每问都卡"的元凶。fast_mode 下
+        # 改为纯本地截断(保留最近 N 条 + 字符预算), 完全不调 LLM, 既不卡也不丢近期上下文。
+        if self.fast_mode:
+            cap = int(getattr(settings, "context_char_budget", 0) or 0)
+            trimmed = self._local_trim_history(history, cap) if cap > 0 else history[-40:]
+            state.metadata["history"] = trimmed
+            state.messages = self._build_messages(user_input, state.metadata.get("history", []) or [])
+            state.active_tools = None
+            return
+
+        # 2) 历史摘要压缩(可能含 1-2 次 LLM 调用,最耗时)
+        try:
+            state.metadata["history"] = await asyncio.wait_for(
+                self._prepare_history(history), timeout=llm_step_timeout * 2
+            )
+            if state.metadata.get("stream") and history and len(state.metadata["history"]) < len(history):
+                state.emit({"type": "thinking", "content": "历史上下文已压缩", "phase": "prepare"})
+        except asyncio.TimeoutError:
+            # 超时: 用本地截断替代原始历史, 避免超长上下文导致 context_length 错误
+            cap = int(getattr(settings, "context_char_budget", 0) or 0)
+            state.metadata["history"] = self._local_trim_history(history, cap) if cap > 0 else history[-40:]
+            logger.warning("历史摘要压缩超时, 本地截断为 %d 条消息", len(state.metadata["history"]))
+
+        # 3) 工具路由(可命中缓存,快;失败回退全量工具)
+        # 逐段限时: 路由内部 LLM/embedding 卡死时不再阻塞整个准备阶段
+        try:
+            route_evt = await asyncio.wait_for(
+                self._maybe_select_tools(user_input, state.steps, 0),
+                timeout=llm_step_timeout,
             )
         except asyncio.TimeoutError:
-            state.emit({"type": "thinking", "content": f"[准备阶段超时({prepare_timeout}s),使用基础配置继续]"})
-            if not state.messages:
-                state.messages = [{"role": "user", "content": user_input}]
-            # 超时后使用最小上下文继续,不中断主流程
-            return
+            logger.warning("工具路由超时,回退全量工具集")
+            route_evt = None
+        except Exception as e:  # noqa: BLE001
+            logger.warning("工具路由异常,回退全量工具集: %s", e)
+            route_evt = None
+        if route_evt:
+            state.emit(route_evt)
+
+        # 4) 任务规划(1 次 LLM 调用)
+        try:
+            plan_created = await asyncio.wait_for(
+                self._plan_task(user_input, state.steps, 0), timeout=llm_step_timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning("任务规划超时,跳过规划直接执行")
+            plan_created = False
+        if plan_created:
+            state.emit({"type": "plan", "action": "create",
+                        "plan": self._plan.to_dict() if self._plan else None})
+        if self._plan is not None:
+            state.plan = self._plan.to_dict()
+
+        # 5) 记忆注入(30s 内部超时,检索失败返回空串)
+        try:
+            self._memory_note = await asyncio.wait_for(
+                self._build_memory_note_async(user_input, state.metadata.get("history", []) or []),
+                timeout=35,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("记忆注入超时,跳过记忆继续执行")
+            self._memory_note = ""
+
+        # 6) 构造消息(纯本地计算,不超时)
+        state.messages = self._build_messages(user_input, state.metadata.get("history", []) or [])
 
         state.active_tools = self._active_tools
 
     async def _run_prepare(self, state, user_input, history, steps, step):
-        """prepare 主体逻辑,可被超时包裹。"""
+        """prepare 主体逻辑(兼容旧调用,内部委托 _node_prepare 的逐段流程)。"""
         await self._maybe_route(user_input)
         state.metadata["model"] = self.llm.info["model"]
         history = await self._prepare_history(history)
         state.metadata["history"] = history
-
         route_evt = await self._maybe_select_tools(user_input, steps, step)
         if route_evt:
             state.emit(route_evt)
@@ -646,10 +782,40 @@ class Agent:
         state.metadata["llm_rounds"] = rounds + 1
 
         is_stream = state.metadata.get("stream", False)
-        if is_stream:
-            tool_call_mode, resp, tool_calls = await self._call_llm_stream(state.messages, state)
-        else:
-            tool_call_mode, resp, tool_calls = await self._call_llm(state.messages)
+        try:
+            if is_stream:
+                tool_call_mode, resp, tool_calls = await self._call_llm_stream(state.messages, state)
+            else:
+                tool_call_mode, resp, tool_calls = await self._call_llm(state.messages)
+        except LLMError as e:
+            err_msg = str(e).lower()
+            # context_length 错误: 修剪消息后重试一次
+            if ("context_length" in err_msg or "too long" in err_msg or "maximum context" in err_msg
+                    or "token" in err_msg and ("limit" in err_msg or "exceed" in err_msg)):
+                logger.warning("LLM context_length 错误(round=%d), 修剪消息后重试: %s", rounds, e)
+                self._trim_state_messages(state)
+                # 二次重试: 失败则放弃
+                try:
+                    if is_stream:
+                        tool_call_mode, resp, tool_calls = await self._call_llm_stream(state.messages, state)
+                    else:
+                        tool_call_mode, resp, tool_calls = await self._call_llm(state.messages)
+                except LLMError as e2:
+                    logger.warning("LLM 重试仍失败(round=%d): %s", rounds, e2)
+                    state.emit({"type": "error", "content": f"执行出错: {e2}"})
+                    state.metadata["tool_call_mode"] = "text"
+                    state.metadata["resp"] = ""
+                    state.metadata["tool_calls"] = []
+                    state.metadata["giveup"] = True
+                    return
+            else:
+                logger.warning("LLM 调用失败(round=%d): %s", rounds, e)
+                state.emit({"type": "error", "content": f"执行出错: {e}"})
+                state.metadata["tool_call_mode"] = "text"
+                state.metadata["resp"] = ""
+                state.metadata["tool_calls"] = []
+                state.metadata["giveup"] = True
+                return
         state.metadata["tool_call_mode"] = tool_call_mode
         state.metadata["resp"] = resp or ""
         state.metadata["tool_calls"] = [tc.to_dict() for tc in tool_calls]
@@ -750,6 +916,9 @@ class Agent:
             })
         state.metadata["tool_seq"] = tool_seq + len(batch)
 
+        # 防止 state.messages 无限增长导致 context_length 错误
+        self._trim_state_messages(state)
+
         evt = self._flush_plan(state.steps, step)
         if evt:
             state.emit(evt)
@@ -790,9 +959,15 @@ class Agent:
             if answer and state.metadata.get("stream"):
                 for ch in answer:
                     state.emit({"type": "token", "content": ch})
-            # 如果仍然为空，非流式模式下补一次 LLM 调用
+            # 如果仍然为空，非流式模式下补一次 LLM 调用（带超时保护）
             if not answer and not state.metadata.get("stream"):
-                answer = await self.llm.chat(state.messages, temperature=self.temperature)
+                try:
+                    answer = await asyncio.wait_for(
+                        self.llm.chat(state.messages, temperature=self.temperature),
+                        timeout=float(getattr(settings, "agent_llm_timeout", 60) or 60)
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("finalize 阶段 LLM 补调用超时")
 
         # 输出 token 配额硬控制
         if self.max_output_tokens > 0 and answer:
@@ -1396,9 +1571,12 @@ class Agent:
                 f"用户请求: {state.user_input}"
             )
             try:
-                new_answer = await self.llm.chat(
-                    [{"role": "user", "content": rewrite_prompt}],
-                    temperature=self.temperature,
+                new_answer = await asyncio.wait_for(
+                    self.llm.chat(
+                        [{"role": "user", "content": rewrite_prompt}],
+                        temperature=self.temperature,
+                    ),
+                    timeout=60
                 )
             except Exception as e:  # noqa: BLE001
                 logger.warning("校验后 LLM 重写回答失败: %s", e)
@@ -1457,11 +1635,16 @@ class Agent:
         # 使用智能路由(关键词+embedding+LLM 三级缓存 + 置信度评分)
         try:
             from app.core.smart_router import select_tools_enhanced
-            selected, conf, reason = await select_tools_enhanced(
-                self.llm, user_input, self.registry,
-                max_tools=max_tools,
-                min_confidence=min_confidence,
-                user_tech_stack=getattr(self, "_tech_stack", []),
+            # 添加超时保护
+            route_timeout = 30.0
+            selected, conf, reason = await asyncio.wait_for(
+                select_tools_enhanced(
+                    self.llm, user_input, self.registry,
+                    max_tools=max_tools,
+                    min_confidence=min_confidence,
+                    user_tech_stack=getattr(self, "_tech_stack", []),
+                ),
+                timeout=route_timeout
             )
             if selected and conf >= min_confidence:
                 self._active_tools = selected
@@ -1470,6 +1653,8 @@ class Agent:
                 await cache.set(user_input, selected, conf, reason)
                 steps.append({"step": step, "type": "tool_route", "tools": selected, "reason": reason})
                 return {"type": "tool_route", "tools": selected, "reason": reason}
+        except asyncio.TimeoutError:
+            logger.warning("智能工具路由超时，回退到全量工具集")
         except Exception as e:  # noqa: BLE001
             logger.warning("智能工具路由失败，回退到全量工具集: %s", e)
 
@@ -1480,9 +1665,15 @@ class Agent:
 
         mode: "native"=原生 function calling / "text"=文本(手写 JSON)
         """
+        # 获取 LLM 超时配置
+        llm_timeout = float(getattr(settings, "agent_llm_timeout", 60) or 60)
+
         if self._native_enabled:
             try:
-                result = await self.llm.chat_with_tools(messages, tools=self._schemas, temperature=self.temperature)
+                result = await asyncio.wait_for(
+                    self.llm.chat_with_tools(messages, tools=self._schemas, temperature=self.temperature),
+                    timeout=llm_timeout
+                )
                 if result.tool_calls:
                     return "native", result.content, result.tool_calls
                 # 原生模式无 tool_calls,但 content 可能是手写 JSON(部分 provider 忽略 tools)
@@ -1490,11 +1681,16 @@ class Agent:
                 if not tool_calls:
                     return "native", result.content, []
                 return "text", result.content, tool_calls
+            except asyncio.TimeoutError:
+                raise LLMError(f"LLM 原生调用超时 ({llm_timeout}s)")
             except Exception as e:  # noqa: BLE001  # 原生调用失败,自动降级
                 logger.warning("native 模式调用失败，自动降级: %s", e)
-                self._native_enabled = False
+                self._disable_native()
 
-        resp = await self.llm.chat(messages, temperature=self.temperature)
+        resp = await asyncio.wait_for(
+            self.llm.chat(messages, temperature=self.temperature),
+            timeout=llm_timeout
+        )
         tool_calls = self._parse_tool_calls(resp)
         if not tool_calls:
             return "text", resp, []
@@ -1526,9 +1722,18 @@ class Agent:
                 if not tool_calls:
                     return "native", full, []
                 return "text", full, tool_calls
+            except LLMError as e:
+                # 流中途空闲/总时长超时:此时可能已向用户吐出部分 token,
+                # 降级到 text 模式会重新发起整个 LLM 请求,导致已输出内容重复 + 卡顿翻倍。
+                # 区分: 建连前失败(collected 为空,未输出任何内容)可安全降级; 流中途失败必须直接上抛。
+                if collected:
+                    logger.warning("native 流式中途失败(已输出 %d 段内容),不再降级: %s", len(collected), e)
+                    raise
+                logger.warning("native 模式建连/调用失败,自动降级: %s", e)
+                self._disable_native()
             except Exception as e:  # noqa: BLE001
                 logger.warning("native 模式调用失败，自动降级: %s", e)
-                self._native_enabled = False
+                self._disable_native()
 
         # 文本模式流式
         try:
@@ -2014,7 +2219,16 @@ class Agent:
         self._plan_dirty = False
         if not settings.agent_planning:
             return False
-        plan = await self._maybe_plan(user_input)
+        # 添加超时保护，防止规划卡住
+        plan_timeout = float(getattr(settings, "agent_llm_timeout", 60) or 60)
+        try:
+            plan = await asyncio.wait_for(
+                self._maybe_plan(user_input),
+                timeout=plan_timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning("任务规划超时，跳过规划直接执行")
+            return False
         if plan is None:
             return False
         self._plan = plan
@@ -2028,8 +2242,16 @@ class Agent:
         cleaned = user_input.strip()
         if len(cleaned) <= _PLAN_SHORT_INPUT_THRESHOLD and not any(kw in cleaned for kw in _PLAN_SHORT_INPUT_KEYWORDS):
             return None
+        # 添加超时保护
+        plan_timeout = float(getattr(settings, "agent_llm_timeout", 60) or 60)
         try:
-            plan = await generate_plan(self.llm, user_input, max_steps=settings.agent_plan_max_steps)
+            plan = await asyncio.wait_for(
+                generate_plan(self.llm, user_input, max_steps=settings.agent_plan_max_steps),
+                timeout=plan_timeout
+            )
+        except asyncio.TimeoutError:
+            logger.warning("任务规划 LLM 调用超时，跳过规划")
+            return None
         except Exception as e:  # noqa: BLE001
             logger.warning("任务规划生成失败，放弃分步计划: %s", e)
             return None
@@ -2198,6 +2420,9 @@ class Agent:
         old = history[: len(history) - len(keep)]
         if len(old) < 2:
             return history
+        # 修复: 摘要 LLM 只认 OpenAI 合法角色, 先降级 error/plan/孤立tool 再传入
+        from app.memory.session import sanitize_history_for_llm
+        old = sanitize_history_for_llm(old)
         from app.memory.summarize import summarize_messages_async
 
         summary = await summarize_messages_async(self.llm, old)
@@ -2208,6 +2433,74 @@ class Agent:
             }] + keep
         return history
 
+    def _local_trim_history(self, history: list[dict], char_budget: int) -> list[dict]:
+        """纯本地截断历史(fast_mode 用, 不调 LLM): 从最旧的消息开始丢弃,
+        直到累计字符量 <= char_budget, 且始终保留最后一条 user 输入。
+
+        与 _prepare_history 的 LLM 摘要不同, 这里是 O(n) 本地操作, 无网络/超时风险,
+        适合交互多轮——历史增长时只截断而不卡。
+        """
+        if not history:
+            return history
+        from app.memory.session import sanitize_history_for_llm
+
+        san = sanitize_history_for_llm(history)
+        keep: list[dict] = []
+        acc = 0
+        for m in reversed(san):
+            c = len(str(m.get("content", "")))
+            if keep and acc + c > char_budget:
+                break
+            keep.insert(0, m)
+            acc += c
+        # 保证最后一条 user 输入一定在(哪怕超预算也保留, 否则本轮问题丢失)
+        if not any(m.get("role") == "user" for m in keep):
+            for m in reversed(san):
+                if m.get("role") == "user":
+                    keep.insert(0, m)
+                    break
+        return keep
+
+    def _trim_state_messages(self, state: AgentState) -> None:
+        """工具循环中修剪 state.messages, 防止上下文无限增长导致 context_length 错误。
+
+        策略: 不删除任何消息(保持角色序列完整), 只截断过长的 tool 结果和 assistant 内容。
+        这样保证消息序列的连续性, 避免 LLM API 报错。
+        """
+        msgs = state.messages
+        if not msgs:
+            return
+        cap = int(getattr(settings, "context_char_budget", 200000) or 0)
+        if cap <= 0:
+            return
+        total = sum(len(str(m.get("content", ""))) for m in msgs)
+        if total <= cap:
+            return
+        # 超出预算: 从最旧的 tool 结果开始截断内容
+        # 保留 system prompt 和最近的消息不动
+        target = int(cap * 0.7)
+        trimmed_any = False
+        for m in msgs:
+            if total <= target:
+                break
+            role = m.get("role", "")
+            content = m.get("content", "")
+            if not content or not isinstance(content, str):
+                continue
+            if role == "tool":
+                # 截断 tool 结果到 2000 字符
+                if len(content) > 2000:
+                    m["content"] = content[:2000] + "\n...(结果已截断)"
+                    total -= len(content) - len(m["content"])
+                    trimmed_any = True
+            elif role == "assistant" and len(content) > 3000 and not m.get("tool_calls"):
+                # 截断长 assistant 消息(不含 tool_calls, 否则会破坏 JSON)
+                m["content"] = content[:3000] + "\n...(内容已截断)"
+                total -= len(content) - len(m["content"])
+                trimmed_any = True
+        if trimmed_any:
+            logger.info("_trim_state_messages: truncated long messages, ~%d chars remaining", total)
+
     async def _build_memory_note_async(self, user_input: str, history: list[dict]) -> str:
         """异步检索分层记忆(working/semantic/episodic),构造注入提示块。
 
@@ -2215,15 +2508,26 @@ class Agent:
         """
         if not settings.agent_memory_enabled:
             return ""
+        # 修复: 历史里可能含 role=error/plan/tool 等自定义角色,
+        # 摘要/检索 LLM 只认 OpenAI 合法角色, 先降级再传入
+        from app.memory.session import sanitize_history_for_llm
+        history = sanitize_history_for_llm(history)
+        # 记忆检索超时保护
+        memory_timeout = 30.0
         try:
             from app.memory.layers import build_layered_memory_note, enable_layered
 
             if enable_layered():
-                note = await build_layered_memory_note(
-                    user_input, history, self.session_id, self.llm,
+                note = await asyncio.wait_for(
+                    build_layered_memory_note(
+                        user_input, history, self.session_id, self.llm,
+                    ),
+                    timeout=memory_timeout
                 )
                 if note:
                     return note
+        except asyncio.TimeoutError:
+            logger.warning("记忆检索超时，跳过记忆注入")
         except Exception as e:  # noqa: BLE001
             logger.warning("记忆沉淀主流程失败: %s", e)  # 分层失败回退旧逻辑
         try:
@@ -2256,6 +2560,9 @@ class Agent:
             return
         try:
             recent = (history or [])[-_MEMORY_RECENT_HISTORY_COUNT:]
+            # 修复: 自动记忆 LLM 只认 OpenAI 合法角色, 先降级 error/plan/孤立tool
+            from app.memory.session import sanitize_history_for_llm
+            recent = sanitize_history_for_llm(recent)
             prompt = [
                 {
                     "role": "system",
@@ -2384,6 +2691,30 @@ class Agent:
             )
 
         messages: list[dict] = [{"role": "system", "content": system}]
+
+        # 修复"messages[i].role: unknown variant 'error'"崩溃:
+        # 会话历史里存了 role=error/plan/tool 等自定义角色(前端错误气泡/工具记录),
+        # OpenAI 只接受 system/user/assistant/tool/function/developer。
+        # 转换时: 自定义角色一律降级为 user, 并剥掉 kind/id/timestamp/meta 等非 OpenAI 字段。
+        #
+        # 修复"missing field 'tool_call_id'"崩溃(OpenAI 网关 400):
+        # 历史里 role=tool 的消息(来自 chat_resume 等路径存库)不带 tool_call_id,
+        # 且对应的 assistant.tool_calls 消息从未入库 → 孤立的 tool 消息永远不合法。
+        # 策略: 只有当 tool 消息自带 tool_call_id 时才能保留 tool 角色,
+        # 否则一律降级为 user(包上"工具 xxx 执行结果"前缀),彻底避免 400。
+        def _to_llm_msg(msg: dict) -> Optional[dict]:
+            # 统一走 session 模块的清洗逻辑(避免与记忆链路的清洗规则分叉)
+            from app.memory.session import sanitize_history_for_llm
+
+            converted = sanitize_history_for_llm([msg])
+            if not converted:
+                return None
+            conv = converted[0]
+            content = str(conv.get("content", ""))
+            if len(content) > settings.message_char_cap:
+                conv["content"] = content[: settings.message_char_cap] + "\n...[内容过长已截断]"
+            return conv
+
         if settings.agent_token_budget and settings.agent_token_budget > 0:
             from app.memory.context import estimate_tokens
 
@@ -2391,38 +2722,52 @@ class Agent:
             budget = int(settings.agent_token_budget)
             from app.memory.context import budget_messages
 
-            # 兼容新旧格式:assistant 消息内容可能在 kind 字段
+            # 兼容新旧格式:先统一转成 OpenAI 合法消息,再按 token 预算裁剪
             clipped = []
             for msg in history:
-                if msg.get("role") in ("tool", "plan"):
+                conv = _to_llm_msg(msg)
+                if conv is None:
                     continue
-                # 获取实际内容:优先 content,其次 kind
-                raw_content = msg.get("content", "") or msg.get("kind", "")
-                if not str(raw_content).strip():
-                    continue
-                content = str(raw_content)
-                if len(content) > settings.message_char_cap:
-                    content = content[: settings.message_char_cap] + "\n...[内容过长已截断]"
-                clipped.append({**msg, "content": content})
+                clipped.append(conv)
             messages += budget_messages(clipped, max_tokens=budget, head_tokens=head_tokens, min_keep=4)
         else:
             total_chars = len(system)
             budget = settings.context_char_budget
             for msg in history:
-                if msg.get("role") in ("tool", "plan"):
-                    continue  # 工具/计划事件仅用于前端展示,不进入模型上下文
-                # 获取实际内容:优先 content,其次 kind
-                content = msg.get("content", "") or msg.get("kind", "")
-                if not str(content).strip():
-                    continue  # 跳过空内容消息,避免 LLM 返回 400
-                if isinstance(content, str) and len(content) > settings.message_char_cap:
-                    content = content[: settings.message_char_cap] + "\n...[内容过长已截断]"
-                line = f"{msg.get('role', '')}:{content}"
-                if total_chars + len(line) > budget:
+                conv = _to_llm_msg(msg)
+                if conv is None:
+                    continue  # 跳过空内容/无法转换的消息
+                total_chars += len(str(conv.get("content", ""))) + len(conv.get("role", "")) + 2
+                if total_chars > budget:
                     break
-                messages.append({**msg, "content": content})
-                total_chars += len(line)
+                messages.append(conv)
         messages.append({"role": "user", "content": self._build_user_content(user_input)})
+
+        # 最终安全网: 校验完整消息列表, 剥离任何残余的非法 tool 消息
+        # (tool 角色必须带 tool_call_id, 且前面需有 assistant.tool_calls; 否则降级为 user)
+        # 收集所有已声明的 tool_call_id (来自 assistant.tool_calls 消息)
+        _known_tool_call_ids: set[str] = set()
+        for m in messages:
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                for tc in m["tool_calls"]:
+                    tc_id = tc.get("id", "") if isinstance(tc, dict) else ""
+                    if tc_id:
+                        _known_tool_call_ids.add(tc_id)
+        for i, m in enumerate(messages):
+            if m.get("role") == "tool":
+                tc_id = m.get("tool_call_id", "")
+                # 缺 tool_call_id, 或 tool_call_id 找不到对应的 assistant.tool_calls → 降级为 user
+                if not tc_id or tc_id not in _known_tool_call_ids:
+                    logger.warning(
+                        "[build_messages] 消息 #%d role=tool 无合法 tool_call_id (%r), 降级为 user",
+                        i, tc_id,
+                    )
+                    m["role"] = "user"
+                    _content = m.get("content", "")
+                    if not _content.startswith("["):
+                        m["content"] = "[工具执行结果(历史)]: " + _content
+                    # 移除非法的 tool_call_id 字段
+                    m.pop("tool_call_id", None)
         return messages
 
     @staticmethod

@@ -5,12 +5,19 @@ App.WorkflowOps = (() => {
   let nodes = [];
   let edges = [];
 
+  /* 修复"新建/刷新点一次弹两次": workflow-ops.js 与 workflow.js 都给
+     wfNewBtn/wfRefreshBtn 绑定了监听器, 且 ops 用硬编码 8517 端口(用户改
+     AGENT_PORT 后 404)。现 ops 不再自行 init 绑定, 按钮统一由 workflow.js
+     (终极版, 用 App.backendUrl 动态端口) 的 init() 绑定。保留 create/run/
+     deleteWorkflow 供 workflow.js 委托, 但端口改用 App.backendUrl。 */
+  function _apiBase() { return App.backendUrl || 'http://127.0.0.1:8517'; }
+
   async function create() {
     const name = await App.prompt?.('请输入工作流名称:', '新工作流') || '新工作流';
     if (!name || name.trim() === '') return;
-    
+
     try {
-      const resp = await fetch(`${API}/v1/workflows`, {
+      const resp = await fetch(`${_apiBase()}/v1/workflows`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -48,7 +55,7 @@ App.WorkflowOps = (() => {
     if (!id) { App.toast?.('请先选择一个工作流', 'err'); return; }
     
     try {
-      const resp = await fetch(`${API}/v1/workflows/${id}/run`, {
+      const resp = await fetch(`${_apiBase()}/v1/workflows/${id}/run`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ input: '测试输入' })
@@ -94,26 +101,15 @@ App.WorkflowOps = (() => {
   }
 
   function init() {
-    const newBtn = App.els.wfNewBtn || document.getElementById('wfNewBtn');
-    const refreshBtn = App.els.wfRefreshBtn || document.getElementById('wfRefreshBtn');
-    
-    if (newBtn) {
-      newBtn.addEventListener('click', create);
+    /* 修复"新建/刷新点一次弹两次": 旧实现 ops + workflow.js 双重绑定按钮。
+       现 ops 不再绑定 wfNewBtn/wfRefreshBtn/wfRunBtn/wfDeleteBtn,
+       统一交给 workflow.js 的 init()(它用 App.backendUrl 动态端口)。
+       保留本 init 仅为兼容旧调用方, 实际不再挂监听器。 */
+    // 按钮绑定已全部迁移到 workflow.js(终极版), 此处不重复绑定
+    if (!App._wfOpsInitDone) {
+      App._wfOpsInitDone = true;
     }
-    if (refreshBtn) {
-      refreshBtn.addEventListener('click', () => App.Workflow.loadList());
-    }
-    
-    const runBtn = App.els.wfRunBtn || document.getElementById('wfRunBtn');
-    const deleteBtn = App.els.wfDeleteBtn || document.getElementById('wfDeleteBtn');
-    if (runBtn) {
-      runBtn.addEventListener('click', () => run(currentWorkflow?.id));
-    }
-    if (deleteBtn) {
-      deleteBtn.addEventListener('click', () => deleteWorkflow(currentWorkflow?.id));
-    }
-    
-    App.Workflow.loadList();
+    if (App.Workflow && App.Workflow.loadList) App.Workflow.loadList();
   }
 
   return { create, run, deleteWorkflow, init };

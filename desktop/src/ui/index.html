@@ -6,7 +6,7 @@
   <!-- CSP: Electron 桌面应用本地加载 + 内联 style + 后端 127.0.0.1 -->
   <!-- eval 兼容层已拆为 5 个独立模块(exec-trace/toast/lightbox/tts/confirm-dialog), 故无需 unsafe-eval -->
   <!-- unsafe-inline 仅为兼容 17 处内联 style, 后续收敛后应改为 nonce/hash -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:* blob: data:; media-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none';">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:* blob: data:; media-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none';">
   <title>天工</title>
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="style-command.css">
@@ -56,13 +56,31 @@
       </div>
 
       <nav class="sidebar-nav">
+        <!-- P1 重排: 导航分组 — 主功能 / 数据资源 / 自动化 -->
         <div class="nav-group">
+          <div class="nav-group-label">主功能</div>
           <button class="nav-btn active" data-view="chat" title="对话">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
             </svg>
             <span class="nav-label">对话</span>
           </button>
+          <button class="nav-btn" data-view="workflow" title="工作流">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"></polyline><path d="M3 11V9a4 4 0 0 1 4-4h14"></path><polyline points="7 23 3 19 7 15"></polyline><path d="M21 13v2a4 4 0 0 1-4 4H3"></path></svg>
+            <span class="nav-label">工作流</span>
+          </button>
+          <button class="nav-btn" data-view="projects" title="项目管理">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+            <span class="nav-label">项目管理</span>
+          </button>
+          <button class="nav-btn" data-view="briefing" title="每日简报">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"></line><line x1="12" y1="20" x2="12" y2="4"></line><line x1="6" y1="20" x2="6" y2="14"></line></svg>
+            <span class="nav-label">每日简报</span>
+          </button>
+        </div>
+
+        <div class="nav-group">
+          <div class="nav-group-label">数据资源</div>
           <button class="nav-btn" data-view="kb" title="知识库">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
@@ -78,12 +96,31 @@
             </svg>
             <span class="nav-label">长期记忆</span>
           </button>
+          <button class="nav-btn" data-view="runs" title="运行记录">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+            <span class="nav-label">运行记录</span>
+          </button>
+          <button class="nav-btn" data-view="telemetry" title="用量统计">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"></line><line x1="12" y1="20" x2="12" y2="4"></line><line x1="6" y1="20" x2="6" y2="14"></line></svg>
+            <span class="nav-label">用量统计</span>
+          </button>
+        </div>
+
+        <div class="nav-group">
+          <div class="nav-group-label">自动化与工具</div>
           <button class="nav-btn" data-view="todo" title="待办">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <polyline points="9 11 12 14 22 4"></polyline>
               <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path>
             </svg>
             <span class="nav-label">待办</span>
+          </button>
+          <button class="nav-btn" data-view="schedule" title="定时任务">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"></circle>
+              <polyline points="12 6 12 12 16 14"></polyline>
+            </svg>
+            <span class="nav-label">定时任务</span>
           </button>
           <button class="nav-btn" data-view="tools" title="工具">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -96,13 +133,6 @@
               <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
             </svg>
             <span class="nav-label">提示词</span>
-          </button>
-          <button class="nav-btn" data-view="schedule" title="定时任务">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="12" cy="12" r="10"></circle>
-              <polyline points="12 6 12 12 16 14"></polyline>
-            </svg>
-            <span class="nav-label">定时任务</span>
           </button>
         </div>
 
@@ -300,12 +330,58 @@
       </div>
       <div id="workflowDesigner" class="workflow-designer">
         <div class="wf-sidebar">
-          <input id="wfSearch" placeholder="搜索节点...">
+          <input id="wfSearch" placeholder="搜索节点类型...">
           <div id="wfNodeList" class="wf-node-list"></div>
+          <div class="wf-sidebar-footer">
+            <button class="mini-btn wf-sidebar-add" id="wfAddNodeBtn2" title="添加节点(编号选择)">+ 节点</button>
+          </div>
         </div>
-        <div class="wf-canvas-wrap">
-          <svg id="wfSvg" class="wf-svg"></svg>
-          <div id="wfProperties" class="wf-properties" hidden></div>
+        <div class="wf-main">
+          <div id="wfToolbar" class="wf-toolbar" hidden>
+            <button class="mini-btn" id="wfRunBtn" title="运行工作流 (Ctrl+R)">▶ 运行</button>
+            <button class="mini-btn" id="wfSaveBtn" title="保存布局与配置 (Ctrl+S)">保存</button>
+            <button class="mini-btn" id="wfSaveVersionBtn" title="保存版本快照">📌 版本</button>
+            <button class="mini-btn" id="wfLayoutBtn" title="自动网格布局">布局</button>
+            <span class="wf-toolbar-group">
+              <button class="mini-btn" id="wfZoomOutBtn" title="缩小">－</button>
+              <button class="mini-btn" id="wfZoomResetBtn" title="重置缩放 (100%)">100%</button>
+              <button class="mini-btn" id="wfZoomInBtn" title="放大">＋</button>
+            </span>
+            <button class="mini-btn" id="wfAiGenBtn" title="AI 生成工作流">✨ AI</button>
+            <button class="mini-btn" id="wfExportBtn" title="导出工作流 JSON">📤 导出</button>
+            <button class="mini-btn" id="wfImportBtn" title="导入工作流 JSON">📥 导入</button>
+            <button class="mini-btn" id="wfCreateScheduleBtn" title="创建定时调度">⏰ 调度</button>
+            <button class="mini-btn" id="wfStatsBtn" title="查看运行统计">📊 统计</button>
+            <button class="mini-btn danger" id="wfDeleteBtn" title="删除当前工作流">删除</button>
+            <div class="wf-toolbar-status">
+              <span id="wfRunStatus" class="wf-run-status"></span>
+            </div>
+          </div>
+          <div class="wf-canvas-wrap">
+            <svg id="wfSvg" class="wf-svg"></svg>
+            <div id="wfProperties" class="wf-properties" hidden></div>
+            <div id="wfRunPanel" class="wf-run-panel" hidden></div>
+            <div id="wfStatsPanel" class="wf-stats-panel" hidden>
+              <div id="wfStatsContent"></div>
+            </div>
+          </div>
+          <div class="wf-run-history-wrap" hidden id="wfRunHistoryWrap">
+            <div class="wf-run-history-head">
+              <span>📊 运行记录</span>
+              <button class="mini-btn" id="wfRunHistoryRefresh">刷新</button>
+            </div>
+            <div id="wfRunHistory" class="wf-run-history"></div>
+          </div>
+          <div class="wf-secondary-panels" hidden id="wfSecondaryPanels">
+            <div class="wf-side-panel" id="wfVersionPanel">
+              <div class="wf-panel-head"><span>📌 版本历史</span><button class="mini-btn close-panel" id="closeVersionPanel">×</button></div>
+              <div id="wfVersionList" class="wf-version-list"></div>
+            </div>
+            <div class="wf-side-panel" id="wfSchedulePanel">
+              <div class="wf-panel-head"><span>⏰ 定时调度</span><button class="mini-btn close-panel" id="closeSchedulePanel">×</button></div>
+              <div id="wfScheduleList" class="wf-schedule-list"></div>
+            </div>
+          </div>
         </div>
       </div>
       <div id="workflowList" class="workflow-list"></div>
@@ -648,7 +724,7 @@
   <script src="js/workflow-list.js"></script>
   <script src="js/workflow-designer.js"></script>
   <script src="js/workflow-ops.js"></script>
-  <script src="js/workflow.js?v=2"></script>
+  <script src="js/workflow.js?v=9"></script>
   <script src="js/briefing.js"></script>
   <script src="js/projects.js"></script>
   <script src="js/confirm.js"></script>

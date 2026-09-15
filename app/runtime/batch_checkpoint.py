@@ -95,17 +95,20 @@ class BatchCheckpointManager:
     
     async def save(self, state: AgentState) -> str:
         """保存状态到缓冲区(非阻塞)。
-        
+
         Args:
             state: Agent 状态
-            
+
         Returns:
             run_id
         """
+        run_id = state.run_id
+        now = time.time()
+        need_flush = False
+
+        # 只在写缓冲区时持锁;flush 单独持锁(asyncio.Lock 不可重入,
+        # 若在 save 的锁内再调 flush 会自锁死,导致整轮 agent.run 挂起无输出)
         async with self._lock:
-            run_id = state.run_id
-            now = time.time()
-            
             if run_id in self._buffer:
                 # 更新已有缓冲
                 entry = self._buffer[run_id]
@@ -115,22 +118,24 @@ class BatchCheckpointManager:
             else:
                 # 新建缓冲
                 if len(self._buffer) >= self._max_buffer_size:
-                    # 缓冲区满，强制刷新最旧的一个
+                    # 缓冲区满，强制刷新最旧的一个(锁外执行,避免自锁)
                     await self._evict_oldest()
                 self._buffer[run_id] = BufferedState(
                     state=state,
                     last_modified=now,
                     modify_count=1,
                 )
-            
+
             self._stats["buffered_count"] += 1
             logger.debug("Checkpoint 缓冲写入: %s (buffer_size=%d)", run_id[:8], len(self._buffer))
-            
-            # 如果修改次数较多，立即刷新
-            if state.status in ("done", "failed", "interrupted", "cancelled"):
-                await self.flush(run_id)
-            
-            return run_id
+
+            # 终态(done/failed/interrupted/cancelled)需立即落盘, 在释放锁后执行
+            need_flush = state.status in ("done", "failed", "interrupted", "cancelled")
+
+        if need_flush:
+            await self.flush(run_id)
+
+        return run_id
     
     async def flush(self, run_id: str) -> None:
         """刷新指定 run_id 的缓冲到磁盘。

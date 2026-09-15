@@ -15,7 +15,8 @@ from pydantic import BaseModel, Field
 from app.api.security import require_api_key
 from app.config import settings
 from app.core.workflow.models import (
-    Workflow, WorkflowNode, WorkflowEdge, NodeType, NodeStatus,
+    Workflow, WorkflowNode, WorkflowEdge, WorkflowRun,
+    NodeType, NodeStatus,
     ErrorStrategy, LoopMode
 )
 from app.core.workflow.executor import WorkflowExecutor
@@ -47,6 +48,7 @@ class WorkflowUpdateRequest(BaseModel):
     edges: list[dict] = Field(default_factory=list, description="完整替换")
     entry_node: Optional[str] = None
     error_mode: Optional[str] = None
+    timeout: Optional[float] = None
 
 
 class NodeCreateRequest(BaseModel):
@@ -76,6 +78,8 @@ class NodeUpdateRequest(BaseModel):
     # 循环配置
     loop_mode: Optional[str] = None
     subgraph_ids: Optional[list[str]] = None
+    # 手动排版位置(设计器拖拽后持久化)
+    position: Optional[dict] = None
 
 
 class EdgeCreateRequest(BaseModel):
@@ -127,6 +131,11 @@ def _get_agent() -> Agent:
 # 生命周期
 # ============================================================
 
+# 说明: 工作流路由挂在 app.main 的 app.include_router(..., dependencies=_auth) 上,
+# 鉴权由 include_router 统一处理, 此处不再重复 import/绑定, 避免与 main.py 冲突。
+# 启动/关闭: FastAPI 新版推荐用 lifespan 钩子; 这里保留 on_event 兼容旧调用方,
+# 实际生效的生命周期见 app.main.lifespan(它会调用 workflow.router 的 startup/shutdown)。
+
 @router.on_event("startup")
 async def startup():
     init_db()
@@ -176,6 +185,16 @@ def _ensure_executor(workflow_id: str) -> WorkflowExecutor:
 
 def _parse_node(n: dict) -> WorkflowNode:
     """从请求字典解析节点。"""
+    position = n.get("position")
+    if position is not None:
+        # 校验并归一化 position 字段(防止前端传入脏数据导致渲染异常)
+        if not isinstance(position, dict):
+            position = None
+        else:
+            try:
+                position = {"x": float(position.get("x", 0)), "y": float(position.get("y", 0))}
+            except (TypeError, ValueError):
+                position = None
     return WorkflowNode(
         id=n["id"],
         type=NodeType(n["type"]),
@@ -197,12 +216,17 @@ def _parse_node(n: dict) -> WorkflowNode:
         # 循环配置
         loop_mode=LoopMode(n.get("loop_mode", "sequential")),
         subgraph_ids=n.get("subgraph_ids", []),
+        position=position,
     )
 
 
-def _parse_edge(e: dict) -> WorkflowEdge:
+def _parse_edge(e: dict, fallback_seq: int = 0) -> WorkflowEdge:
+    """从请求字典解析边。优先保留调用方传入的稳定 id, 否则用序号兜底。"""
+    edge_id = e.get("id")
+    if not edge_id:
+        edge_id = f"edge_{fallback_seq}"
     return WorkflowEdge(
-        id=f"edge_{int(time.time() * 1000)}_{len(e.get('source', ''))}",
+        id=edge_id,
         source=e["source"],
         target=e["target"],
         condition=e.get("condition"),
@@ -244,7 +268,7 @@ async def create_workflow(req: WorkflowCreateRequest):
         raise HTTPException(400, f"入口节点 {req.entry_node} 不存在")
 
     nodes = {n["id"]: _parse_node(n) for n in req.nodes}
-    edges = [_parse_edge(e) for e in req.edges]
+    edges = [_parse_edge(e, i) for i, e in enumerate(req.edges)]
 
     now = time.time()
     wf_id = f"wf_{int(now * 1000)}"
@@ -383,7 +407,7 @@ async def generate_workflow(req: WorkflowGenerateRequest):
         name=wf_name,
         description=wf_desc,
         nodes={n["id"]: _parse_node(n) for n in nodes},
-        edges=[_parse_edge(e) for e in edges],
+        edges=[_parse_edge(e, i) for i, e in enumerate(edges)],
         entry_node=entry_node,
         created_at=now,
         updated_at=now,
@@ -417,6 +441,8 @@ async def update_workflow(workflow_id: str, req: WorkflowUpdateRequest):
         wf.entry_node = req.entry_node
     if req.error_mode is not None:
         wf.error_mode = req.error_mode
+    if req.timeout is not None:
+        wf.timeout = req.timeout
 
     if req.nodes:
         new_nodes = {}
@@ -445,6 +471,15 @@ async def update_workflow(workflow_id: str, req: WorkflowUpdateRequest):
                     existing.loop_mode = LoopMode(n["loop_mode"])
                 if "subgraph_ids" in n:
                     existing.subgraph_ids = n["subgraph_ids"]
+                if "position" in n:
+                    _p = n.get("position")
+                    if isinstance(_p, dict):
+                        try:
+                            existing.position = {"x": float(_p.get("x", 0)), "y": float(_p.get("y", 0))}
+                        except (TypeError, ValueError):
+                            existing.position = None
+                    else:
+                        existing.position = None
                 new_nodes[nid] = existing
             else:
                 node = _parse_node(n)
@@ -454,8 +489,10 @@ async def update_workflow(workflow_id: str, req: WorkflowUpdateRequest):
     if req.edges:
         new_edges = []
         for i, e in enumerate(req.edges):
+            # 保留请求方传入的稳定 id(前端据此做边的选中/删除),缺失时回退为序号 id
+            edge_id = e.get("id") or f"edge_{i}"
             new_edges.append(WorkflowEdge(
-                id=f"edge_{i}",
+                id=edge_id,
                 source=e["source"],
                 target=e["target"],
                 condition=e.get("condition"),
@@ -500,11 +537,12 @@ async def get_workflow(workflow_id: str):
                 "fallback_node_id": n.fallback_node_id,
                 "loop_mode": n.loop_mode.value,
                 "subgraph_ids": n.subgraph_ids,
+                "position": n.position,
             }
             for n in wf.nodes.values()
         ],
         "edges": [
-            {"source": e.source, "target": e.target,
+            {"id": e.id, "source": e.source, "target": e.target,
              "condition": e.condition, "condition_expr": e.condition_expr}
             for e in wf.edges
         ],
@@ -548,6 +586,15 @@ async def add_node(workflow_id: str, req: NodeCreateRequest):
     loop_mode = LoopMode(req.config.get("loop_mode", "sequential")) if req.config else LoopMode.SEQUENTIAL
     subgraph_ids = req.config.get("subgraph_ids", []) if req.config else []
 
+    pos = req.config.get("position") if req.config else None
+    if isinstance(pos, dict):
+        try:
+            pos = {"x": float(pos.get("x", 0)), "y": float(pos.get("y", 0))}
+        except (TypeError, ValueError):
+            pos = None
+    else:
+        pos = None
+
     node = WorkflowNode(
         id=req.node_id,
         type=NodeType(req.type),
@@ -564,6 +611,7 @@ async def add_node(workflow_id: str, req: NodeCreateRequest):
         fallback_node_id=fallback_node_id,
         loop_mode=loop_mode,
         subgraph_ids=subgraph_ids,
+        position=pos,
     )
     wf.add_node(node)
     wf.updated_at = time.time()
@@ -617,6 +665,16 @@ async def update_node(workflow_id: str, node_id: str, req: NodeUpdateRequest):
         node.loop_mode = LoopMode(req.loop_mode)
     if req.subgraph_ids is not None:
         node.subgraph_ids = req.subgraph_ids
+    # 手动排版位置
+    if req.position is not None:
+        _p = req.position
+        if isinstance(_p, dict):
+            try:
+                node.position = {"x": float(_p.get("x", 0)), "y": float(_p.get("y", 0))}
+            except (TypeError, ValueError):
+                node.position = None
+        else:
+            node.position = None
 
     wf.updated_at = time.time()
     _workflows[workflow_id] = wf
@@ -661,8 +719,13 @@ async def add_edge(workflow_id: str, req: EdgeCreateRequest):
     if existing:
         raise HTTPException(400, "此边已存在")
 
+    # 新边 id:避免与现有边 id 撞车(旧实现直接用 len 做 id, 删除中间边后会产生重复 id)
+    used_ids = {e.id for e in wf.edges}
+    seq = len(wf.edges)
+    while f"edge_{seq}" in used_ids:
+        seq += 1
     edge = WorkflowEdge(
-        id=f"edge_{len(wf.edges)}",
+        id=f"edge_{seq}",
         source=req.source,
         target=req.target,
         condition=req.condition,
@@ -735,11 +798,16 @@ async def run_workflow_stream(workflow_id: str, req: WorkflowRunStreamRequest):
     if workflow_id not in _runs:
         _runs[workflow_id] = {}
 
+    # 同一时刻只允许一个流式运行,避免并发跑同一个工作流导致事件缓冲互相串台
+    for existing_run_id, existing_run in list(_runs.get(workflow_id, {}).items()):
+        if existing_run.status == "running":
+            raise HTTPException(409, "该工作流已有正在进行的运行,请等待完成或取消后重试")
+
     # 清空并创建事件缓冲
     _run_events[run_id] = []
 
     # 创建带回调的执行器
-    realtime_executor = WorkflowExecutor(_get_agent(), on_node_event=lambda rid, nid, status, result=None, error=None: _run_events.get(rid, []).append({
+    realtime_executor = WorkflowExecutor(on_node_event=lambda rid, nid, status, result=None, error=None: _run_events.get(rid, []).append({
         "event": f"node_{status}",
         "node_id": nid,
         "status": status,
@@ -750,7 +818,7 @@ async def run_workflow_stream(workflow_id: str, req: WorkflowRunStreamRequest):
     async def _event_stream():
         # 启动运行任务
         run_task = asyncio.create_task(
-            realtime_executor.run(wf, req.inputs or {}, run_id=run_id, session_id=req.session_id)
+            realtime_executor.run(wf, req.inputs or {}, run_id=run_id, session_id=req.session_id, agent=_get_agent())
         )
 
         # 发送运行开始事件
@@ -761,17 +829,45 @@ async def run_workflow_stream(workflow_id: str, req: WorkflowRunStreamRequest):
         try:
             run = await asyncio.wait_for(run_task, timeout=wf.timeout or 1800)
         except asyncio.TimeoutError:
+            # 运行任务因超时被 wait_for 取消,把超时也记录进 run,便于前端/历史面板看到真实状态
+            run_task.cancel()
+            run = WorkflowRun(
+                run_id=run_id,
+                workflow_id=wf.id,
+                status="failed",
+                session_id=req.session_id,
+                error=f"运行超时({int(wf.timeout or 1800)}s)",
+                started_at=time.time(),
+                finished_at=time.time(),
+            )
+            _runs.setdefault(workflow_id, {})[run_id] = run
+            get_db().save_run(run)
             yield f"event: run_error\n"
-            yield f"data: {json.dumps({'error': '运行超时'})}\n\n"
+            yield f"data: {json.dumps({'run_id': run_id, 'error': '运行超时', 'status': 'failed', 'terminal': True})}\n\n"
             return
         except Exception as e:
+            run_task.cancel()
+            failed_run = WorkflowRun(
+                run_id=run_id,
+                workflow_id=wf.id,
+                status="failed",
+                session_id=req.session_id,
+                error=str(e),
+                started_at=time.time(),
+                finished_at=time.time(),
+            )
+            _runs.setdefault(workflow_id, {})[run_id] = failed_run
+            get_db().save_run(failed_run)
             yield f"event: run_error\n"
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            yield f"data: {json.dumps({'run_id': run_id, 'error': str(e), 'status': 'failed', 'terminal': True})}\n\n"
             return
 
-        # 发送所有中间节点事件
+        # 发送所有中间节点事件(跳过运行级 __run__ 事件,前端只关心具体节点状态,
+        # 避免历史面板把每次运行级事件也当成"节点失败"重复入栈)
         events = _run_events.pop(run_id, [])
         for evt in events:
+            if evt.get('node_id') == '__run__':
+                continue
             yield f"event: {evt['event']}\n"
             yield f"data: {json.dumps({
                 'run_id': run_id,
@@ -781,7 +877,7 @@ async def run_workflow_stream(workflow_id: str, req: WorkflowRunStreamRequest):
                 'error': evt.get('error'),
             })}\n\n"
 
-        # 发送最终状态
+        # 发送最终状态(带 terminal=true 标记,前端据此只入栈一次运行历史)
         yield f"event: run_done\n"
         yield f"data: {json.dumps({
             'run_id': run_id,
@@ -790,6 +886,8 @@ async def run_workflow_stream(workflow_id: str, req: WorkflowRunStreamRequest):
             'output': run.output,
             'error': run.error,
             'node_states': run.node_states,
+            'history': run.history,
+            'terminal': True,
         })}\n\n"
 
         # 保存到内存和数据库
@@ -1248,3 +1346,373 @@ async def cleanup_checkpoints(max_age_hours: float = 24.0):
     mgr = WorkflowCheckpointManager("")
     deleted = mgr.cleanup_old_checkpoints(max_age_hours=max_age_hours)
     return {"deleted": deleted, "max_age_hours": max_age_hours}
+
+
+# ============================================================
+# 版本管理
+# ============================================================
+
+class VersionCreateRequest(BaseModel):
+    version: str = Field(..., description="版本号,如 v1.1.0")
+    comment: str = Field("", description="版本说明")
+
+
+@router.post("/{workflow_id}/versions")
+async def save_workflow_version(workflow_id: str, req: VersionCreateRequest):
+    """保存工作流版本快照。"""
+    wf = _load_workflow(workflow_id)
+    if not wf:
+        raise HTTPException(404, "工作流不存在")
+
+    nodes_json = json.dumps([
+        {
+            "id": n.id, "type": n.type.value, "name": n.name, "config": n.config,
+            "tool_name": n.tool_name, "agent_config": n.agent_config,
+            "condition_expr": n.condition_expr, "branches": n.branches,
+            "timeout": n.timeout, "error_strategy": n.error_strategy.value,
+            "retry_count": n.retry_count, "retry_delay": n.retry_delay,
+            "fallback_node_id": n.fallback_node_id, "loop_mode": n.loop_mode.value,
+            "subgraph_ids": n.subgraph_ids, "position": n.position,
+        }
+        for n in wf.nodes.values()
+    ])
+    edges_json = json.dumps([
+        {"id": e.id, "source": e.source, "target": e.target,
+         "condition": e.condition, "condition_expr": e.condition_expr}
+        for e in wf.edges
+    ])
+
+    version_id = get_db().save_version(
+        workflow_id=workflow_id,
+        version=req.version,
+        nodes_json=nodes_json,
+        edges_json=edges_json,
+        metadata={"comment": req.comment, "node_count": len(wf.nodes), "edge_count": len(wf.edges)},
+    )
+    logger.info(f"工作流版本已保存: {workflow_id} -> {req.version} ({version_id})")
+    return {"version_id": version_id, "version": req.version, "message": "版本已保存"}
+
+
+@router.get("/{workflow_id}/versions")
+async def list_workflow_versions(workflow_id: str, limit: int = 50):
+    """列出工作流版本历史。"""
+    versions = get_db().load_workflow_versions(workflow_id, limit=limit)
+    return {"workflow_id": workflow_id, "versions": versions, "total": len(versions)}
+
+
+@router.get("/{workflow_id}/versions/{version_id}")
+async def get_workflow_version(workflow_id: str, version_id: str):
+    """获取指定版本的完整内容。"""
+    content = get_db().load_version_content(version_id)
+    if not content:
+        raise HTTPException(404, f"版本不存在: {version_id}")
+    return {"version_id": version_id, "nodes": content["nodes"], "edges": content["edges"]}
+
+
+@router.post("/{workflow_id}/versions/{version_id}/rollback")
+async def rollback_to_version(workflow_id: str, version_id: str):
+    """回滚到指定版本。"""
+    wf = _load_workflow(workflow_id)
+    if not wf:
+        raise HTTPException(404, "工作流不存在")
+
+    content = get_db().load_version_content(version_id)
+    if not content:
+        raise HTTPException(404, f"版本不存在: {version_id}")
+
+    # 保存当前版本作为备份
+    now = time.time()
+    backup_version = f"backup_{int(now * 1000)}"
+    nodes_json = json.dumps([{"id": n.id, "type": n.type.value, "name": n.name, "config": n.config}
+                             for n in wf.nodes.values()])
+    edges_json = json.dumps([{"id": e.id, "source": e.source, "target": e.target}
+                             for e in wf.edges])
+    get_db().save_version(workflow_id, backup_version, nodes_json, edges_json,
+                          {"comment": f"自动备份 before rollback to {version_id}"})
+
+    # 加载目标版本
+    nodes_data = content["nodes"]
+    edges_data = content["edges"]
+    nodes = {}
+    for n in nodes_data:
+        error_strategy_str = n.get("error_strategy", "fail_fast")
+        try:
+            error_strategy = ErrorStrategy(error_strategy_str)
+        except ValueError:
+            error_strategy = ErrorStrategy.FAIL_FAST
+        loop_mode_str = n.get("loop_mode", "sequential")
+        try:
+            loop_mode = LoopMode(loop_mode_str)
+        except ValueError:
+            loop_mode = LoopMode.SEQUENTIAL
+        nodes[n["id"]] = WorkflowNode(
+            id=n["id"], type=NodeType(n["type"]), name=n.get("name", n["id"]),
+            config=n.get("config", {}), tool_name=n.get("tool_name"),
+            agent_config=n.get("agent_config"), condition_expr=n.get("condition_expr"),
+            branches=n.get("branches", {}), timeout=n.get("timeout", 60),
+            error_strategy=error_strategy, retry_count=n.get("retry_count", 0),
+            retry_delay=n.get("retry_delay", 0.5), fallback_node_id=n.get("fallback_node_id"),
+            loop_mode=loop_mode, subgraph_ids=n.get("subgraph_ids", []),
+            position=n.get("position"),
+        )
+    edges = [
+        WorkflowEdge(id=e.get("id") or f"edge_{i}", source=e["source"], target=e["target"],
+                     condition=e.get("condition"), condition_expr=e.get("condition_expr"))
+        for i, e in enumerate(edges_data)
+    ]
+
+    wf.nodes = nodes
+    wf.edges = edges
+    wf.updated_at = now
+    _workflows[workflow_id] = wf
+    _executors[workflow_id] = WorkflowExecutor(_get_agent())
+    get_db().save_workflow(wf)
+    logger.info(f"工作流已回滚到版本: {version_id}")
+    return {"message": f"已回滚到版本 {version_id}", "backup_version": backup_version}
+
+
+# ============================================================
+# 导出 / 导入
+# ============================================================
+
+class WorkflowImportRequest(BaseModel):
+    workflow: dict = Field(..., description="完整工作流定义")
+    import_as: str = Field("new", description="导入方式: new=新建 / overwrite=覆盖现有")
+    workflow_id: Optional[str] = Field(None, description="覆盖时的目标 ID")
+
+
+@router.get("/{workflow_id}/export")
+async def export_workflow(workflow_id: str):
+    """导出工作流为完整 JSON。"""
+    wf = _load_workflow(workflow_id)
+    if not wf:
+        raise HTTPException(404, "工作流不存在")
+    return {
+        "id": wf.id, "name": wf.name, "description": wf.description, "version": wf.version,
+        "nodes": [
+            {
+                "id": n.id, "type": n.type.value, "name": n.name, "config": n.config,
+                "description": n.description, "tool_name": n.tool_name,
+                "agent_config": n.agent_config, "condition_expr": n.condition_expr,
+                "branches": n.branches, "timeout": n.timeout,
+                "error_strategy": n.error_strategy.value,
+                "retry_count": n.retry_count, "retry_delay": n.retry_delay,
+                "fallback_node_id": n.fallback_node_id, "loop_mode": n.loop_mode.value,
+                "subgraph_ids": n.subgraph_ids, "position": n.position,
+            }
+            for n in wf.nodes.values()
+        ],
+        "edges": [
+            {"id": e.id, "source": e.source, "target": e.target,
+             "condition": e.condition, "condition_expr": e.condition_expr}
+            for e in wf.edges
+        ],
+        "entry_node": wf.entry_node, "error_mode": wf.error_mode, "timeout": wf.timeout,
+        "created_at": wf.created_at, "updated_at": wf.updated_at,
+    }
+
+
+@router.post("/import")
+async def import_workflow(req: WorkflowImportRequest):
+    """从 JSON 导入工作流。"""
+    wf_data = req.workflow
+    if req.import_as == "overwrite" and req.workflow_id:
+        wf_id = req.workflow_id
+        wf = _load_workflow(wf_id)
+        if not wf:
+            raise HTTPException(404, "目标工作流不存在")
+    else:
+        wf_id = f"wf_{int(time.time() * 1000)}"
+        wf = None
+
+    nodes = {}
+    for n in wf_data.get("nodes", []):
+        error_strategy_str = n.get("error_strategy", "fail_fast")
+        try:
+            error_strategy = ErrorStrategy(error_strategy_str)
+        except ValueError:
+            error_strategy = ErrorStrategy.FAIL_FAST
+        loop_mode_str = n.get("loop_mode", "sequential")
+        try:
+            loop_mode = LoopMode(loop_mode_str)
+        except ValueError:
+            loop_mode = LoopMode.SEQUENTIAL
+        node = WorkflowNode(
+            id=n["id"], type=NodeType(n["type"]), name=n.get("name", n["id"]),
+            config=n.get("config", {}), description=n.get("description", ""),
+            tool_name=n.get("tool_name"), agent_config=n.get("agent_config"),
+            condition_expr=n.get("condition_expr"), loop_config=n.get("loop_config"),
+            http_config=n.get("http_config"), script_code=n.get("script_code"),
+            timeout=n.get("timeout", 60), branches=n.get("branches", {}),
+            error_strategy=error_strategy, retry_count=n.get("retry_count", 0),
+            retry_delay=n.get("retry_delay", 0.5), fallback_node_id=n.get("fallback_node_id"),
+            loop_mode=loop_mode, subgraph_ids=n.get("subgraph_ids", []),
+            position=n.get("position"),
+        )
+        nodes[node.id] = node
+
+    edges = [
+        WorkflowEdge(id=e.get("id") or f"edge_{i}", source=e["source"], target=e["target"],
+                     condition=e.get("condition"), condition_expr=e.get("condition_expr"))
+        for i, e in enumerate(wf_data.get("edges", []))
+    ]
+
+    now = time.time()
+    if wf:
+        wf.nodes = nodes
+        wf.edges = edges
+        wf.entry_node = wf_data.get("entry_node", wf.entry_node)
+        wf.error_mode = wf_data.get("error_mode", wf.error_mode)
+        wf.timeout = wf_data.get("timeout", wf.timeout)
+        wf.updated_at = now
+    else:
+        wf = Workflow(
+            id=wf_id, name=wf_data.get("name", "导入工作流"),
+            description=wf_data.get("description", ""), version=wf_data.get("version", "1.0.0"),
+            nodes=nodes, edges=edges, entry_node=wf_data.get("entry_node"),
+            error_mode=wf_data.get("error_mode", "fail_fast"),
+            timeout=wf_data.get("timeout", 1800.0), created_at=now, updated_at=now,
+        )
+
+    errors = wf.validate()
+    if errors:
+        raise HTTPException(400, "; ".join(errors))
+
+    _workflows[wf_id] = wf
+    _executors[wf_id] = WorkflowExecutor(_get_agent())
+    _runs[wf_id] = {}
+    get_db().save_workflow(wf)
+    logger.info(f"工作流已导入: {wf_id} ({wf.name})")
+    return {"id": wf_id, "name": wf.name, "message": "工作流导入成功"}
+
+
+# ============================================================
+# 调度管理
+# ============================================================
+
+from croniter import croniter
+
+
+class ScheduleCreateRequest(BaseModel):
+    name: str = Field(..., description="调度名称")
+    cron_expr: str = Field(..., description="Cron 表达式,如 '0 9 * * *'")
+    inputs: dict = Field(default_factory=dict, description="运行输入变量")
+    session_id: str = Field("default", description="关联会话")
+
+
+class ScheduleUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    cron_expr: Optional[str] = None
+    inputs: Optional[dict] = None
+    enabled: Optional[bool] = None
+
+
+# 内存中的调度器: {schedule_id: {next_run_at, task}}
+_schedules: dict[str, dict] = {}
+
+
+@router.post("/{workflow_id}/schedules")
+async def create_schedule(workflow_id: str, req: ScheduleCreateRequest):
+    """创建定时调度。"""
+    wf = _load_workflow(workflow_id)
+    if not wf:
+        raise HTTPException(404, "工作流不存在")
+
+    # 验证 cron 表达式
+    try:
+        cron = croniter(req.cron_expr, __import__("datetime").datetime.now())
+        next_run = cron.get_next(__import__("datetime").datetime)
+        next_run_ts = next_run.timestamp()
+    except Exception as e:
+        raise HTTPException(400, f"Cron 表达式无效: {e}")
+
+    schedule_id = f"sch_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+    get_db().save_schedule(
+        schedule_id=schedule_id, workflow_id=workflow_id, cron_expr=req.cron_expr,
+        name=req.name, enabled=True, next_run_at=next_run_ts,
+    )
+    _schedules[schedule_id] = {
+        "workflow_id": workflow_id, "cron_expr": req.cron_expr, "inputs": req.inputs,
+        "session_id": req.session_id, "next_run_at": next_run_ts, "enabled": True,
+    }
+    logger.info(f"定时调度已创建: {schedule_id} -> {workflow_id}")
+    return {"schedule_id": schedule_id, "next_run_at": next_run_ts, "message": "调度已创建"}
+
+
+@router.get("/{workflow_id}/schedules")
+async def list_schedules(workflow_id: str):
+    """列出工作流的定时调度。"""
+    schedules = get_db().load_schedules(workflow_id=workflow_id)
+    return {"schedules": schedules, "total": len(schedules)}
+
+
+@router.patch("/{workflow_id}/schedules/{schedule_id}")
+async def update_schedule(workflow_id: str, schedule_id: str, req: ScheduleUpdateRequest):
+    """更新定时调度配置。"""
+    schedule = get_db().load_schedules(workflow_id=workflow_id)
+    schedule = next((s for s in schedule if s["schedule_id"] == schedule_id), None)
+    if not schedule:
+        raise HTTPException(404, "调度不存在")
+
+    kwargs = {}
+    if req.name is not None:
+        kwargs["name"] = req.name
+    if req.cron_expr is not None:
+        try:
+            cron = croniter(req.cron_expr, __import__("datetime").datetime.now())
+            kwargs["cron_expr"] = req.cron_expr
+            kwargs["next_run_at"] = cron.get_next(__import__("datetime").datetime).timestamp()
+        except Exception as e:
+            raise HTTPException(400, f"Cron 表达式无效: {e}")
+    if req.inputs is not None:
+        kwargs["inputs"] = req.inputs
+    if req.enabled is not None:
+        kwargs["enabled"] = req.enabled
+        if schedule_id in _schedules:
+            _schedules[schedule_id]["enabled"] = req.enabled
+
+    get_db().update_schedule(schedule_id, **kwargs)
+    if schedule_id in _schedules:
+        _schedules[schedule_id].update(kwargs)
+    return {"message": "调度已更新"}
+
+
+@router.delete("/{workflow_id}/schedules/{schedule_id}")
+async def delete_schedule(workflow_id: str, schedule_id: str):
+    """删除定时调度。"""
+    if get_db().delete_schedule(schedule_id):
+        _schedules.pop(schedule_id, None)
+        return {"message": "调度已删除"}
+    raise HTTPException(404, "调度不存在")
+
+
+@router.post("/{workflow_id}/schedules/{schedule_id}/toggle")
+async def toggle_schedule(workflow_id: str, schedule_id: str):
+    """切换调度启用/禁用状态。"""
+    schedule = get_db().load_schedules(workflow_id=workflow_id)
+    schedule = next((s for s in schedule if s["schedule_id"] == schedule_id), None)
+    if not schedule:
+        raise HTTPException(404, "调度不存在")
+    new_enabled = not schedule["enabled"]
+    get_db().update_schedule(schedule_id, enabled=new_enabled)
+    if schedule_id in _schedules:
+        _schedules[schedule_id]["enabled"] = new_enabled
+    return {"enabled": new_enabled, "message": "调度状态已切换"}
+
+
+# ============================================================
+# 统计分析
+# ============================================================
+
+@router.get("/{workflow_id}/stats")
+async def get_workflow_stats(workflow_id: str, days: int = 7):
+    """获取工作流运行统计。"""
+    stats = get_db().get_workflow_stats(workflow_id, days=days)
+    return stats
+
+
+@router.get("/{workflow_id}/perf/nodes")
+async def get_node_performance(workflow_id: str, run_id: str = None):
+    """获取节点性能统计。"""
+    perf = get_db().get_node_performance(workflow_id, run_id=run_id)
+    return {"workflow_id": workflow_id, "nodes": perf}

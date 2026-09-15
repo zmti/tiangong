@@ -247,7 +247,11 @@ async def layered_compress(
 
     # 三分:最早 40% → 摘要;中段 60% → 抽事实
     n = len(old)
+    # 修复: 摘要/抽事实 LLM 只认 OpenAI 合法角色, 先降级 error/plan/孤立tool
+    from app.memory.session import sanitize_history_for_llm
     very_old, mid = old[: int(n * 0.4)], old[int(n * 0.4):]
+    very_old = sanitize_history_for_llm(very_old)
+    mid = sanitize_history_for_llm(mid)
 
     stats: dict = {"strategy": "layered", "fact_count": 0, "summary": False}
 

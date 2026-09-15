@@ -1,6 +1,22 @@
 /* 聊天模块:SSE 流式对话 / 工具事件 / 停止生成 / 图片识别 */
 App.Chat = App.Chat || {};
 
+/* 统一滚动到底部工具函数 - 防抖优化 */
+App._scrollToBottomTimer = null;
+App.scrollMessagesToBottom = function(force = false) {
+  if (App._scrollToBottomTimer && !force) return;
+  App._scrollToBottomTimer = requestAnimationFrame(() => {
+    App._scrollToBottomTimer = null;
+    if (!App.els || !App.els.messages) return;
+    const el = App.els.messages;
+    // 仅当用户已在底部极近距离(<10%)时才跟随滚动,否则保持原位
+    const threshold = force ? 100 : el.clientHeight * 0.1;
+    if (force || el.scrollHeight - el.scrollTop <= el.clientHeight + threshold) {
+      el.scrollTop = el.scrollHeight;
+    }
+  });
+};
+
 /* 引用回复状态 */
 App._replyQuote = null;
 
@@ -55,6 +71,7 @@ App.Chat.modeParams = function () {
 App.Chat.send = async function () {
   // 已选图片时,发送即执行图片识别
   if (App.selectedImageFile) {
+    if (App.streaming) return; // 流式中不可并发发送(与文本一致, 避免双 SSE 竞争)
     const f = App.selectedImageFile;
     App.selectedImageFile = null;
     App.els.imgPreviewBar.classList.remove('show');
@@ -65,7 +82,12 @@ App.Chat.send = async function () {
   }
   const input = App.els.input;
   const text = input.value.trim();
-  if (!text || App.streaming) return;
+  /* 修复"不知道是否可发送": send 的"可否发送"判断走 App.canSend()(renderer.js 单一事实源),
+     避免各处自行判断 streaming/input 状态不一致 */
+  if (!App.canSend()) {
+    if (text && App.streaming) App.toast && App.toast('正在生成中, 点停止按钮后再发新消息', 'info');
+    return;
+  }
   App.lastUserText = text;
   App._lastUserWrap = null;
   await App.Chat.doSend(text);
@@ -81,7 +103,7 @@ App.Chat.regenerate = async function (wrap) {
   let userText = '';
   let userNode = null;
   for (let i = baseIdx; i >= 0; i--) {
-    if (nodes[i].classList.contains('user')) {
+    if (nodes[i].classList.contains('user') || nodes[i].classList.contains('msg-user')) {
       const b = nodes[i].querySelector('.answer-doc');
       userText = b ? (b.textContent || '').trim() : '';
       userNode = nodes[i];
@@ -227,6 +249,14 @@ App.Chat.doSend = async function (text, opts = {}) {
   // 每轮重置思考卡/答案锚点,避免上一轮残留导致本轮 thinking 错位
   App._thinkingWrap = null;
   App._answerWrap = null;
+  /* 修复"再次发送后状态错乱/不能停止/不知可否发送": 引入发送代次(stamp)。
+     旧实现中, 当新 doSend abort 旧流时, 旧流的 reader.read() 抛 AbortError,
+     其 finally 会异步执行 setStreaming(false) + 强制 sendBtn.disabled=false,
+     把新流刚设好的 streaming=true / stopBtn.show 覆盖掉 → 停止按钮消失、
+     发送按钮状态错乱。现每轮记录 stamp, finally 只在与当前代次匹配时才
+     重置全局 streaming 状态, 旧代次直接跳过, 不再干扰新流。 */
+  App.Chat._sendSeq = (App.Chat._sendSeq || 0) + 1;
+  const mySeq = App.Chat._sendSeq;
   // 标记是否已完成最终渲染(防止 scheduleRender 在 done 后重复渲染)
   let renderDone = false;
   // 每轮取消上一轮的流式请求，避免并发 SSE 竞争
@@ -341,33 +371,75 @@ App.Chat.doSend = async function (text, opts = {}) {
     if (renderTimer !== null) { clearTimeout(renderTimer); renderTimer = null; }
   }
 
+  // 增量渲染优化：记录已渲染的偏移量，只渲染新增部分
+  let _mdRenderedOffset = 0;
+  let _lastRenderedHtml = '';
+  
   function scheduleRender() {
     if (renderTimer !== null) return;
     // 已完成渲染则跳过,防止 done 之后 scheduleRender 再次触发造成重复渲染
     if (renderDone) return;
-    renderTimer = setTimeout(() => {
+    renderTimer = requestAnimationFrame(() => {
       renderTimer = null;
       if (!answerDiv) return;
       const md = App._mdBuf || '';
       if (!md) return;
-      let html = '';
-      try {
-        html = App.renderMarkdown(md);
-      } catch (renderErr) {
-        console.error('[renderMarkdown] scheduleRender ERROR:', renderErr);
-        // fallback: 必须 escape,防止原始 JSON/HTML 含 < 被解析为元素或泄露事件内容
-        html = '<p style="white-space:pre-wrap;word-break:break-word;">' + App.escapeHtml(md) + '</p>';
+      
+      // 增量渲染：检查是否有新内容
+      if (md.length <= _mdRenderedOffset) return;
+      
+      // 对于短文本或首次渲染，使用全量渲染
+      if (_mdRenderedOffset === 0 || md.length < 500) {
+        let html = '';
+        try {
+          html = App.renderMarkdown(md);
+        } catch (renderErr) {
+          console.error('[renderMarkdown] scheduleRender ERROR:', renderErr);
+          html = '<p style="white-space:pre-wrap;word-break:break-word;">' + App.escapeHtml(md) + '</p>';
+        }
+        answerDiv.innerHTML = html;
+        _lastRenderedHtml = html;
+        _mdRenderedOffset = md.length;
+      } else {
+        // 增量渲染：只渲染新增部分并追加
+        const newContent = md.slice(_mdRenderedOffset);
+        // 检查新增内容是否包含块级元素的开始（如代码块、列表等）
+        // 如果包含，需要全量重渲染以确保正确解析
+        const hasBlockElement = /```|^\s*[-*]\s|^\s*\d+\.\s|^\s*>|^\s*#{1,6}\s|<\/?think/m.test(newContent);
+        
+        if (hasBlockElement) {
+          // 包含块级元素，全量重渲染
+          let html = '';
+          try {
+            html = App.renderMarkdown(md);
+          } catch (renderErr) {
+            console.error('[renderMarkdown] scheduleRender ERROR:', renderErr);
+            html = '<p style="white-space:pre-wrap;word-break:break-word;">' + App.escapeHtml(md) + '</p>';
+          }
+          answerDiv.innerHTML = html;
+          _lastRenderedHtml = html;
+        } else {
+          // 纯文本增量，直接追加
+          const appendedHtml = App.renderMarkdown(newContent);
+          // 移除包裹的<p>标签（如果只有一个）
+          const tempDiv = document.createElement('div');
+          tempDiv.innerHTML = appendedHtml;
+          if (tempDiv.children.length === 1 && tempDiv.children[0].tagName === 'P') {
+            answerDiv.appendChild(tempDiv.children[0]);
+          } else {
+            answerDiv.insertAdjacentHTML('beforeend', appendedHtml);
+          }
+          _lastRenderedHtml = answerDiv.innerHTML;
+        }
+        _mdRenderedOffset = md.length;
       }
-      // 整段重渲染:保证跨切片边界的代码块/列表/表格等块级结构被正确解析
-      answerDiv.innerHTML = html;
-      // 仅当用户已在底部极近距离(<5%)时才跟随滚动,否则保持原位
-      if (App.els.messages.scrollHeight - App.els.messages.scrollTop <= App.els.messages.clientHeight * 0.05) {
-        App.els.messages.scrollTop = App.els.messages.scrollHeight;
-      }
-    }, 16);
+      
+      // 使用统一的滚动函数
+      App.scrollMessagesToBottom();
+    });
   }
 
-try {
+  try {
     // 【关键修复】在 try 块内设置 streaming 状态，确保 finally 一定能执行
     streamingSet = true;
     App.Chat._streamingStart = Date.now();
@@ -411,8 +483,8 @@ try {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(App.Attach ? App.Attach.patchBody(body) : body),
-          signal,
-        });
+            signal,
+          });
       } catch (fetchErr) {
         if (signal.aborted) throw fetchErr; // 用户主动停止，不重试
         retries++;
@@ -436,19 +508,8 @@ try {
     const decoder = new TextDecoder();
     let buffer = '';
     let value = null; // reader.read() 返回的 Uint8Array 块,显式声明避免隐式全局变量
-    // 绝对上限:即使后端持续产生事件,也不得超过 10 分钟,防止永久挂起
-    hardTimeout = setTimeout(() => {
-      hardTimeout = null;
-      if (!done && !isError) {
-        done = true;
-        isError = true;
-        cleanupStream();
-        if (App.abortController) App.abortController.abort(new DOMException('硬超时', 'TimeoutError'));
-        if (typingShown) App.removeTyping();
-        App.appendMessage('响应超时(超过上限),请稍后重试', 'error');
-        _finishGroup();
-      }
-    }, 600000); // 10 分钟绝对上限
+    // 不设硬超时:agent 可能需要很长时间,让 SSE 连接一直开着
+    // 心跳机制(60 秒)保证空闲时不断线,agent 完成后自然结束
 
     // 重置空闲计时器:每次收到事件都续期,区分"卡死"与"正在干重活(慢但持续活跃)"
     function resetStreamTimeout() {
@@ -473,17 +534,21 @@ try {
       let isDone;
       try {
         const result = await reader.read();
-        console.log('[SSE read]', 'done=', result.done, 'bytes=', result.value ? result.value.byteLength : 0);
+        if (App.DEBUG) console.log('[SSE read]', 'done=', result.done, 'bytes=', result.value ? result.value.byteLength : 0);
         ({ done: isDone, value } = result);
       } catch (readErr) {
-        // 连接异常(如用户停止、切换会话、后端非正常关闭).
-        // 如果已经收到过合法 SSE 事件,不再标记为"响应中断",按正常结束处理(让 done/error 分支的提示保留).
+        // 连接异常(如用户停止、切换会话、后端非正常关闭、代理超时).
+        // 即使收到过事件,连接中断仍意味着流未正常完成,标记为错误以便 finally 块提示用户.
         if (!receivedAnyEvent) isError = true;
+        else if (!done && !isError) {
+          // 已收到过事件但连接中断(如代理超时):流未正常结束,需提示用户
+          isError = true;
+        }
         console.warn('[SSE read error]', readErr && readErr.message);
         break;
       }
       if (isDone) {
-        console.log('[SSE] FINAL buffer:', buffer.substring(0, 500));
+        if (App.DEBUG) console.log('[SSE] FINAL buffer:', buffer.substring(0, 500));
         break;
       }
       buffer += decoder.decode(value, { stream: true });
@@ -496,10 +561,10 @@ try {
         try {
           const evt = JSON.parse(line.slice(6));
           receivedAnyEvent = true; // 标记已收到合法 SSE 事件
-          console.log('[SSE]', evt.type, evt.subtype || '', evt.provider || '', evt.content ? evt.content.substring(0, 30) : '');
+          if (App.DEBUG) console.log('[SSE]', evt.type, evt.subtype || '', evt.provider || '', evt.content ? evt.content.substring(0, 30) : '');
           // 调试: 记录心跳接收情况
           if (evt.type === 'heartbeat') {
-            console.log('[SSE] Heartbeat received, resetting stream timeout');
+            if (App.DEBUG) console.log('[SSE] Heartbeat received, resetting stream timeout');
           }
           resetStreamTimeout(); // 收到任意事件即续期空闲计时器,避免慢任务被误杀
           // heartbeat 事件:后端发送保活信号,前端仅续期超时但不显示
@@ -532,12 +597,18 @@ try {
           // 去重记录:避免同一工具结果重复显示(tool_done 和 tool 事件都可能触发)
           if (evt.type === 'tool_start') {
             // tool_start 是兼容旧事件的兜底处理
-            const existingRunning = Array.from(App.els.messages.children).reverse().find(n => {
-              return n.classList.contains('msg') && n.classList.contains('tool') &&
-                     n.querySelector('.tool-label') &&
-                     n.querySelector('.tool-label').textContent.includes(evt.name || evt.tool || '') &&
-                     !n.classList.contains('done') && !n.classList.contains('fail');
-            });
+            const children = App.els.messages.children;
+            let existingRunning = null;
+            for (let i = children.length - 1; i >= 0; i--) {
+              const n = children[i];
+              if (n.classList.contains('msg') && n.classList.contains('tool') &&
+                  n.querySelector('.tool-label') &&
+                  n.querySelector('.tool-label').textContent.includes(evt.name || evt.tool || '') &&
+                  !n.classList.contains('done') && !n.classList.contains('fail')) {
+                existingRunning = n;
+                break;
+              }
+            }
             if (!existingRunning) {
               App.ExecTrace.addStep(evt.name || evt.tool || '工具', evt.arguments || '', 'running');
             }
@@ -567,11 +638,17 @@ try {
             }
             // 检查是否已有该工具的显示记录,避免重复
             const msgs = App.els.messages;
-            const lastToolMsg = Array.from(msgs.children).reverse().find(n => {
-              return n.classList.contains('msg') && n.classList.contains('tool') &&
-                     n.querySelector('.tool-label') &&
-                     n.querySelector('.tool-label').textContent.includes(doneToolName);
-            });
+            const toolChildren = msgs.children;
+            let lastToolMsg = null;
+            for (let i = toolChildren.length - 1; i >= 0; i--) {
+              const n = toolChildren[i];
+              if (n.classList.contains('msg') && n.classList.contains('tool') &&
+                  n.querySelector('.tool-label') &&
+                  n.querySelector('.tool-label').textContent.includes(doneToolName)) {
+                lastToolMsg = n;
+                break;
+              }
+            }
             if (!lastToolMsg) {
               // 没有重复记录,才显示结果
               App.ExecTrace.updateStep(doneToolName, 'done', '');
@@ -647,8 +724,24 @@ try {
             const rawContent = evt.content || '';
             const thinkText = App.stripThinkingTags ? App.stripThinkingTags(rawContent) : rawContent;
             if (!thinkText.trim()) {
+              // 思考为空:确保 bot 消息已创建, 否则后续 token 无法附着
+              if (!App._currentBotMsg) {
+                const botMsg = App.createBotMessage();
+                answerDiv = botMsg ? botMsg._answer : null;
+                App._currentBotMsg = botMsg || null;
+                if (answerDiv) answerDiv.style.display = '';
+                App._answerWrap = answerDiv ? { _answer: answerDiv, _rail: botMsg?._rail } : null;
+              }
               App.updateRailStatus(App._currentBotMsg, 'thinking', '思考中...');
               continue;
+            }
+            // 确保 bot 消息已创建, 否则思考内容无处附着
+            if (!App._currentBotMsg) {
+              const botMsg = App.createBotMessage();
+              answerDiv = botMsg ? botMsg._answer : null;
+              App._currentBotMsg = botMsg || null;
+              if (answerDiv) answerDiv.style.display = '';
+              App._answerWrap = answerDiv ? { _answer: answerDiv, _rail: botMsg?._rail } : null;
             }
             // 使用规范渲染器
             if (App._currentBotMsg && App.addThinking) {
@@ -662,8 +755,19 @@ try {
               typingShown = true;
               // 移除打字指示器
               const msgs = App.els.messages;
-              const waitMsg = Array.from(msgs.children).reverse().find(n => n.id === 'typing' || (n.classList.contains('msg') && n.classList.contains('bot') && n.textContent.trim() === '正在思考中...'));
-              if (waitMsg) waitMsg.remove();
+              const typingEl = msgs.querySelector('#typing');
+              if (typingEl) {
+                typingEl.remove();
+              } else {
+                const msgChildren = msgs.children;
+                for (let i = msgChildren.length - 1; i >= 0; i--) {
+                  const n = msgChildren[i];
+                  if (n.classList.contains('msg') && n.classList.contains('bot') && n.textContent.trim() === '正在思考中...') {
+                    n.remove();
+                    break;
+                  }
+                }
+              }
             }
             if (!answerDiv) {
               // 创建可见的空 bot 消息 (使用规范渲染器)
@@ -682,7 +786,9 @@ try {
               }
             }
             if (text) {
-              App._mdBuf += text;
+              // 防护: 即使 processTokenChunk 未捕获, 也剥离残留 thinking 标签
+              const cleanText = App.stripThinkingTags ? App.stripThinkingTags(text) : text;
+              App._mdBuf += cleanText;
               scheduleRender();
             }
           } else if (evt.type === 'error') {
@@ -719,7 +825,10 @@ try {
             if (typingShown) App.removeTyping();
             // 流式完成后整段重渲染,确保最终内容(含跨切片块级结构)正确
             if (answerDiv) {
-              const finalMd = App._mdBuf || '';
+              const rawMd = App._mdBuf || '';
+              // 剥离 thinking 标签:防止思考内容重复显示在答案区
+              const finalMd = (App.stripThinkingTags ? App.stripThinkingTags(rawMd) : rawMd)
+                .replace(/\n{3,}/g, '\n\n').trim();
               let finalHtml = '';
               try {
                 finalHtml = App.renderMarkdown(finalMd);
@@ -731,6 +840,12 @@ try {
                 App.showAnswer(App._currentBotMsg, finalMd);
               } else if (answerDiv) {
                 answerDiv.innerHTML = finalHtml;
+              }
+            } else if (App._currentBotMsg) {
+              // answerDiv 为 null 但 bot 消息已创建(思考先到、token 未到):显示占位提示
+              const placeholder = App._currentBotMsg.querySelector('.answer-doc');
+              if (placeholder && !placeholder.textContent.trim()) {
+                placeholder.innerHTML = '<p style="color:var(--text-tertiary);font-style:italic;">思考完成, 等待回答...</p>';
               }
             }
             // ── 从 done 事件的 steps 中补全执行轨迹(后端聚合结果,兜底未增量上报的步骤) ──
@@ -757,6 +872,9 @@ try {
                 // 记录中断集合,批准后自动续跑
                 App.Confirmation.trackInterrupt({ run_id: intr.run_id, interrupt: intr });
               }
+            } else if (evt.error) {
+              // 后端报告了错误(如 LLM 上下文溢出、节点失败等)
+              App.appendMessage(`执行出错: ${evt.error}`, 'error');
             } else if (!receivedTokens && (!evt.steps || !Array.isArray(evt.steps) || evt.steps.length === 0)) {
               // 没有 token,也没有 steps,也没有 interrupt:后端返回了完全空的响应
               App.refreshWelcomePage();
@@ -812,7 +930,9 @@ try {
             cleanupStream();
             if (typingShown) App.removeTyping();
             if (answerDiv) {
-              const finalMd = App._mdBuf || '';
+              const rawMd = App._mdBuf || '';
+              const finalMd = (App.stripThinkingTags ? App.stripThinkingTags(rawMd) : rawMd)
+                .replace(/\n{3,}/g, '\n\n').trim();
               let finalHtml = '';
               try { finalHtml = App.renderMarkdown(finalMd); }
               catch (e) {
@@ -841,6 +961,8 @@ try {
                 App.Confirmation.show(intr.requests, intr.run_id);
                 App.Confirmation.trackInterrupt({ run_id: intr.run_id, interrupt: intr });
               }
+            } else if (evt.error) {
+              App.appendMessage(`执行出错: ${evt.error}`, 'error');
             } else if (!receivedTokens && (!evt.steps || !Array.isArray(evt.steps) || evt.steps.length === 0)) {
               App.refreshWelcomePage();
               App.appendMessage('未收到响应,请重试', 'error');
@@ -875,7 +997,7 @@ try {
                 const thinkText = App.stripThinkingTags ? App.stripThinkingTags(thinking) : thinking;
                 App.appendThinking(thinkText);
               }
-              if (text) { App._mdBuf += text; scheduleRender(); }
+              if (text) { const cleanText = App.stripThinkingTags ? App.stripThinkingTags(text) : text; App._mdBuf += cleanText; scheduleRender(); }
             }
           } else if (evt.type === 'heartbeat') {
             // no-op
@@ -901,7 +1023,7 @@ try {
     const wasAtBottomBefore = scrollRatioBefore > 0.95; // 流开始前用户是否在底部
     if (wasAtBottomBefore || atBottomNow) {
       // 用户在流开始前或当前就在底部，允许自动跟随
-      App.els.messages.scrollTop = App.els.messages.scrollHeight;
+      App.scrollMessagesToBottom(true);
     } else {
       // 用户在上方浏览，保持位置不变，显示返回按钮
       const pill = document.createElement('div');
@@ -917,7 +1039,7 @@ try {
       pill.textContent = '↓';
       pill.title = '回到底部';
       pill.addEventListener('click', () => {
-        App.els.messages.scrollTop = App.els.messages.scrollHeight;
+        App.scrollMessagesToBottom(true);
         pill.remove();
       });
       // 移除现有的 pill (防止重复)
@@ -928,11 +1050,16 @@ try {
     }
 
     // 流被异常中断:直接显示错误,不再回退非流式接口
-    // 只要有收到过任何合法 SSE 事件(含后端只返回空 done),就不要再显示"响应中断"
-    if (!done && !receivedTokens && !receivedAnyEvent && !isError) {
+    // 场景1: 从未收到任何事件 → "响应中断"
+    // 场景2: 收到过事件(工具执行等)但流未正常完成(连接中断/后端异常) → "执行中断"
+    if (!done && !isError) {
       App.removeTyping();
       if (renderTimer !== null) { clearTimeout(renderTimer); renderTimer = null; }
-      App.appendMessage('响应中断,请稍后重试', 'error');
+      if (receivedAnyEvent) {
+        App.appendMessage('执行中断,结果可能不完整。请检查上下文长度后重试', 'error');
+      } else {
+        App.appendMessage('响应中断,请稍后重试', 'error');
+      }
       _finishGroup();
     }
   } catch (e) {
@@ -946,10 +1073,14 @@ try {
       _finishGroup();
     }
   } finally {
-    // 【关键修复】必须最先重置 streaming 状态，防止后续代码抛异常导致按钮永远卡死
+    /* 代次保护: 仅当本轮仍是"最新发送"时才重置全局 streaming 状态。
+       若已被更新的 doSend 取代(旧流被 abort), 跳过 setStreaming(false)/stopBtn/
+       sendBtn 强制复位, 避免旧 finally 覆盖新流的 streaming=true + stopBtn.show
+       状态 —— 这正是"再次发送后停止按钮消失、不知可否发送"的根因。 */
+    const isStale = (App.Chat._sendSeq || 0) !== mySeq;
     App.Chat._streamingStart = null;
-    if (streamingSet) App.Chat.setStreaming(false);
-    clearTimeout(connectTimer); // 兜底清理建连超时
+    if (streamingSet && !isStale) App.Chat.setStreaming(false);
+    clearTimeout(connectTimer); // 兜底清理建连超时(仅本轮 timer, 幂等)
     // 确保分组被关闭
     if (App._currentGroup) {
       try { _finishGroup(answerDiv ? (answerDiv.textContent || '') : null); } catch (_) {}
@@ -957,20 +1088,24 @@ try {
     // 重置 mdBuf 防止下次流式时累积
     App._mdBuf = '';
     renderDone = false;
-    // 【关键修复】强制启用按钮，并使用 setTimeout 确保不被后续事件覆盖
-    if (App.els.sendBtn) {
-      App.els.sendBtn.disabled = false;
-      // 延迟再次确保按钮启用（防止 syncComposer 等事件在微任务中重新禁用）
-      setTimeout(() => {
-        if (App.els.sendBtn && !App.streaming) {
-          App.els.sendBtn.disabled = false;
-        }
-      }, 0);
+    _mdRenderedOffset = 0;
+    _lastRenderedHtml = '';
+    /* 代次保护: 旧流不得强制复位 sendBtn/streaming, 否则新流刚显示的 stopBtn
+       会被 setStreaming(false) 隐藏。仅最新代次才启用按钮 + 同步 streaming。 */
+    if (!isStale) {
+      if (App.els.sendBtn) {
+        App.els.sendBtn.disabled = !((App.els.input) && App.els.input.value.trim());
+        setTimeout(() => {
+          if (App.els.sendBtn && !App.streaming && (App.Chat._sendSeq || 0) === mySeq) {
+            App.els.sendBtn.disabled = !((App.els.input) && App.els.input.value.trim());
+          }
+        }, 0);
+      }
     }
-    App.abortController = null;
+    if (!isStale) App.abortController = null;
     if (App.Attach) App.Attach.reset();
     if (App.CtxMeter) App.CtxMeter.refresh();
-    App.els.input.focus();
+    if (!isStale) App.els.input.focus();
   }
 };
 
@@ -979,15 +1114,11 @@ App.Chat.stop = function (silent) {
   if (App.abortController) {
     try { App.abortController.abort(); } catch (_) { /* 忽略 */ }
   }
+  /* 代次保护: stop() 会主动 abort 当前流, 该 doSend 的 finally 因 isStale 判定
+     不会复位 streaming(避免与 stop 竞争)。这里由 stop() 自己负责复位全局状态。 */
   App.Chat.setStreaming(false);
-  // 【关键修复】与 doSend finally 块一致，强制启用按钮并延迟确保不被覆盖
   if (App.els.sendBtn) {
-    App.els.sendBtn.disabled = false;
-    setTimeout(() => {
-      if (App.els.sendBtn && !App.streaming) {
-        App.els.sendBtn.disabled = false;
-      }
-    }, 0);
+    App.els.sendBtn.disabled = !((App.els.input) && App.els.input.value.trim());
   }
   if (!silent) {
     App.removeTyping();
@@ -1000,17 +1131,23 @@ App.Chat.stop = function (silent) {
 
 App.Chat.setStreaming = function (val) {
   App.streaming = val;
-  // 【关键修复】使用 classList 的 add/remove 而非 toggle,避免 toggle 的第三个参数兼容性问题
+  /* 修复"发送后不能停止/不知道是否可发送": 旧实现用
+     document.body.className = className.replace(...) 同步 class,
+     会把 body 上所有其他 class(sidebar-collapsed/side-open/has-messages 等)全部清掉,
+     导致布局塌掉且后续 class 判断失效。现改用 classList 精确增删, 绝不动其他 class */
   if (val) {
     document.body.classList.add('streaming');
   } else {
     document.body.classList.remove('streaming');
-    // 双重保障:确保 class 确实被移除
-    if (document.body.classList.contains('streaming')) {
-      document.body.className = document.body.className.replace(/\bstreaming\b/g, '').trim();
-    }
   }
-  // val=true 时禁用按钮; val=false 时仅根据输入框内容决定是否启用
+  /* 修复"不能停止": stopBtn 显隐改由 JS 直接控制 .show class, 不依赖 body.streaming,
+     彻底与 body class 同步解耦(旧实现在 streaming class 被清掉后 stopBtn 永远不可见) */
+  if (val) {
+    if (App.els.stopBtn) App.els.stopBtn.classList.add('show');
+  } else {
+    if (App.els.stopBtn) App.els.stopBtn.classList.remove('show');
+  }
+  // val=true 时禁用 sendBtn + 显示 stopBtn; val=false 时按输入内容启用 sendBtn + 隐藏 stopBtn
   const inp = App.els.input;
   if (val) {
     if (App.els.sendBtn) App.els.sendBtn.disabled = true;

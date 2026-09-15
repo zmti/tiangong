@@ -71,15 +71,40 @@ App.Workflow = (() => {
   let runHistory = [];
   let viewScale = 1;
   let viewOffset = { x: 0, y: 0 };
+  let _posCache = {};
+  let _versionHistory = [];
+  let _scheduleList = [];
+  let _statsData = null;
 
   const NODE_W = 140;
   const NODE_H = 64;
-  const PAD    = 60;
-  const GRID   = 20;
+  const PAD = 60;
+  const GRID = 20;
 
   function $(id) { return document.getElementById(id); }
 
-  // ── 节点模板配置 ──────────────────────────────────────────────
+  function _capturePositions() {
+    nodes.forEach(n => {
+      if (n.id != null && n._x != null && n._y != null) {
+        _posCache[n.id] = { x: n._x, y: n._y };
+      }
+    });
+  }
+
+  function _layoutPosition(node, idx, total) {
+    if (node._x != null) return;
+    const cached = _posCache[node.id];
+    if (cached) { node._x = cached.x; node._y = cached.y; return; }
+    if (node.position && typeof node.position.x === 'number') {
+      node._x = node.position.x; node._y = node.position.y; return;
+    }
+    const cols = total > 4 ? 3 : total > 2 ? 2 : 1;
+    const colW = NODE_W + PAD * 2;
+    const rowH = NODE_H + PAD * 2;
+    node._x = PAD + (idx % cols) * colW;
+    node._y = PAD + Math.floor(idx / cols) * rowH;
+  }
+
   const NODE_TEMPLATES = [
     { type: 'start',    icon: '▶',  label: '开始',    color: '#22c55e', desc: '工作流入口' },
     { type: 'end',      icon: '⏹',  label: '结束',    color: '#f59e0b', desc: '工作流出口' },
@@ -106,11 +131,13 @@ App.Workflow = (() => {
   let _tempLine = null;
   let _hoveredPort = null;
   let _isConnecting = false;
-  let _templateDrag = null; // 从模板面板拖拽
+  let _templateDrag = null;
+  let _snapLines = { h: [], v: [] };
+  const SNAP_THRESHOLD = 10;
 
   // ── SVG 工具 ──────────────────────────────────────────────────
   function ensureSvg() {
-    const container = $('wfDesigner');
+    const container = document.getElementById('workflowDesigner') || $('wfDesigner');
     if (!container) return null;
     let svg = $('wfSvg');
     if (!svg) {
@@ -125,12 +152,13 @@ App.Workflow = (() => {
   }
 
   function _updateSvgSize() {
-    if (!svgEl || !svgEl.parentElement) return;
-    const rect = svgEl.parentElement.getBoundingClientRect();
-    const h = Math.max(rect.height || 400, 200);
-    svgEl.setAttribute('height', h);
+    if (!svgEl) return;
     svgEl.style.width = '100%';
     svgEl.style.height = '100%';
+  }
+
+  function _designerEl() {
+    return document.getElementById('workflowDesigner') || document.getElementById('wfDesigner');
   }
 
   function buildDefs(svg) {
@@ -169,24 +197,107 @@ App.Workflow = (() => {
     return null;
   }
 
+  function _getSnapOffset(direction, currentVal, otherVal) {
+    let offset = 0;
+    nodes.forEach(n => {
+      if (n.id === _dragNode?.id) return;
+      let alignVal;
+      if (direction === 'v') {
+        const left = n._x;
+        const center = n._x + NODE_W / 2;
+        const right = n._x + NODE_W;
+        [left, center, right].forEach(v => {
+          if (Math.abs(currentVal - v) < SNAP_THRESHOLD) {
+            offset = v - currentVal;
+          }
+        });
+      } else {
+        const top = n._y;
+        const middle = n._y + NODE_H / 2;
+        const bottom = n._y + NODE_H;
+        [top, middle, bottom].forEach(v => {
+          if (Math.abs(currentVal - v) < SNAP_THRESHOLD) {
+            offset = v - currentVal;
+          }
+        });
+      }
+    });
+    return offset;
+  }
+
+  function _renderSnapLines(x, y) {
+    _clearSnapLines();
+    if (!svgEl) return;
+    const lines = [];
+    nodes.forEach(n => {
+      if (n.id === _dragNode?.id) return;
+      [n._x, n._x + NODE_W / 2, n._x + NODE_W].forEach(lineX => {
+        if (Math.abs(x + NODE_W / 2 - lineX) < SNAP_THRESHOLD) {
+          lines.push({ type: 'v', pos: lineX });
+        }
+      });
+      [n._y, n._y + NODE_H / 2, n._y + NODE_H].forEach(lineY => {
+        if (Math.abs(y + NODE_H / 2 - lineY) < SNAP_THRESHOLD) {
+          lines.push({ type: 'h', pos: lineY });
+        }
+      });
+    });
+    lines.forEach(line => {
+      const el = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      el.setAttribute('class', 'wf-snap-line');
+      if (line.type === 'v') {
+        el.setAttribute('x1', line.pos); el.setAttribute('y1', 0);
+        el.setAttribute('x2', line.pos); el.setAttribute('y2', '100%');
+      } else {
+        el.setAttribute('x1', 0); el.setAttribute('y1', line.pos);
+        el.setAttribute('x2', '100%'); el.setAttribute('y2', line.pos);
+      }
+      svgEl.appendChild(el);
+      _snapLines[line.type].push(el);
+    });
+  }
+
+  function _clearSnapLines() {
+    _snapLines.h.forEach(el => el.remove());
+    _snapLines.v.forEach(el => el.remove());
+    _snapLines = { h: [], v: [] };
+  }
+
   // ── 事件监听 ──────────────────────────────────────────────────
   document.addEventListener('mousemove', e => {
-    // 模板拖拽预览
     if (_templateDrag) {
-      // 可以显示预览 ghost
+      if (svgEl && e.target && e.target.closest && (e.target.closest('#wfSvg') || e.target === svgEl)) {
+        const c = _svgCoord(e);
+        if (!_tempGhost) {
+          _tempGhost = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+          _tempGhost.setAttribute('width', NODE_W);
+          _tempGhost.setAttribute('height', NODE_H);
+          _tempGhost.setAttribute('rx', '12');
+          _tempGhost.setAttribute('class', 'edge-temp');
+          _tempGhost.style.fill = 'var(--primary-soft)';
+          svgEl.appendChild(_tempGhost);
+        }
+        _tempGhost.style.display = '';
+        _tempGhost.setAttribute('transform', `translate(${c.x - NODE_W/2}, ${c.y - NODE_H/2})`);
+      } else if (_tempGhost) {
+        _tempGhost.style.display = 'none';
+      }
       return;
     }
-    // 节点拖拽
     if (_dragNode) {
       if (!svgEl) return;
       const c = _svgCoord(e);
-      _dragNode._x = snap(Math.max(0, _ox0 + (c.x - _mx0)));
-      _dragNode._y = snap(Math.max(0, _oy0 + (c.y - _my0)));
+      const newX = snap(Math.max(0, _ox0 + (c.x - _mx0)));
+      const newY = snap(Math.max(0, _oy0 + (c.y - _my0)));
+      const snapX = _getSnapOffset('v', newX, newY);
+      const snapY = _getSnapOffset('h', newY, newX);
+      _dragNode._x = newX + snapX;
+      _dragNode._y = newY + snapY;
       _dragEl.setAttribute('transform', `translate(${_dragNode._x}, ${_dragNode._y})`);
+      _renderSnapLines(_dragNode._x, _dragNode._y);
       renderEdges();
       return;
     }
-    // 连线预览
     if (_edgeDraw) {
       if (!_tempLine) {
         _tempLine = document.createElementNS('http://www.w3.org/2000/svg', 'line');
@@ -199,30 +310,29 @@ App.Workflow = (() => {
       _tempLine.setAttribute('x2', c.x);
       _tempLine.setAttribute('y2', c.y);
     }
-    // 端口悬停
     _updateHoveredPort(e);
   });
 
+  let _tempGhost = null;
+
   document.addEventListener('mouseup', e => {
-    // 结束模板拖拽
     if (_templateDrag) {
-      if (svgEl) {
+      if (_tempGhost) { _tempGhost.remove(); _tempGhost = null; }
+      const onCanvas = svgEl && e.target && e.target.closest && (e.target.closest('#wfSvg') || e.target === svgEl);
+      if (onCanvas) {
         const c = _svgCoord(e);
-        const newNode = _createNode(_templateDrag.type, c.x - NODE_W/2, c.y - NODE_H/2);
-        _templateDrag = null;
-      } else {
-        _templateDrag = null;
+        _createNode(_templateDrag.type, c.x - NODE_W/2, c.y - NODE_H/2, null);
       }
+      _templateDrag = null;
       return;
     }
-    // 结束节点拖拽
     if (_dragNode) {
       _dragRect?.classList.remove('dragging');
-      _savePositions();
+      _capturePositions();
+      _clearSnapLines();
       _dragNode = null; _dragEl = null; _dragRect = null;
       return;
     }
-    // 结束连线
     if (_edgeDraw) {
       if (_tempLine) { _tempLine.remove(); _tempLine = null; }
       if (!svgEl) { _edgeDraw = null; return; }
@@ -237,7 +347,6 @@ App.Workflow = (() => {
     _hoveredPort = null;
   });
 
-  // 滚轮缩放
   document.addEventListener('wheel', e => {
     if (!e.target.closest('.wf-svg') && !e.target.closest('.wf-designer')) return;
     e.preventDefault();
@@ -250,36 +359,21 @@ App.Workflow = (() => {
     renderEdges();
   }, { passive: false });
 
-  // 键盘快捷键
   document.addEventListener('keydown', e => {
     if (!currentWorkflow) return;
-    // 删除选中节点
     if ((e.key === 'Delete' || e.key === 'Backspace') && selectedNodeId) {
       if (document.activeElement.tagName !== 'INPUT' && document.activeElement.tagName !== 'TEXTAREA') {
         deleteNode(selectedNodeId);
       }
     }
-    // Ctrl+A 全选
-    if ((e.ctrlKey || e.metaKey) && e.key === 'a') {
-      e.preventDefault();
-      // 可以添加全选逻辑
-    }
-    // Ctrl+Z 撤销（预留）
-    if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
-      e.preventDefault();
-      // 预留撤销功能
-    }
-    // Ctrl+S 保存
     if ((e.ctrlKey || e.metaKey) && e.key === 's') {
       e.preventDefault();
       saveWorkflow();
     }
-    // Ctrl+R 运行
     if ((e.ctrlKey || e.metaKey) && e.key === 'r') {
       e.preventDefault();
       run(currentWorkflow?.id);
     }
-    // Escape 取消选择
     if (e.key === 'Escape') {
       selectedNodeId = null;
       nodeElements.forEach(g => g.querySelector('.node-rect')?.classList.remove('selected'));
@@ -304,10 +398,10 @@ App.Workflow = (() => {
     }
   }
 
-  // ── 创建节点 ──────────────────────────────────────────────────
   async function _createNode(type, x, y, name) {
     if (!currentWorkflow) return;
     const nodeId = genId('node');
+    _posCache[nodeId] = { x: snap(x), y: snap(y) };
     try {
       await _fetch(`/v1/workflows/${currentWorkflow.id}/nodes`, {
         method: 'POST',
@@ -315,125 +409,116 @@ App.Workflow = (() => {
           node_id: nodeId,
           type: type,
           name: name || nodeStyle(type).label,
-          config: { timeout: 60 },
+          config: { timeout: 60, position: { x: snap(x), y: snap(y) } },
         }),
       });
       await _reloadWorkflow();
-      // 设置位置
-      const newNode = nodes.find(n => n.id === nodeId);
-      if (newNode) {
-        newNode._x = x;
-        newNode._y = y;
-        const g = nodeElements.get(nodeId);
-        if (g) g.setAttribute('transform', `translate(${x}, ${y})`);
-        renderEdges();
-      }
       return nodeId;
     } catch (e) {
       App.toast?.('添加节点失败: ' + e.message, 'err');
+      delete _posCache[nodeId];
       return null;
     }
   }
 
-  // ── 渲染节点 ──────────────────────────────────────────────────
   function renderNodes(svg, wf) {
-    const count = (wf.nodes || []).length;
-    const cols = count > 4 ? 3 : count > 2 ? 2 : 1;
-    const colW = NODE_W + PAD * 2;
-    const rowH = NODE_H + PAD * 2;
-    const h = Math.max(PAD * 2 + Math.ceil(count / cols) * rowH, 400);
-    svg.setAttribute('height', h);
-    svg.style.height = h + 'px';
-
     svg.querySelectorAll('.wf-node-group').forEach(el => el.remove());
     nodeElements.clear();
-
+    const total = (wf.nodes || []).length;
     (wf.nodes || []).forEach((node, idx) => {
-      if (node._x == null) {
-        node._x = PAD + (idx % cols) * colW;
-        node._y = PAD + Math.floor(idx / cols) * rowH;
-      }
-
+      _layoutPosition(node, idx, total);
       const style = nodeStyle(node.type);
       const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
       g.setAttribute('transform', `translate(${node._x}, ${node._y})`);
       g.setAttribute('class', `wf-node-group node-type-${node.type || ''}`);
       g.dataset.nodeId = node.id;
 
-      // 阴影
-      const shadow = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-      shadow.setAttribute('width', NODE_W);
-      shadow.setAttribute('height', NODE_H);
-      shadow.setAttribute('rx', '12');
-      shadow.setAttribute('fill', 'var(--bg)');
-      shadow.setAttribute('filter', 'url(#shadow)');
-
-      // 主矩形
       const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
       rect.setAttribute('width', NODE_W);
       rect.setAttribute('height', NODE_H);
-      rect.setAttribute('rx', '12');
+      rect.setAttribute('rx', '14');
+      rect.setAttribute('ry', '14');
       rect.setAttribute('class', 'node-rect');
-      rect.setAttribute('stroke', style.color);
-      rect.setAttribute('fill', style.bg || '#fff');
       if (wf.entry_node === node.id) rect.classList.add('entry-node');
       if (selectedNodeId === node.id) rect.classList.add('selected');
 
-      // 图标
+      const statusDot = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      statusDot.setAttribute('cx', NODE_W - 14);
+      statusDot.setAttribute('cy', 14);
+      statusDot.setAttribute('r', '4');
+      statusDot.setAttribute('class', 'node-status-dot');
+
+      const iconBg = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      iconBg.setAttribute('cx', 28);
+      iconBg.setAttribute('cy', 32);
+      iconBg.setAttribute('r', '16');
+      iconBg.setAttribute('fill', style.color);
+      iconBg.setAttribute('opacity', '0.15');
+
       const icon = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-      icon.setAttribute('x', 18);
-      icon.setAttribute('y', 28);
+      icon.setAttribute('x', 28);
+      icon.setAttribute('y', 37);
       icon.setAttribute('class', 'node-icon');
       icon.setAttribute('font-size', '16');
+      icon.setAttribute('text-anchor', 'middle');
       icon.textContent = style.icon;
 
-      // 名称
+      const rawName = node.name || style.label;
+      const displayName = rawName.length > 9 ? rawName.slice(0, 8) + '…' : rawName;
       const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-      text.setAttribute('x', 40);
-      text.setAttribute('y', 26);
+      text.setAttribute('x', 52);
+      text.setAttribute('y', 28);
       text.setAttribute('class', 'node-text');
-      text.textContent = node.name || style.label;
+      text.textContent = displayName;
+      if (displayName !== rawName) {
+        const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+        title.textContent = rawName;
+        text.appendChild(title);
+      }
 
-      // 类型标签
       const typeLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
-      typeLabel.setAttribute('x', 40);
-      typeLabel.setAttribute('y', 44);
+      typeLabel.setAttribute('x', 52);
+      typeLabel.setAttribute('y', 48);
       typeLabel.setAttribute('class', 'node-type-label');
-      typeLabel.setAttribute('fill', style.color);
-      typeLabel.setAttribute('font-size', '10');
       typeLabel.textContent = style.label;
 
-      // 端口
       const port = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
       port.setAttribute('cx', NODE_W);
       port.setAttribute('cy', NODE_H / 2);
       port.setAttribute('r', '8');
       port.setAttribute('class', 'node-port');
-      port.setAttribute('fill', style.color);
-      port.setAttribute('stroke', 'var(--bg)');
-      port.setAttribute('stroke-width', '3');
+      port.style.fill = style.color;
+      
+      const portGlow = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      portGlow.setAttribute('cx', NODE_W);
+      portGlow.setAttribute('cy', NODE_H / 2);
+      portGlow.setAttribute('r', '12');
+      portGlow.setAttribute('fill', 'none');
+      portGlow.setAttribute('stroke', style.color);
+      portGlow.setAttribute('stroke-width', '1');
+      portGlow.setAttribute('opacity', '0.3');
+      portGlow.classList.add('port-glow');
 
-      g.appendChild(shadow);
       g.appendChild(rect);
+      g.appendChild(statusDot);
+      g.appendChild(iconBg);
       g.appendChild(icon);
       g.appendChild(text);
       g.appendChild(typeLabel);
+      g.appendChild(portGlow);
       g.appendChild(port);
       svg.appendChild(g);
       nodeElements.set(node.id, g);
 
-      // 点击选中
       g.addEventListener('click', e => { e.stopPropagation(); selectNode(node.id); });
-      // 双击编辑
       g.addEventListener('dblclick', e => { e.stopPropagation(); openNodePanel(node.id); });
-      // 端口拖拽连线
       port.addEventListener('mousedown', e => {
+        if (e.button !== 0) return;
         e.stopPropagation();
         e.preventDefault();
         _isConnecting = true;
         _edgeDraw = { sourceId: node.id, startX: node._x + NODE_W, startY: node._y + NODE_H / 2 };
       });
-      // 节点拖拽
       rect.addEventListener('mousedown', e => {
         if (e.button !== 0) return;
         _dragNode = node; _dragEl = g; _dragRect = rect;
@@ -447,7 +532,6 @@ App.Workflow = (() => {
     });
   }
 
-  // ── 渲染边 ────────────────────────────────────────────────────
   function renderEdges() {
     if (!svgEl) return;
     svgEl.querySelectorAll('.edge-line').forEach(el => el.remove());
@@ -457,22 +541,40 @@ App.Workflow = (() => {
       const src = nodeMap.get(edge.source);
       const tgt = nodeMap.get(edge.target);
       if (!src || !tgt) return;
-      const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+      const startX = src._x + NODE_W;
+      const startY = src._y + NODE_H / 2;
+      const endX = tgt._x;
+      const endY = tgt._y + NODE_H / 2;
+      const dx = Math.abs(endX - startX) * 0.5;
+      const ctrlOffset = Math.min(dx, 100);
+      let path;
+      if (startX < endX) {
+        path = `M ${startX} ${startY} C ${startX + ctrlOffset} ${startY}, ${endX - ctrlOffset} ${endY}, ${endX} ${endY}`;
+      } else {
+        path = `M ${startX} ${startY} C ${startX - ctrlOffset} ${startY}, ${endX + ctrlOffset} ${endY}, ${endX} ${endY}`;
+      }
+      const pathEl = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      pathEl.setAttribute('d', path);
+      pathEl.setAttribute('class', 'edge-line');
+      pathEl.setAttribute('fill', 'none');
+      pathEl.setAttribute('stroke', 'transparent');
+      pathEl.setAttribute('stroke-width', '12');
+      pathEl.dataset.edgeId = edge.id;
+      pathEl.addEventListener('dblclick', e => { e.stopPropagation(); _deleteEdge(edge.id); });
+      svgEl.appendChild(pathEl);
+      const line = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+      line.setAttribute('d', path);
       line.setAttribute('class', 'edge-line');
-      line.setAttribute('x1', src._x + NODE_W);
-      line.setAttribute('y1', src._y + NODE_H / 2);
-      line.setAttribute('x2', tgt._x);
-      line.setAttribute('y2', tgt._y + NODE_H / 2);
+      line.setAttribute('fill', 'none');
       line.setAttribute('marker-end', 'url(#arrowhead)');
       line.dataset.edgeId = edge.id;
-      line.addEventListener('dblclick', e => { e.stopPropagation(); _deleteEdge(edge.id); });
       svgEl.appendChild(line);
     });
   }
 
-  // ── 边操作 ────────────────────────────────────────────────────
   async function _addEdge(sourceId, targetId) {
     if (!currentWorkflow) return;
+    _capturePositions();
     try {
       await _fetch(`/v1/workflows/${currentWorkflow.id}/edges`, {
         method: 'POST', body: JSON.stringify({ source: sourceId, target: targetId }),
@@ -483,7 +585,9 @@ App.Workflow = (() => {
 
   async function _deleteEdge(edgeId) {
     if (!currentWorkflow) return;
+    if (!edgeId) { App.toast?.('边 ID 缺失', 'err'); return; }
     if (!await App.confirm?.('删除此连接？')) return;
+    _capturePositions();
     try {
       await _fetch(`/v1/workflows/${currentWorkflow.id}/edges/${edgeId}`, { method: 'DELETE' });
       await _reloadWorkflow();
@@ -498,7 +602,6 @@ App.Workflow = (() => {
     });
   }
 
-  // ── 节点选择 ──────────────────────────────────────────────────
   function selectNode(nodeId) {
     selectedNodeId = nodeId;
     nodeElements.forEach((g, id) => {
@@ -516,18 +619,16 @@ App.Workflow = (() => {
     closeNodePanel();
   });
 
-  // ── 节点配置面板 ──────────────────────────────────────────────
   function openNodePanel(nodeId) {
-    const panel = $('wfNodePanel');
+    const panel = document.getElementById('wfProperties') || $('wfNodePanel');
     if (!panel) return;
+    panel.removeAttribute('hidden');
     panel.classList.add('open');
     const node = nodes.find(n => n.id === nodeId);
     if (!node) return;
-
     const typeOptions = NODE_TEMPLATES.map(t =>
       `<option value="${t.type}" ${node.type === t.type ? 'selected' : ''}>${t.icon} ${t.label}</option>`
     ).join('');
-
     let configHtml = '';
     if (node.type === 'tool') {
       configHtml = `
@@ -609,7 +710,7 @@ App.Workflow = (() => {
     panel.innerHTML = `
       <div class="np-header">
         <span>${nodeStyle(node.type).icon} ${node.name || '节点'}</span>
-        <button class="np-close" onclick="App.Workflow.closeNodePanel()">×</button>
+        <button class="np-close wf-close-panel-btn" data-node-id="${node.id}">×</button>
       </div>
       <div class="np-body">
         <div class="np-field"><label>节点 ID</label>
@@ -620,15 +721,23 @@ App.Workflow = (() => {
           <select id="np-type">${typeOptions}</select></div>
         ${configHtml}
         <div class="np-actions">
-          <button class="np-btn np-btn-save" onclick="App.Workflow.saveNodeConfig('${node.id}')">保存</button>
-          <button class="np-btn np-btn-delete" onclick="App.Workflow.deleteNode('${node.id}')">删除</button>
+          <button class="np-btn np-btn-save wf-save-node-btn" data-node-id="${node.id}">保存</button>
+          <button class="np-btn np-btn-delete wf-delete-node-btn" data-node-id="${node.id}">删除</button>
         </div>
       </div>`;
+    
+    // 绑定按钮事件（避免内联onclick被CSP阻止）
+    const closeBtn = panel.querySelector('.wf-close-panel-btn');
+    if (closeBtn) closeBtn.addEventListener('click', () => closeNodePanel());
+    const saveBtn = panel.querySelector('.wf-save-node-btn');
+    if (saveBtn) saveBtn.addEventListener('click', () => saveNodeConfig(saveBtn.dataset.nodeId));
+    const deleteBtn = panel.querySelector('.wf-delete-node-btn');
+    if (deleteBtn) deleteBtn.addEventListener('click', () => deleteNode(deleteBtn.dataset.nodeId));
   }
 
   function closeNodePanel() {
-    const panel = $('wfNodePanel');
-    if (panel) { panel.classList.remove('open'); setTimeout(() => { panel.innerHTML = ''; }, 200); }
+    const panel = document.getElementById('wfProperties') || $('wfNodePanel');
+    if (panel) { panel.classList.remove('open'); panel.setAttribute('hidden', ''); setTimeout(() => { panel.innerHTML = ''; }, 200); }
   }
 
   async function saveNodeConfig(nodeId) {
@@ -638,15 +747,17 @@ App.Workflow = (() => {
     const timeout = parseInt($('np-timeout')?.value) || 60;
     const updates = { name, type };
     const config = {};
-
     if (type === 'tool') {
       config.tool_name = $('np-tool-name')?.value?.trim() || '';
       try { config.params = JSON.parse($('np-tool-params')?.value || '{}'); } catch(_) {}
       config.timeout = timeout;
-      // 错误恢复配置
       config.error_strategy = $('np-error-strategy')?.value || 'fail_fast';
       config.retry_count = parseInt($('np-retry-count')?.value) || 0;
       config.fallback_node_id = $('np-fallback-node')?.value?.trim() || null;
+      updates.error_strategy = config.error_strategy;
+      updates.retry_count = config.retry_count;
+      updates.fallback_node_id = config.fallback_node_id;
+      updates.tool_name = config.tool_name;
     } else if (type === 'condition') {
       config.condition_expr = $('np-condition')?.value?.trim() || '';
       const t = ($('np-branch-true')?.value || '').split(',').map(s=>s.trim()).filter(Boolean);
@@ -666,34 +777,29 @@ App.Workflow = (() => {
       try { config.iterable = JSON.parse($('np-loop-iterable')?.value || '[]'); } catch(_) { config.iterable = []; }
       config.max = parseInt($('np-loop-max')?.value) || 10;
       config.loop_mode = $('np-loop-mode')?.value || 'sequential';
-      // 子图配置
       const subgraphStr = $('np-subgraph-ids')?.value || '';
       config.subgraph_ids = subgraphStr.split(',').map(s => s.trim()).filter(Boolean);
     } else if (type === 'sleep') {
       config.seconds = parseFloat($('np-sleep-secs')?.value) || 1;
     }
-
     updates.config = config;
-    if (type === 'tool') {
-      updates.tool_name = config.tool_name;
-      updates.error_strategy = config.error_strategy;
-      updates.retry_count = config.retry_count;
-      updates.retry_delay = config.retry_delay;
-      updates.fallback_node_id = config.fallback_node_id;
-    }
-    if (type === 'agent') {
-      updates.error_strategy = config.error_strategy;
-      updates.retry_count = config.retry_count;
-    }
     if (type === 'condition') { updates.condition_expr = config.condition_expr; updates.branches = config.branches; }
     if (type === 'http') updates.http_config = config;
     if (type === 'script') updates.script_code = config.script_code;
     if (type === 'loop') updates.loop_config = config;
-
     try {
       await _fetch(`/v1/workflows/${currentWorkflow.id}/nodes/${nodeId}`, {
         method: 'PATCH', body: JSON.stringify(updates),
       });
+      const nodeObj = nodes.find(n => n.id === nodeId);
+      if (nodeObj && nodeObj._x != null) {
+        try {
+          await _fetch(`/v1/workflows/${currentWorkflow.id}/nodes/${nodeId}`, {
+            method: 'PATCH',
+            body: JSON.stringify({ position: { x: nodeObj._x, y: nodeObj._y } }),
+          });
+        } catch (_) {}
+      }
       App.toast?.('节点已更新', 'ok');
       closeNodePanel();
       await _reloadWorkflow();
@@ -704,6 +810,8 @@ App.Workflow = (() => {
     if (!currentWorkflow) return;
     if (currentWorkflow.entry_node === nodeId) { App.toast?.('不能删除入口节点', 'err'); return; }
     if (!await App.confirm?.('确定删除节点 "' + (nodes.find(n => n.id === nodeId)?.name || nodeId) + '"？关联的边也会删除。')) return;
+    _capturePositions();
+    delete _posCache[nodeId];
     try {
       await _fetch(`/v1/workflows/${currentWorkflow.id}/nodes/${nodeId}`, { method: 'DELETE' });
       App.toast?.('节点已删除', 'ok');
@@ -712,40 +820,37 @@ App.Workflow = (() => {
     } catch (e) { App.toast?.('删除失败: ' + e.message, 'err'); }
   }
 
-  // ── 重新加载 ──────────────────────────────────────────────────
   async function _reloadWorkflow() {
     if (!currentWorkflow) return;
+    _capturePositions();
     try {
       const data = await _fetch(`/v1/workflows/${currentWorkflow.id}`);
       renderDesigner(data);
     } catch (e) { App.toast?.('刷新失败: ' + e.message, 'err'); }
   }
 
-  // ── 渲染设计器 ────────────────────────────────────────────────
   function renderDesigner(wf) {
     currentWorkflow = wf;
     nodes = wf.nodes ? wf.nodes.map(n => ({ ...n })) : [];
-    edges = wf.edges ? [...wf.edges] : [];
+    edges = (wf.edges || []).map(e => ({ ...e }));
     selectedNodeId = null;
     viewScale = 1;
     const svg = ensureSvg();
     if (!svg) return;
     buildDefs(svg);
     renderNodes(svg, wf);
-    nodes.forEach(n => {
-      const srcNode = wf.nodes.find(x => x.id === n.id);
-      if (srcNode && srcNode._x != null) { n._x = srcNode._x; n._y = srcNode._y; }
-    });
     renderEdges();
     setTimeout(_updateSvgSize, 50);
     if (svgEl && typeof ResizeObserver !== 'undefined') {
       if (svgEl._resizeObserver) svgEl._resizeObserver.disconnect();
-      svgEl._resizeObserver = new ResizeObserver(() => { _updateSvgSize(); renderEdges(); });
-      svgEl._resizeObserver.observe($('wfDesigner'));
+      const designerEl = _designerEl();
+      if (designerEl) {
+        svgEl._resizeObserver = new ResizeObserver(() => { _updateSvgSize(); renderEdges(); });
+        svgEl._resizeObserver.observe(designerEl);
+      }
     }
   }
 
-  // ── 列表 ──────────────────────────────────────────────────────
   async function loadList() {
     try {
       const data = await _fetch('/v1/workflows');
@@ -754,7 +859,7 @@ App.Workflow = (() => {
   }
 
   function renderList(workflows) {
-    const listEl = $('wfList');
+    const listEl = document.getElementById('workflowList') || $('wfList');
     if (!listEl) return;
     if (!workflows || workflows.length === 0) {
       listEl.innerHTML = `
@@ -780,89 +885,77 @@ App.Workflow = (() => {
           <span class="wf-item-meta">${wf.nodes_count || 0} 节点</span>
         </div>
         <div class="wf-item-actions">
-          <button class="mini-btn" onclick="event.stopPropagation(); App.Workflow.load('${wf.id}')">编辑</button>
-          <button class="mini-btn" onclick="event.stopPropagation(); App.Workflow.run('${wf.id}')">▶ 运行</button>
-          <button class="mini-btn danger" onclick="event.stopPropagation(); App.Workflow.deleteWorkflow('${wf.id}')">删除</button>
+          <button class="mini-btn wf-edit-btn" data-id="${wf.id}">编辑</button>
+          <button class="mini-btn wf-run-btn" data-id="${wf.id}">▶ 运行</button>
+          <button class="mini-btn danger wf-delete-btn" data-id="${wf.id}">删除</button>
         </div>
       </div>`).join('');
+    
+    listEl.addEventListener('click', e => {
+      const btn = e.target.closest('.wf-item-actions .mini-btn');
+      if (!btn) return;
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      if (btn.classList.contains('wf-edit-btn')) App.Workflow.load(id);
+      else if (btn.classList.contains('wf-run-btn')) App.Workflow.run(id);
+      else if (btn.classList.contains('wf-delete-btn')) App.Workflow.deleteWorkflow(id);
+    });
   }
 
   async function load(id) {
     try {
       const data = await _fetch(`/v1/workflows/${id}`);
       renderDesigner(data);
-      $('wfToolbar')?.style.setProperty('display', 'flex');
-      $('wfList')?.querySelectorAll('.wf-item').forEach(el => {
+      const toolbar = $('wfToolbar');
+      if (toolbar) toolbar.hidden = false;
+      const historyWrap = $('wfRunHistoryWrap');
+      if (historyWrap) historyWrap.hidden = false;
+      (document.getElementById('workflowList') || $('wfList'))?.querySelectorAll('.wf-item').forEach(el => {
         el.classList.toggle('active', el.dataset.id === id);
       });
       loadRunHistory();
+      loadVersions();
+      loadSchedules();
+      const wrap = $('wfSecondaryPanels');
+      if (wrap) wrap.hidden = true;
+      const panels = ['wfVersionPanel', 'wfSchedulePanel', 'wfStatsPanel'];
+      panels.forEach(p => { if ($(p)) $(p).style.display = 'none'; });
     } catch (e) { App.toast?.('加载失败: ' + e.message, 'err'); }
   }
 
   async function create() {
-    const name = await App.prompt?.('工作流名称:', '新工作流') || '新工作流';
-    if (!name?.trim()) return;
+    const name = await App.prompt?.('工作流名称:', '新建工作流');
+    if (!name) return;
     try {
       const data = await _fetch('/v1/workflows', {
         method: 'POST',
-        body: JSON.stringify({
-          name: name.trim(), description: '',
-          nodes: [
-            { id: 'start_1', type: 'start', name: '开始' },
-            { id: 'agent_1', type: 'agent', name: 'Agent 处理' },
-            { id: 'end_1',   type: 'end',   name: '结束' },
-          ],
-          edges: [
-            { source: 'start_1', target: 'agent_1' },
-            { source: 'agent_1', target: 'end_1' },
-          ],
-          entry_node: 'start_1'
-        })
+        body: JSON.stringify({ name, description: '', nodes: [], edges: [], entry_node: '' }),
       });
-      App.toast?.('工作流创建成功', 'ok');
-      await loadList();
-      if (data.id) setTimeout(() => load(data.id), 100);
+      App.toast?.('工作流已创建', 'ok');
+      await load(data.id);
     } catch (e) { App.toast?.('创建失败: ' + e.message, 'err'); }
   }
 
-  // ── AI 描述性工作流生成 ─────────────────────────────────────────
-  async function generateByDescription() {
-    const name = await App.prompt?.('工作流名称:', 'AI 生成工作流');
-    if (!name?.trim()) return;
-    const description = await App.prompt?.('描述工作流(自然语言):',
-      '例如:先用搜索查询天气,再根据天气推荐穿衣建议');
-    if (!description?.trim()) return;
-    try {
-      const data = await _fetch('/v1/workflows/generate', {
-        method: 'POST',
-        body: JSON.stringify({
-          name: name.trim(),
-          description: description.trim(),
-          input_variables: {},
-        }),
-      });
-      App.toast?.(`✨ 工作流 "${data.name}" 生成成功`, 'ok');
-      await loadList();
-      if (data.id) setTimeout(() => load(data.id), 100);
-    } catch (e) { App.toast?.('AI 生成失败: ' + e.message, 'err'); }
-  }
-
-  // ── 运行 ──────────────────────────────────────────────────────
+  let _runAborter = null;
   async function run(id) {
-    if (!id) id = currentWorkflow?.id;
-    if (!id) { App.toast?.('请先选择工作流', 'err'); return; }
-    activeRunId = null; runHistory = [];
+    if (_runAborter) { _runAborter.abort(); _runAborter = null; showRunStatus('⏹ 已取消', ''); return; }
+    _runAborter = new AbortController();
+    const signal = _runAborter.signal;
+    activeRunId = null;
     clearNodeStates();
-    showRunStatus('▶ 运行中...');
-
+    showRunStatus('▶ 运行中...', 'running');
     try {
       const resp = await fetch(_apiBase() + `/v1/workflows/${id}/run/stream`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...(_apiKey() ? { 'Authorization': 'Bearer ' + _apiKey() } : {}) },
         body: JSON.stringify({ inputs: {}, stream_detail: true }),
+        signal,
       });
-      if (!resp.ok) throw new Error((await resp.json().catch(() => ({}))).detail || '运行失败');
-
+      if (!resp.ok) {
+        let detail = '运行失败';
+        try { const d = await resp.json(); detail = d.detail || detail; } catch(_) {}
+        throw new Error(detail);
+      }
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
@@ -875,33 +968,59 @@ App.Workflow = (() => {
           const line = buffer.substring(0, lineEnd).trim();
           buffer = buffer.substring(lineEnd + 1);
           if (line.startsWith('data: ')) {
-            try { handleStreamEvent(JSON.parse(line.substring(6))); } catch (_) {}
+            try { handleStreamEvent(JSON.parse(line.substring(6))); } catch(_) {}
           }
         }
       }
+      _runAborter = null;
     } catch (e) {
+      _runAborter = null;
+      if (e && e.name === 'AbortError') { showRunStatus('⏹ 已取消', ''); return; }
       showRunStatus('❌ 运行失败', 'error');
       App.toast?.('运行失败: ' + e.message, 'err');
     }
   }
 
   function handleStreamEvent(data) {
+    if (!data || typeof data !== 'object') return;
     if (data.run_id) activeRunId = data.run_id;
-    if (data.node_id && data.status) {
+    if (data.node_id && data.node_id !== '__run__' && data.status) {
       applyNodeStates({ [data.node_id]: { status: data.status } });
-      showRunStatus(`▶ ${data.node_id} 执行中...`);
+      const node = nodes.find(n => n.id === data.node_id);
+      const label = node ? node.name : data.node_id;
+      if (data.status === 'running') showRunStatus(`▶ ${label} 执行中...`, '');
+      else if (data.status === 'success') showRunStatus(`✓ ${label} 完成`, 'success');
+      else if (data.status === 'failed') showRunStatus(`✗ ${label} 失败`, 'error');
+      else if (data.status === 'skipped') showRunStatus(`— ${label} 已跳过`, '');
     }
-    if (data.status === 'completed') {
-      showRunStatus('✅ 运行完成', 'success');
-      if (data.node_states) applyNodeStates(data.node_states);
-      runHistory.push({ run_id: data.run_id, status: 'completed', duration: data.duration,
-        output: data.output, node_states: data.node_states, history: data.history, timestamp: Date.now() });
-      renderRunHistory();
-    } else if (data.status === 'failed') {
-      showRunStatus('❌ 运行失败', 'error');
-      runHistory.push({ run_id: data.run_id, status: 'failed', duration: data.duration,
-        error: data.error, timestamp: Date.now() });
-      renderRunHistory();
+    if (data.terminal) {
+      if (data.status === 'completed') {
+        showRunStatus('✅ 运行完成', 'success');
+        if (data.node_states) applyNodeStates(data.node_states);
+        runHistory.push({ run_id: data.run_id, status: 'completed', duration: data.duration,
+          output: data.output, node_states: data.node_states, history: data.history, error: data.error, timestamp: Date.now() });
+        renderRunHistory();
+      } else {
+        showRunStatus('❌ 运行失败', 'error');
+        runHistory.push({ run_id: data.run_id, status: data.status || 'failed', duration: data.duration,
+          output: data.output, node_states: data.node_states, history: data.history,
+          error: data.error, timestamp: Date.now() });
+        renderRunHistory();
+      }
+      return;
+    }
+    if (data.node_states !== undefined && data.status) {
+      if (data.status === 'completed') {
+        showRunStatus('✅ 运行完成', 'success');
+        runHistory.push({ run_id: data.run_id, status: 'completed', duration: data.duration,
+          output: data.output, node_states: data.node_states, history: data.history, timestamp: Date.now() });
+        renderRunHistory();
+      } else if (data.status === 'failed') {
+        showRunStatus('❌ 运行失败', 'error');
+        runHistory.push({ run_id: data.run_id, status: 'failed', duration: data.duration,
+          output: data.output, node_states: data.node_states, error: data.error, timestamp: Date.now() });
+        renderRunHistory();
+      }
     }
   }
 
@@ -935,7 +1054,6 @@ App.Workflow = (() => {
     bar.className = 'wf-run-status' + (cls ? ' ' + cls : '');
   }
 
-  // ── 运行历史 ──────────────────────────────────────────────────
   async function loadRunHistory() {
     if (!currentWorkflow) return;
     try {
@@ -952,27 +1070,27 @@ App.Workflow = (() => {
   function renderRunHistory() {
     const el = $('wfRunHistory');
     if (!el) return;
-    if (!runHistory.length) {
-      el.innerHTML = `<div class="wf-empty">
-        <div class="wf-empty-icon">📊</div>
-        <div>暂无运行记录</div>
-        <div class="wf-empty-hint">点击"▶ 运行"执行工作流</div>
-      </div>`;
-      return;
-    }
+    const wrap = $('wfRunHistoryWrap');
+    if (wrap) wrap.hidden = !runHistory.length;
+    if (!runHistory.length) return;
     el.innerHTML = runHistory.slice(-8).reverse().map(r => `
-      <div class="wf-run-item ${r.status}" onclick="App.Workflow.showRunDetail('${r.run_id}')">
+      <div class="wf-run-item ${r.status === 'completed' ? 'completed' : 'failed'} wf-run-item-clickable" data-run-id="${r.run_id}">
         <span class="wf-run-icon">${r.status === 'completed' ? '✅' : '❌'}</span>
         <span class="wf-run-time">${formatTime(r.timestamp)}</span>
         <span class="wf-run-id">${r.run_id.slice(-8)}</span>
-        <span class="wf-run-dur">${r.duration ? (r.duration * 1000).toFixed(0) + 'ms' : ''}</span>
-        <span class="wf-run-status-badge">${r.status === 'completed' ? '成功' : '失败'}</span>
+        <span class="wf-run-dur">${r.duration != null ? (r.duration * 1000).toFixed(0) + 'ms' : ''}</span>
+        <span class="wf-run-status-badge">${r.status === 'completed' ? '成功' : r.status}</span>
       </div>`).join('');
+    el.addEventListener('click', e => {
+      const item = e.target.closest('.wf-run-item-clickable');
+      if (item) App.Workflow.showRunDetail(item.dataset.runId);
+    });
   }
 
   function formatTime(ts) {
     if (!ts) return '';
-    return new Date(ts).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+    const asMs = ts < 1e12 ? ts * 1000 : ts;
+    return new Date(asMs).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
   }
 
   async function showRunDetail(runId) {
@@ -987,39 +1105,49 @@ App.Workflow = (() => {
   function renderRunDetail(run) {
     const panel = $('wfRunPanel');
     if (!panel) return;
-    panel.style.display = 'flex';
-    const history = run.history || [];
+    panel.hidden = false;
     const stateRows = Object.entries(run.node_states || {}).map(([nid, state]) => {
       const node = nodes.find(n => n.id === nid);
-      const color = state.status === 'success' ? 'var(--ok)' : state.status === 'failed' ? 'var(--danger)' : 'var(--muted)';
+      const color = state.status === 'success' ? 'var(--ok)' : state.status === 'failed' ? 'var(--err)' : 'var(--muted)';
       const icon = state.status === 'success' ? '✓' : state.status === 'failed' ? '✗' : state.status === 'skipped' ? '—' : '?';
-      return `<tr><td>${node?.name || nid}</td><td style="color:${color}">${icon} ${state.status}</td><td>${state.duration ? (state.duration*1000).toFixed(0)+'ms' : '-'}</td><td>${state.error || '-'}</td></tr>`;
+      const errText = state.error ? escapeHtml(String(state.error).slice(0, 120)) : '-';
+      return `<tr><td>${escapeHtml(node?.name || nid)}</td><td style="color:${color}">${icon} ${state.status}</td><td>${state.duration != null ? (state.duration*1000).toFixed(0)+'ms' : '-'}</td><td>${errText}</td></tr>`;
     }).join('');
     const outputJson = run.output ? escapeHtml(JSON.stringify(run.output, null, 2)) : '-';
     panel.innerHTML = `
-      <div class="wf-run-panel-header"><span>📋 运行详情 · ${run.run_id.slice(-8)}</span><button class="np-close" onclick="App.Workflow.closeRunPanel()">×</button></div>
+      <div class="wf-run-panel-header"><span>📋 运行详情 · ${run.run_id.slice(-8)}</span><button class="np-close wf-close-run-panel-btn">×</button></div>
       <div class="wf-run-detail-tabs">
-        <button class="wf-tab active" onclick="App.Workflow.switchRunTab('nodes')">节点状态</button>
-        <button class="wf-tab" onclick="App.Workflow.switchRunTab('output')">输出结果</button>
+        <button class="wf-tab wf-run-tab-btn active" data-tab="nodes">节点状态</button>
+        <button class="wf-tab wf-run-tab-btn" data-tab="output">输出结果</button>
       </div>
       <div id="wfRunNodes" class="wf-run-tab-content active">
         <table class="wf-state-table"><thead><tr><th>节点</th><th>状态</th><th>耗时</th><th>错误</th></tr></thead><tbody>${stateRows || '<tr><td colspan="4">无数据</td></tr>'}</tbody></table>
       </div>
       <div id="wfRunOutput" class="wf-run-tab-content"><pre class="wf-output-pre">${outputJson}</pre></div>`;
+    
+    // 绑定事件（避免内联onclick被CSP阻止）
+    const closeBtn = panel.querySelector('.wf-close-run-panel-btn');
+    if (closeBtn) closeBtn.addEventListener('click', closeRunPanel);
+    panel.addEventListener('click', e => {
+      const tabBtn = e.target.closest('.wf-run-tab-btn');
+      if (tabBtn) switchRunTab(tabBtn.dataset.tab, tabBtn);
+    });
   }
 
-  function switchRunTab(tab) {
+  function switchRunTab(tab, btn) {
     document.querySelectorAll('.wf-run-tab').forEach(t => t.classList.remove('active'));
     document.querySelectorAll('.wf-run-tab-content').forEach(t => t.classList.remove('active'));
-    event.target.classList.add('active');
+    if (btn) btn.classList.add('active');
     document.getElementById('wfRun' + tab.charAt(0).toUpperCase() + tab.slice(1))?.classList.add('active');
   }
 
-  function closeRunPanel() { $('wfRunPanel')?.style.setProperty('display', 'none'); }
-  function escapeHtml(t) { return t?.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;') || ''; }
+  function closeRunPanel() { const p = $('wfRunPanel'); if (p) p.hidden = true; }
+  function escapeHtml(t) {
+    if (t == null) return '';
+    return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
 
-  // ── 自动布局 ──────────────────────────────────────────────────
-  function autoLayout() {
+  async function autoLayout() {
     if (!currentWorkflow || nodes.length === 0) return;
     const count = nodes.length;
     const cols = count > 4 ? 3 : count > 2 ? 2 : 1;
@@ -1029,16 +1157,18 @@ App.Workflow = (() => {
       node._x = PAD + (idx % cols) * colW;
       node._y = PAD + Math.floor(idx / cols) * rowH;
     });
+    _capturePositions();
     _savePositions();
     renderNodes(svgEl, currentWorkflow);
     renderEdges();
-    App.toast?.('已自动布局', 'ok');
+    try {
+      await saveWorkflow();
+      App.toast?.('已自动布局并保存', 'ok');
+    } catch (_) {}
   }
 
-  // ── 添加节点 ──────────────────────────────────────────────────
   async function addNode() {
-    if (!currentWorkflow) return;
-    // 可视化节点选择器
+    if (!currentWorkflow) { App.toast?.('请先选择一个工作流', 'err'); return; }
     const types = [
       { type: 'start', icon: '▶', label: '开始' },
       { type: 'end', icon: '⏹', label: '结束' },
@@ -1058,31 +1188,18 @@ App.Workflow = (() => {
     );
     if (!choice) return;
     const idx = parseInt(choice) - 1;
-    if (isNaN(idx) || idx < 0 || idx >= types.length) {
-      App.toast?.('无效选择', 'err');
-      return;
-    }
+    if (isNaN(idx) || idx < 0 || idx >= types.length) { App.toast?.('无效选择', 'err'); return; }
     const selected = types[idx];
     const name = await App.prompt?.('节点名称:', selected.label + ' ' + (nodes.length + 1));
     if (!name) return;
-    const nodeId = genId('node');
-    try {
-      await _fetch(`/v1/workflows/${currentWorkflow.id}/nodes`, {
-        method: 'POST',
-        body: JSON.stringify({
-          node_id: nodeId,
-          type: selected.type,
-          name: name.trim(),
-          config: { timeout: 60 }
-        }),
-      });
-      await _reloadWorkflow();
-    } catch (e) { App.toast?.('添加失败: ' + e.message, 'err'); }
+    const x = Math.max(60, ...nodes.map(n => n._x || 0)) + NODE_W + 40;
+    const y = Math.max(60, ...nodes.map(n => n._y || 0));
+    await _createNode(selected.type, x, y, name.trim());
   }
 
-  // ── 保存/删除 ─────────────────────────────────────────────────
   async function saveWorkflow() {
     if (!currentWorkflow) return;
+    _capturePositions();
     _savePositions();
     try {
       await _fetch(`/v1/workflows/${currentWorkflow.id}`, {
@@ -1103,13 +1220,15 @@ App.Workflow = (() => {
             fallback_node_id: n.fallback_node_id,
             loop_mode: n.loop_mode,
             subgraph_ids: n.subgraph_ids,
+            position: n._x != null ? { x: n._x, y: n._y } : (n.position || null),
           })),
-          edges: edges.map(e => ({ source: e.source, target: e.target, condition: e.condition, condition_expr: e.condition_expr })),
+          edges: edges.map(e => ({ id: e.id, source: e.source, target: e.target, condition: e.condition, condition_expr: e.condition_expr })),
           entry_node: currentWorkflow.entry_node,
           error_mode: currentWorkflow.error_mode,
         }),
       });
       App.toast?.('已保存', 'ok');
+      await _reloadWorkflow();
     } catch (e) { App.toast?.('保存失败: ' + e.message, 'err'); }
   }
 
@@ -1120,17 +1239,22 @@ App.Workflow = (() => {
     try {
       await _fetch(`/v1/workflows/${id}`, { method: 'DELETE' });
       App.toast?.('已删除', 'ok');
+      Object.keys(_posCache).forEach(k => { delete _posCache[k]; });
       currentWorkflow = null; nodes = []; edges = []; nodeElements.clear();
       selectedNodeId = null; activeRunId = null; runHistory = [];
-      $('wfToolbar')?.style.setProperty('display', 'none');
-      $('wfSvg')?.remove(); svgEl = null;
-      $('wfRunStatus').textContent = '';
-      $('wfRunHistory').innerHTML = '';
+      const toolbar = $('wfToolbar');
+      if (toolbar) toolbar.hidden = true;
+      const historyWrap = $('wfRunHistoryWrap');
+      if (historyWrap) historyWrap.hidden = true;
+      const svg = $('wfSvg');
+      if (svg) svg.querySelectorAll('.wf-node-group, .edge-line, .edge-temp').forEach(el => el.remove());
+      svgEl = null;
+      const status = $('wfRunStatus');
+      if (status) status.textContent = '';
       loadList();
     } catch (e) { App.toast?.('删除失败: ' + e.message, 'err'); }
   }
 
-  // ── 初始化 ────────────────────────────────────────────────────
   function init() {
     const btns = {
       new: ['wfNewBtn', create],
@@ -1144,14 +1268,73 @@ App.Workflow = (() => {
       zoomOut: ['wfZoomOutBtn', () => { viewScale = Math.max(0.3, viewScale * 0.8); applyZoom(); }],
       zoomReset: ['wfZoomResetBtn', () => { viewScale = 1; applyZoom(); }],
       aiGen: ['wfAiGenBtn', generateByDescription],
+      runHistoryRefresh: ['wfRunHistoryRefresh', loadRunHistory],
+      addNodeAlt: ['wfAddNodeBtn2', addNode],
+      saveVersion: ['wfSaveVersionBtn', () => { _toggleSecondaryPanel('wfVersionPanel'); saveVersion(); }],
+      exportWf: ['wfExportBtn', exportWorkflow],
+      importWf: ['wfImportBtn', importWorkflow],
+      createSchedule: ['wfCreateScheduleBtn', () => { _toggleSecondaryPanel('wfSchedulePanel'); createSchedule(); }],
+      loadStats: ['wfStatsBtn', () => { _toggleSecondaryPanel('wfStatsPanel'); if (typeof loadStats === 'function') loadStats(); else console.warn('loadStats not ready'); }],
     };
     Object.entries(btns).forEach(([id, [elId, fn]]) => {
       const el = $(elId);
       if (el) el.addEventListener('click', fn);
     });
 
+    const closeVersionBtn = $('closeVersionPanel');
+    if (closeVersionBtn) closeVersionBtn.addEventListener('click', () => { App.Workflow._closeSecondaryPanel(); });
+    const closeScheduleBtn = $('closeSchedulePanel');
+    if (closeScheduleBtn) closeScheduleBtn.addEventListener('click', () => { App.Workflow._closeSecondaryPanel(); });
+    const hintCloseBtn = $('wfHintClose');
+    if (hintCloseBtn) hintCloseBtn.addEventListener('click', () => { hintCloseBtn.parentElement.remove(); });
+
+    _initNodeTemplateList();
+    const svg = $('wfSvg');
+    if (svg) {
+      svg.addEventListener('dblclick', e => {
+        if (e.target !== svg && e.target.tagName !== 'svg') return;
+        if (!currentWorkflow) return;
+        const c = _svgCoord(e);
+        _createNode('agent', c.x - NODE_W / 2, c.y - NODE_H / 2);
+      });
+    }
     loadList();
     showWorkflowHint();
+  }
+
+  function _initNodeTemplateList() {
+    const list = $('wfNodeList');
+    if (!list || list.children.length) return;
+    NODE_TEMPLATES.forEach(tpl => {
+      const chip = document.createElement('div');
+      chip.className = 'wf-node-chip';
+      chip.dataset.type = tpl.type;
+      chip.title = tpl.desc;
+      chip.innerHTML = `<span class="chip-icon">${tpl.icon}</span><span class="chip-label">${tpl.label}</span><span class="chip-desc">${tpl.desc}</span>`;
+      chip.addEventListener('mousedown', e => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        _templateDrag = { type: tpl.type };
+      });
+      chip.addEventListener('click', () => {
+        if (!currentWorkflow) { App.toast?.('请先在下方列表选择一个工作流', 'info'); return; }
+        const x = Math.max(60, ...nodes.map(n => n._x || 0)) + NODE_W + 40;
+        const y = Math.max(60, ...nodes.map(n => n._y || 0));
+        _createNode(tpl.type, x, y, null);
+      });
+      list.appendChild(chip);
+    });
+    const search = $('wfSearch');
+    if (search) {
+      search.addEventListener('input', () => {
+        const kw = search.value.trim().toLowerCase();
+        list.querySelectorAll('.wf-node-chip').forEach(chip => {
+          const tpl = NODE_TEMPLATES.find(t => t.type === chip.dataset.type);
+          const hit = !kw || (tpl.label + tpl.desc + tpl.type).toLowerCase().includes(kw);
+          chip.style.display = hit ? '' : 'none';
+        });
+      });
+    }
   }
 
   function applyZoom() {
@@ -1165,12 +1348,13 @@ App.Workflow = (() => {
 
   function showZoomStatus() {
     const status = $('wfRunStatus');
-    if (status && !status.textContent.includes('▶') && !status.textContent.includes('❌') && !status.textContent.includes('✅')) {
-      // 不覆盖运行状态
-    }
+    if (!status) return;
+    const running = /运行中|完成|失败|取消/.test(status.textContent);
+    if (running) return;
+    status.textContent = viewScale === 1 ? '' : `缩放 ${Math.round(viewScale * 100)}%`;
+    status.classList.remove('success', 'error');
   }
 
-  // ── 操作提示 ──────────────────────────────────────────────────
   function showWorkflowHint() {
     if (document.querySelector('.wf-hint')) return;
     const hint = document.createElement('div');
@@ -1178,27 +1362,258 @@ App.Workflow = (() => {
     hint.innerHTML = `
       <div class="wf-hint-title">⚙️ 工作流操作指南</div>
       <div class="wf-hint-body">
-        <p>🖱️ <strong>拖拽节点</strong> — 按住节点拖动调整位置</p>
+        <p>🖱️ <strong>拖拽节点</strong> — 按住节点拖动调整位置，松开时自动吸附对齐</p>
         <p>🔗 <strong>添加连线</strong> — 从右侧端口拖到目标节点</p>
-        <p>✏️ <strong>编辑节点</strong> — 双击节点打开配置</p>
-        <p>🗑️ <strong>删除节点</strong> — 选中后按 Delete 键</p>
+        <p>✏️ <strong>编辑节点</strong> — 双击节点打开配置面板</p>
+        <p>🗑️ <strong>删除节点/连线</strong> — 选中后按 Delete 键</p>
         <p>🔍 <strong>缩放画布</strong> — 滚轮缩放或使用工具栏按钮</p>
         <p>📐 <strong>自动布局</strong> — 点击"布局"自动排列节点</p>
+        <p>🧲 <strong>智能对齐</strong> — 拖拽时自动吸附到网格和其他节点边缘</p>
         <p>💾 <strong>保存</strong> — Ctrl + S</p>
         <p>▶ <strong>运行</strong> — Ctrl + R</p>
         <p>⎋ <strong>取消选择</strong> — Esc 键</p>
       </div>
-      <button class="wf-hint-close" onclick="this.parentElement.remove()">我知道了</button>
+      <button class="wf-hint-close" id="wfHintClose">我知道了</button>
     `;
-    const container = $('wfDesigner');
+    const container = document.getElementById('workflowDesigner') || $('wfDesigner');
     if (container) container.appendChild(hint);
+    const closeBtn = container.querySelector('#wfHintClose');
+    if (closeBtn) closeBtn.addEventListener('click', () => { hint.remove(); });
   }
+
+  async function saveVersion() {
+    if (!currentWorkflow) return;
+    const version = await App.prompt?.('版本号 (如 v1.1):', 'v' + (currentWorkflow.version || '1.0'));
+    if (!version) return;
+    const comment = await App.prompt?.('版本说明 (可选):', '') || '';
+    try {
+      const data = await _fetch(`/v1/workflows/${currentWorkflow.id}/versions`, {
+        method: 'POST', body: JSON.stringify({ version: version.trim(), comment }),
+      });
+      App.toast?.(`版本 ${version} 已保存`, 'ok');
+      loadVersions();
+    } catch (e) { App.toast?.('保存版本失败: ' + e.message, 'err'); }
+  }
+
+  async function loadVersions() {
+    if (!currentWorkflow) return;
+    try {
+      const data = await _fetch(`/v1/workflows/${currentWorkflow.id}/versions`);
+      _versionHistory = data.versions || [];
+      renderVersionHistory();
+    } catch (e) { console.error('加载版本历史失败:', e); }
+  }
+
+  function renderVersionHistory() {
+    const el = $('wfVersionList');
+    if (!el) return;
+    if (!_versionHistory.length) { el.innerHTML = '<div class="wf-empty-hint">暂无版本历史</div>'; return; }
+    el.innerHTML = _versionHistory.map(v => `
+      <div class="wf-version-item">
+        <span class="wf-version-tag">${v.version}</span>
+        <span class="wf-version-time">${formatTime(v.created_at * 1000)}</span>
+        <button class="mini-btn wf-rollback-btn" data-version-id="${v.version_id}">回滚</button>
+      </div>`).join('');
+    el.addEventListener('click', e => {
+      const btn = e.target.closest('.wf-rollback-btn');
+      if (btn) App.Workflow.rollbackVersion(btn.dataset.versionId);
+    });
+  }
+
+  async function rollbackVersion(versionId) {
+    if (!currentWorkflow) return;
+    if (!await App.confirm?.('确定回滚到此版本？当前版本将自动备份。')) return;
+    try {
+      const data = await _fetch(`/v1/workflows/${currentWorkflow.id}/versions/${versionId}/rollback`, { method: 'POST' });
+      App.toast?.(`已回滚到版本 ${data.version || versionId}`, 'ok');
+      await _reloadWorkflow(); loadVersions();
+    } catch (e) { App.toast?.('回滚失败: ' + e.message, 'err'); }
+  }
+
+  async function exportWorkflow() {
+    if (!currentWorkflow) { App.toast?.('请先选择工作流', 'err'); return; }
+    try {
+      const data = await _fetch(`/v1/workflows/${currentWorkflow.id}/export`);
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url;
+      a.download = `${data.name || currentWorkflow.id}.json`; a.click();
+      URL.revokeObjectURL(url);
+      App.toast?.('工作流已导出', 'ok');
+    } catch (e) { App.toast?.('导出失败: ' + e.message, 'err'); }
+  }
+
+  async function importWorkflow() {
+    const input = document.createElement('input'); input.type = 'file'; input.accept = '.json';
+    input.onchange = async (e) => {
+      const file = e.target.files[0]; if (!file) return;
+      try {
+        const text = await file.text(); const data = JSON.parse(text);
+        if (!data.nodes || !data.edges) throw new Error('无效的工作流文件');
+        const result = await _fetch('/v1/workflows/import', {
+          method: 'POST', body: JSON.stringify({ workflow: data, import_as: 'new' }),
+        });
+        App.toast?.(`已导入: ${result.name}`, 'ok');
+        await loadList(); setTimeout(() => load(result.id), 100);
+      } catch (err) { App.toast?.('导入失败: ' + err.message, 'err'); }
+    };
+    input.click();
+  }
+
+  async function generateByDescription() {
+    if (!currentWorkflow) { App.toast?.('请先选择工作流', 'err'); return; }
+    const desc = await App.prompt?.('请输入工作流描述:', '');
+    if (!desc) return;
+    try {
+      const data = await _fetch('/v1/workflows/generate', {
+        method: 'POST',
+        body: JSON.stringify({ name: desc.slice(0, 30), description: desc }),
+      });
+      App.toast?.(`工作流已生成: ${data.name}`, 'ok');
+      await load(data.id);
+    } catch (e) { App.toast?.('生成失败: ' + e.message, 'err'); }
+  }
+
+  async function loadSchedules() {
+    if (!currentWorkflow) return;
+    try {
+      const data = await _fetch(`/v1/workflows/${currentWorkflow.id}/schedules`);
+      _scheduleList = data.schedules || [];
+      renderSchedules();
+    } catch (e) { console.error('加载调度失败:', e); }
+  }
+
+  function renderSchedules() {
+    const el = $('wfScheduleList'); if (!el) return;
+    if (!_scheduleList.length) { el.innerHTML = '<div class="wf-empty-hint">暂无定时调度</div>'; return; }
+    el.innerHTML = _scheduleList.map(s => `
+      <div class="wf-schedule-item ${s.enabled ? '' : 'disabled'}">
+        <span class="wf-schedule-icon">${s.enabled ? '⏰' : '⏸'}</span>
+        <div class="wf-schedule-info">
+          <div class="wf-schedule-name">${s.name}</div>
+          <div class="wf-schedule-cron">${s.cron_expr}</div>
+          <div class="wf-schedule-next">下次: ${s.next_run_at ? formatTime(s.next_run_at * 1000) : '-'}</div>
+        </div>
+        <button class="mini-btn ${s.enabled ? 'danger' : ''} wf-toggle-schedule" data-id="${s.schedule_id}">
+          ${s.enabled ? '禁用' : '启用'}
+        </button>
+      </div>`).join('');
+    el.addEventListener('click', e => {
+      const btn = e.target.closest('.wf-toggle-schedule');
+      if (btn) App.Workflow.toggleSchedule(btn.dataset.id);
+    });
+  }
+
+  async function createSchedule() {
+    if (!currentWorkflow) { App.toast?.('请先选择工作流', 'err'); return; }
+    const name = await App.prompt?.('调度名称:', '定时运行') || '定时运行';
+    const cronExpr = await App.prompt?.('Cron 表达式:', '0 9 * * *') || '0 9 * * *';
+    const session = await App.prompt?.('会话 ID (可选):', 'default') || 'default';
+    try {
+      const data = await _fetch(`/v1/workflows/${currentWorkflow.id}/schedules`, {
+        method: 'POST', body: JSON.stringify({ name, cron_expr: cronExpr, inputs: {}, session_id: session }),
+      });
+      App.toast?.('调度已创建', 'ok'); loadSchedules();
+    } catch (e) { App.toast?.('创建调度失败: ' + e.message, 'err'); }
+  }
+
+  async function toggleSchedule(scheduleId) {
+    try {
+      await _fetch(`/v1/workflows/${currentWorkflow.id}/schedules/${scheduleId}/toggle`, { method: 'POST' });
+      loadSchedules();
+    } catch (e) { App.toast?.('操作失败: ' + e.message, 'err'); }
+  }
+
+  async function deleteSchedule(scheduleId) {
+    if (!await App.confirm?.('确定删除此调度？')) return;
+    try {
+      await _fetch(`/v1/workflows/${currentWorkflow.id}/schedules/${scheduleId}`, { method: 'DELETE' });
+      App.toast?.('调度已删除', 'ok'); loadSchedules();
+    } catch (e) { App.toast?.('删除失败: ' + e.message, 'err'); }
+  }
+
+  async function loadStats() {
+    if (!currentWorkflow) return;
+    try {
+      const data = await _fetch(`/v1/workflows/${currentWorkflow.id}/stats?days=30`);
+      _statsData = data;
+      renderStats();
+    } catch (e) { console.error('加载统计失败:', e); }
+  }
+
+  function renderStats() {
+    const el = $('wfStatsContent'); if (!el) return;
+    if (!_statsData) { el.innerHTML = '<div class="wf-empty-hint">暂无统计数据</div>'; return; }
+    const d = _statsData;
+    el.innerHTML = `
+      <div class="wf-stats-grid">
+        <div class="wf-stat-card">
+          <div class="wf-stat-value">${d.total_runs ?? 0}</div>
+          <div class="wf-stat-label">总运行次数</div>
+        </div>
+        <div class="wf-stat-card success">
+          <div class="wf-stat-value">${d.success_count ?? 0}</div>
+          <div class="wf-stat-label">成功</div>
+        </div>
+        <div class="wf-stat-card fail">
+          <div class="wf-stat-value">${d.failed_count ?? 0}</div>
+          <div class="wf-stat-label">失败</div>
+        </div>
+        <div class="wf-stat-card">
+          <div class="wf-stat-value">${d.success_rate ?? 0}%</div>
+          <div class="wf-stat-label">成功率</div>
+        </div>
+        <div class="wf-stat-card">
+          <div class="wf-stat-value">${d.avg_duration_sec ?? 0}s</div>
+          <div class="wf-stat-label">平均耗时</div>
+        </div>
+      </div>
+      ${d.latest_run ? `
+      <div class="wf-stats-latest">
+        <div class="wf-stats-title">最近运行</div>
+        <div class="wf-stats-row">
+          <span>Run: ${d.latest_run.run_id}</span>
+          <span class="wf-status-${d.latest_run.status}">${d.latest_run.status === 'completed' ? '✓ 成功' : '✗ 失败'}</span>
+          <span>耗时: ${d.latest_run.duration ? d.latest_run.duration.toFixed(1) + 's' : '-'}</span>
+        </div>
+      </div>` : ''}
+    `;
+  }
+
+  function _toggleSecondaryPanel(panelId) {
+    const wrap = $('wfSecondaryPanels');
+    const panels = ['wfVersionPanel', 'wfSchedulePanel', 'wfStatsPanel'];
+    if (!wrap || !panels.includes(panelId)) return;
+    const isVisible = !wrap.hidden;
+    panels.forEach(p => {
+      const el = $(p);
+      if (el) el.style.display = (p === panelId && !isVisible) ? '' : 'none';
+    });
+    wrap.hidden = isVisible;
+  }
+
+  window.App = window.App || {};
+  App.Workflow = App.Workflow || {};
+  App.Workflow._closeSecondaryPanel = function() {
+    const wrap = $('wfSecondaryPanels');
+    if (wrap) wrap.hidden = true;
+  };
+
+  const _origReload = _reloadWorkflow;
+  window._reloadWorkflow = async function() {
+    await _origReload.apply(this, arguments);
+    if (currentWorkflow) { loadVersions(); loadSchedules(); }
+  };
 
   return {
     loadList, load, create, run, deleteWorkflow, renderDesigner, init,
     openNodePanel, closeNodePanel, saveNodeConfig, deleteNode, addNode, saveWorkflow,
     loadRunHistory, showRunDetail, closeRunPanel, switchRunTab,
     autoLayout, generateByDescription,
+    saveVersion, loadVersions, rollbackVersion,
+    exportWorkflow, importWorkflow,
+    loadSchedules, renderSchedules, createSchedule, toggleSchedule, deleteSchedule,
+    loadStats, renderStats,
     get current() { return currentWorkflow; }
   };
 })();

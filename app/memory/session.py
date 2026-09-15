@@ -20,6 +20,38 @@ from app.core.storage_backend import StorageBackend, get_storage_backend
 # _DB_LOCK 已移除,由 storage backend 内部保证线程安全
 
 
+def sanitize_history_for_llm(history: list[dict]) -> list[dict]:
+    """把会话历史清洗成 LLM 安全消息(供记忆摘要/检索等非主链调用方使用)。
+
+    - 自定义角色(error/plan/tool 等)降级为 user, 孤立 tool 消息(无 tool_call_id)
+      也降级为 user, 避免 OpenAI 兼容网关 400。
+    - 剥掉 kind/id/timestamp/meta 等非 OpenAI 字段。
+    - 保留 user/assistant 文本 + 合法的 tool_call 配对, 供 LLM 理解上下文。
+    """
+    _VALID_ROLES = ("system", "user", "assistant", "tool", "function", "developer")
+    out: list[dict] = []
+    for m in history or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role", "")
+        content = m.get("content", "") or m.get("kind", "")
+        if not str(content).strip():
+            continue
+        content = str(content)
+        llm_role = role if role in _VALID_ROLES else "user"
+        msg: dict = {"role": llm_role, "content": content}
+        if llm_role == "tool" and m.get("tool_call_id"):
+            msg["tool_call_id"] = m["tool_call_id"]
+        elif llm_role == "tool":
+            # 孤立 tool 消息 → user
+            msg["role"] = "user"
+            msg["content"] = "[工具执行结果(历史)]: " + content
+        if m.get("tool_calls"):
+            msg["tool_calls"] = m["tool_calls"]
+        out.append(msg)
+    return out
+
+
 class SessionStore:
     """会话存储,按 session_id 隔离,含历史容量限制。"""
 
@@ -186,6 +218,30 @@ class SessionStore:
                 (session_id, tid)
             )
         return {"id": session_id, "tenant_id": tid, "messages": messages, "created_at": now, "updated_at": now}
+
+    async def update_message(self, session_id: str, msg_id: str, content: str, meta: Optional[dict] = None, tenant_id: Optional[str] = None) -> bool:
+        """原地更新指定消息的内容(用于流式场景实时保存 assistant 回复)。"""
+        tid = await self._resolve_tid(tenant_id)
+        now = time.time()
+        async with self._lock:
+            session = self._ensure_session(session_id, tid)
+            messages = list(session["messages"])
+            updated = False
+            for i, m in enumerate(messages):
+                if m.get("id") == msg_id:
+                    messages[i] = {**m, "content": content, "timestamp": now}
+                    if meta is not None:
+                        messages[i]["meta"] = meta
+                    updated = True
+                    break
+            if updated:
+                self._backend.update(
+                    "sessions",
+                    {"messages": json.dumps(messages, ensure_ascii=False), "updated_at": now},
+                    "id = ? AND tenant_id = ?",
+                    (session_id, tid),
+                )
+            return updated
 
     async def get_history(self, session_id: str, last_n: Optional[int] = None) -> list[dict]:
         tid = await self._resolve_tid()

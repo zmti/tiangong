@@ -22,13 +22,15 @@ App.ChatUI.renderMessage = function(role, content, options = {}) {
   
   wrap.innerHTML = `
     <div class="avatar">${avatar}</div>
-    <div class="msg-body">
-      <div class="msg-time">${time}</div>
+    <div class="msg-content">
       <div class="answer-doc">${content}</div>
-      <div class="msg-actions">
-        <button class="msg-action" data-action="copy" title="复制">📋 复制</button>
-        <button class="msg-action" data-action="reply" title="回复">💬 回复</button>
-        ${role === 'bot' ? '<button class="msg-action" data-action="regenerate" title="重新生成">🔄 重新生成</button>' : ''}
+      <div class="msg-footer">
+        <div class="msg-actions">
+          <button class="msg-action" data-action="copy" title="复制">📋 复制</button>
+          <button class="msg-action" data-action="reply" title="回复">💬 回复</button>
+          ${role === 'bot' ? '<button class="msg-action" data-action="regenerate" title="重新生成">🔄 重新生成</button>' : ''}
+        </div>
+        <div class="msg-time">${time}</div>
       </div>
     </div>
   `;
@@ -80,8 +82,7 @@ App.ChatUI.showStreaming = function() {
   
   wrap.innerHTML = `
     <div class="avatar">🤖</div>
-    <div class="msg-body">
-      <div class="msg-time">思考中...</div>
+    <div class="msg-content">
       <div class="answer-doc">
         <div class="typing-indicator">
           <span></span>
@@ -105,10 +106,7 @@ App.ChatUI.hideStreaming = function() {
 
 // ========== 滚动到底部 ==========
 App.ChatUI.scrollToBottom = function() {
-  const container = document.getElementById('messages');
-  if (container) {
-    container.scrollTop = container.scrollHeight;
-  }
+  App.scrollMessagesToBottom(true);
 };
 
 // ========== 进度条 ==========

@@ -26,12 +26,32 @@ logger = logging.getLogger(__name__)
 # ChatCompletion message 类型定义
 Message = dict  # {"role": "user"/"assistant"/"system", "content": str}
 
-# 瞬态错误特征:命中即判定为可重试(网络抖动/限流/5xx)
+# 瞬态错误特征:命中即判定为可重试(网络抖动/5xx 服务不可用/超时限流抖动)。
+# 注意:终态错误(429 配额耗尽/401/404 鉴权与配置错误)由 _NON_RETRYABLE_MARKERS 先行拦截,
+# 保证它们立即失败而非长时间退避重试。
 _RETRYABLE_MARKERS = (
-    "timeout", "timed out", "rate limit", "429", "overloaded",
+    "timeout", "timed out", "rate limit", "overloaded",
     "connection", "network", "500", "502", "503", "504",
     "temporarily unavailable", "try again",
 )
+
+# 终态错误特征:命中即判定为不可重试(鉴权失败/配额耗尽/模型/路径配置错误)。
+# 这类错误重试只会浪费时间并触发熔断,应立即失败并给出可操作提示。
+_NON_RETRYABLE_MARKERS = (
+    "401", "403", "404", "429", "invalid api key", "incorrect api key",
+    "unauthorized", "authentication", "not found", "api key",
+    "does not exist", "insufficient", "quota", "exceeded your current quota",
+    "access denied", "arrearage", "arrears", "overdue", "not in good standing",
+    "access_denied", "account",
+)
+
+
+def _is_retryable(error: str) -> bool:
+    """可重试的瞬态错误(网络抖动/超时/5xx 服务不可用),但不含终态错误。"""
+    err = error.lower()
+    if any(m in err for m in _NON_RETRYABLE_MARKERS):
+        return False
+    return any(m in err for m in _RETRYABLE_MARKERS)
 
 # 推理模型:thinking 内容在 reasoning_content 字段,需分离透出
 _REASONING_MODELS = ("deepseek-reasoner", "deepseek-r1", "o1", "o1-", "o3", "o3-", "reasoner")
@@ -245,8 +265,7 @@ class LLMClient:
 
     @classmethod
     def _is_retryable(cls, error: str) -> bool:
-        err = error.lower()
-        return any(m in err for m in _RETRYABLE_MARKERS)
+        return _is_retryable(error)
 
     def _failover_specs(self) -> list[tuple[str, str]]:
         """返回 [(provider, model), ...] 故障转移候选,主 provider 在前。"""
@@ -351,12 +370,17 @@ class LLMClient:
                 except Exception as e:  # noqa: BLE001
                     self._trace(kind, t0, None, ok=False, error=str(e), tools_n=tools_n)
                     last_err = e
-                    if attempt < retries and self._is_retryable(str(e)):
+                    # 终态错误(429 限流/401 鉴权/404 路径错/配额耗尽)立即失败,不做指数退避,
+                    # 避免 CLI/UI 在配额打满时长时间"重试中"挂起。仅瞬态网络错误才退避重试。
+                    if not _is_retryable(str(e)):
+                        break
+                    if attempt < retries:
                         await asyncio.sleep(settings.agent_llm_retry_delay * (2 ** attempt))
                         continue
-                    break  # 不可重试或重试耗尽,本 spec 失败
+                    break
             self._record_failure(provider)
-        raise LLMError(f"LLM 调用失败(已重试{retries}次/切换{len(specs)}个provider): {last_err}") from last_err
+        friendly = _friendly_llm_error(last_err, self.provider, self.model)
+        raise LLMError(friendly) from last_err
 
     # ---- Provider 熔断状态 ----
     # 实例级 _circuit_fails / _circuit_open_until 已在 __init__ 中初始化，
@@ -482,6 +506,9 @@ class LLMClient:
             "messages": messages,
             "temperature": temperature,
         }
+        max_out = int(getattr(settings, "agent_default_max_output_tokens", 0) or 0)
+        if max_out > 0:
+            kwargs["max_tokens"] = max_out
 
         async def _fn(client, model):
             k = dict(kwargs)
@@ -498,7 +525,11 @@ class LLMClient:
         return content
 
     async def chat_stream(self, messages: list[Message], temperature: float = 0.7):
-        """流式对话,逐个产出文本增量(str);推理模型先产出 thinking 增量。"""
+        """流式对话,逐个产出文本增量(str);推理模型先产出 thinking 增量。
+
+        修复: 流式消费加空闲超时(流内两个 chunk 之间超过 stream_idle_timeout 秒视为卡死,
+        立即抛 LLMError,不再无限挂起),避免 provider 中途停顿导致前端"一直卡"。
+        """
         self._require_key()
         messages = self._cache_control_messages(messages)
         kwargs: dict = {
@@ -507,6 +538,9 @@ class LLMClient:
             "temperature": temperature,
             "stream": True,
         }
+        max_out = int(getattr(settings, "agent_default_max_output_tokens", 0) or 0)
+        if max_out > 0:
+            kwargs["max_tokens"] = max_out
 
         async def _fn(client, model):
             k = dict(kwargs)
@@ -515,8 +549,18 @@ class LLMClient:
 
         resp = await self._invoke(_fn, "chat_stream")
         reasoning = ""
+        idle_timeout = float(getattr(settings, "agent_llm_stream_idle_timeout", 0) or 0)
+        total_deadline = (
+            time.time() + int(settings.agent_llm_stream_total_timeout)
+            if settings.agent_llm_stream_total_timeout > 0 else 0.0
+        )
         try:
-            async for chunk in resp:
+            async for chunk in self._stream_with_idle_timeout(resp, idle_timeout):
+                # 总时长硬超时: 防止 provider 以极慢速度持续吐字导致流永不结束
+                if total_deadline and time.time() > total_deadline:
+                    raise LLMError(
+                        f"LLM 流式调用超过总时长上限({settings.agent_llm_stream_total_timeout}s), 已中断"
+                    )
                 if chunk.usage:
                     self.last_usage = self._usage_of(chunk)
                 if not chunk.choices:
@@ -529,11 +573,39 @@ class LLMClient:
                     continue
                 if delta and delta.content:
                     yield delta.content
+        except LLMError:
+            self._reasoning = reasoning
+            raise
         except Exception as e:  # noqa: BLE001
+            self._reasoning = reasoning
             self._trace("chat_stream", time.time(), None, ok=False, error=str(e))
             raise LLMError(f"LLM 流式调用失败: {e}") from e
         self._reasoning = reasoning
         self._trace("chat_stream", time.time(), self.last_usage)
+
+    @staticmethod
+    async def _stream_with_idle_timeout(stream, idle_timeout: float):
+        """消费 OpenAI 流式响应;idle_timeout>0 时,相邻 chunk 间隔超过该值即视为上游卡死。
+
+        用 asyncio.wait_for 包住每次 __anext__ —— 这是对流内停顿的唯一超时保护,
+        覆盖 provider 建连后长时间不吐字 / 中途断流不回 EOF 的场景。
+        """
+        if idle_timeout <= 0:
+            async for chunk in stream:
+                yield chunk
+            return
+        aiter = stream.__aiter__()
+        while True:
+            try:
+                chunk = await asyncio.wait_for(aiter.__anext__(), timeout=idle_timeout)
+            except StopAsyncIteration:
+                return
+            except asyncio.TimeoutError as e:
+                raise LLMError(
+                    f"LLM 流式响应空闲超时 ({idle_timeout:.0f}s 无新数据),已中断。"
+                    "请检查网络或换用更稳定的 provider/模型。"
+                ) from e
+            yield chunk
 
     @property
     def supports_native_tools(self) -> bool:
@@ -622,6 +694,10 @@ class LLMClient:
         }
         if tools:
             kwargs["tools"] = tools
+        # 传递 max_output_tokens 限制, 防止 provider 默认值过低导致截断
+        max_out = int(getattr(settings, "agent_default_max_output_tokens", 0) or 0)
+        if max_out > 0:
+            kwargs["max_tokens"] = max_out
 
         async def _fn(client, model):
             k = dict(kwargs)
@@ -632,8 +708,18 @@ class LLMClient:
         reasoning = ""
         content_buf = ""
         tool_call_bufs: list[dict] = []  # 每个 tool_call 的累积数据
+        idle_timeout = float(getattr(settings, "agent_llm_stream_idle_timeout", 0) or 0)
+        total_deadline = (
+            time.time() + int(settings.agent_llm_stream_total_timeout)
+            if settings.agent_llm_stream_total_timeout > 0 else 0.0
+        )
         try:
-            async for chunk in resp:
+            async for chunk in self._stream_with_idle_timeout(resp, idle_timeout):
+                # 总时长硬超时: 防止 provider 以极慢速度持续吐字导致流永不结束
+                if total_deadline and time.time() > total_deadline:
+                    raise LLMError(
+                        f"LLM 流式调用超过总时长上限({settings.agent_llm_stream_total_timeout}s), 已中断"
+                    )
                 if chunk.usage:
                     self.last_usage = self._usage_of(chunk)
                 if not chunk.choices:
@@ -671,6 +757,9 @@ class LLMClient:
                             "name": tool_call_bufs[idx]["name"],
                             "arguments": tool_call_bufs[idx]["arguments"],
                         }
+        except LLMError:
+            # 空闲超时/流中断等 LLMError 保留原始可操作提示,不再包一层
+            raise
         except Exception as e:  # noqa: BLE001
             self._trace("chat_stream", time.time(), None, ok=False, error=str(e))
             raise LLMError(f"LLM 流式调用失败: {e}") from e
@@ -920,6 +1009,26 @@ def _extract_json(text: str):
         return json.loads(text[start : end + 1])
     except json.JSONDecodeError:
         return None
+
+
+def _friendly_llm_error(last_err: Exception, provider: str, model: str) -> str:
+    """把底层 LLM 异常包装成可操作的错误信息,指明 provider/model 与下一步。"""
+    base = f"LLM 调用失败 (provider={provider} model={model}): {last_err}"
+    low = str(last_err).lower()
+    if "arrears" in low or "arrearage" in low or "overdue" in low or "not in good standing" in low \
+            or "欠费" in low or "good standing" in low:
+        return base + " —— 账户欠费/未开通(Arrearage)。请在服务商后台确认账号在正常服务状态并完成充值/开通模型服务。"
+    if "429" in low or "rate limit" in low or "quota" in low or "limit" in low:
+        return base + " —— API 限流/配额耗尽。请等待限流恢复,或在设置中切换服务商/模型(如 qwen、deepseek)。"
+    if "401" in low or "403" in low or "unauthorized" in low or "api key" in low:
+        return base + " —— API Key 无效或无权限。请检查该 provider 的 *_API_KEY 配置。"
+    if "access denied" in low:
+        return base + " —— 访问被拒(可能欠费/未开通服务/无该模型权限)。请确认账号在正常状态并已开通对应模型服务。"
+    if "404" in low or "not found" in low or "model" in low:
+        return base + " —— 模型或路径不存在。请检查 *_MODEL / *_BASE_URL 配置。"
+    if "timeout" in low or "timed out" in low:
+        return base + " —— 调用超时。可增大 AGENT_LLM_TIMEOUT(秒)。"
+    return base
 
 
 def build_llm(provider: Optional[str] = None) -> LLMClient:

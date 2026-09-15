@@ -27,7 +27,7 @@
     wrap.appendChild(head);
     wrap.appendChild(body);
     App.els.messages.appendChild(wrap);
-    App.els.messages.scrollTop = App.els.messages.scrollHeight;
+    App.scrollMessagesToBottom();
     App._currentGroup = { gid, wrap, head, body, tools: [], thinking: null, plan: null, started: Date.now() };
     return gid;
   }

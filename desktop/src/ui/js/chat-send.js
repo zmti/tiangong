@@ -49,7 +49,7 @@ App.Chat.regenerate = async function (wrap) {
   let userText = '';
   let userNode = null;
   for (let i = baseIdx; i >= 0; i--) {
-    if (nodes[i].classList.contains('user')) {
+    if (nodes[i].classList.contains('user') || nodes[i].classList.contains('msg-user')) {
       const b = nodes[i].querySelector('.answer-doc');
       userText = b ? (b.textContent || '').trim() : '';
       userNode = nodes[i];

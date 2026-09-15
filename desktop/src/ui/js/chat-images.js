@@ -30,7 +30,7 @@ App.showImageGenerating = function () {
     App.els.messages.appendChild(wrap);
   }
   App._imgGenCard = wrap;
-  App.els.messages.scrollTop = App.els.messages.scrollHeight;
+  App.scrollMessagesToBottom();
   // 点号动画:JS 驱动,避免 CSS content 动画不支持的问题
   App._dotsInterval = setInterval(() => {
     const dots = wrap.querySelector('.txt-dots');

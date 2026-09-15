@@ -94,7 +94,27 @@
   /* ---------- 设置侧边栏入口 → 打开完整面板 ---------- */
   // 保留旧面板切换能力,供"更多设置 / Provider优先级 / 自定义System Prompt"等入口使用
   let currentView = 'chat';
-  const panelMap = { todo: 'todoPanel', kb: 'kbPanel', memory: 'memoryPanel', runs: 'runsPanel', telemetry: 'telemetryPanel', schedule: 'schedulePanel', prompts: 'promptsPanel', tools: 'toolsPanel', workflow: 'workflowPanel' };
+  /* 修复"左侧栏看不到工作流 + 显示功能怪": 旧 panelMap 只有 8 个右面板视图,
+     workflow/projects/briefing 是主区 .tab-content 全页视图, 之前没入口点不到,
+     且 ui-modern 的 navigate 把它们当 tabContent 找(隐藏了 chatView 却找不到目标)。
+     现两类视图统一由 showView 处理: 主区 tab-content 用 switchTab, 右面板用 side-open。 */
+  const panelMap = { todo: 'todoPanel', kb: 'kbPanel', memory: 'memoryPanel', runs: 'runsPanel', telemetry: 'telemetryPanel', schedule: 'schedulePanel', prompts: 'promptsPanel', tools: 'toolsPanel' };
+  const tabMap = { workflow: 'tabWorkflow', projects: 'tabProjects', briefing: 'tabBriefing' };
+
+  function switchTab(view) {
+    const tabId = tabMap[view];
+    if (!tabId) return;
+    const chatView = document.getElementById('chatView');
+    document.querySelectorAll('.tab-content').forEach(el => {
+      const on = el.id === tabId;
+      el.classList.toggle('active', on);
+      el.style.display = on ? 'flex' : 'none';
+    });
+    if (chatView) chatView.style.display = 'none';
+    if (view === 'workflow' && App.Workflow && App.Workflow.loadList) App.Workflow.loadList();
+    if (view === 'projects' && App.Projects && App.Projects.load) App.Projects.load();
+    if (view === 'briefing' && App.Briefing && App.Briefing.load) App.Briefing.load();
+  }
 
   function showView(view) {
     if (view === 'chat') {
@@ -105,22 +125,45 @@
       openSettingsModal();
       return;
     }
+    /* 主区全页视图(workflow/projects/briefing): 隐藏聊天, 切到对应 tab */
+    if (tabMap[view]) {
+      switchTab(view);
+      currentView = view;
+      syncNavActive(view);
+      return;
+    }
+    /* 右侧面板视图: 隐藏聊天, 面板全屏显示 */
     const panelId = panelMap[view];
     if (!panelId) return;
+    document.querySelectorAll('.tab-content').forEach(el => { el.classList.remove('active'); el.style.display = 'none'; });
+    const chatView = document.getElementById('chatView');
+    if (chatView) chatView.style.display = 'none';
     document.querySelectorAll('.side-content').forEach((el) => el.classList.toggle('active', el.id === panelId));
     document.body.classList.add('side-open');
     currentView = view;
+    syncNavActive(view);
     if (view === 'memory' && App.Memory) App.Memory.refresh();
     if (view === 'runs' && App.Runs) App.Runs.load();
     if (view === 'telemetry' && App.Telemetry) App.Telemetry.load();
     if (view === 'schedule' && App.Schedule) App.Schedule.load();
     if (view === 'prompts' && App.Prompts) App.Prompts.render();
-    if (view === 'workflow' && App.Workflow) App.Workflow.loadList();
+  }
+
+  /* 修复"高亮错乱": 统一 nav-btn.active 与 currentView 状态联动 */
+  function syncNavActive(view) {
+    document.querySelectorAll('.nav-btn').forEach((b) => {
+      b.classList.toggle('active', b.dataset.view === view);
+    });
   }
 
   function closePanel() {
     document.body.classList.remove('side-open');
+    document.querySelectorAll('.side-content').forEach(el => el.classList.remove('active'));
+    const chatView = document.getElementById('chatView');
+    if (chatView) chatView.style.display = 'flex';
+    document.querySelectorAll('.tab-content').forEach(el => { el.classList.remove('active'); el.style.display = 'none'; });
     currentView = 'chat';
+    syncNavActive('chat');
   }
 
   const openSettingsBtn = document.getElementById('openSettingsBtn');
@@ -193,6 +236,8 @@
   document.querySelectorAll('.nav-btn').forEach((btn) => {
     btn.addEventListener('click', () => {
       const view = btn.dataset.view;
+      /* 修复"重复点击同视图无反应/状态错乱": 同视图再点 = 回到对话,
+         不同视图 = 切换。tab-content 与 side-panel 都走 showView 统一处理。 */
       if (currentView === view && view !== 'chat') {
         closePanel();
       } else {
@@ -240,13 +285,27 @@
       || e.keyCode === 229
       || (e.nativeEvent && e.nativeEvent.isComposing === true);
   };
-  App.els.sendBtn.addEventListener('click', () => App.Chat.send());
-  App.els.stopBtn.addEventListener('click', () => App.Chat.stop(false));
+  /* 修复"发送后不能再次发送 + 不能停止": 绑定加缺失守卫,
+     任一按钮 DOM 缺失不再抛 TypeError 中断后续 200 行绑定 */
+  if (App.els.sendBtn) {
+    App.els.sendBtn.addEventListener('click', () => {
+      /* 修复"不知道是否可发送": 点击走 App.canSend() 单一判断 + 明确提示,
+         生成中点发送不再静默无反应 */
+      if (App.canSend()) App.Chat.send();
+      else if (App.streaming) App.toast && App.toast('正在生成中, 点停止按钮后再发', 'info');
+    });
+  }
+  if (App.els.stopBtn) App.els.stopBtn.addEventListener('click', () => App.Chat.stop(false));
   App.els.input.addEventListener('keydown', (e) => {
     if (isImeComposing(e)) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      App.Chat.send();
+      /* 修复"不知道是否可发送": Enter 发送走 App.canSend() 单一判断,
+         生成中点 Enter 给出明确提示而非静默无反应 */
+      if (App.canSend()) App.Chat.send();
+      else if (App.streaming) {
+        App.toast && App.toast('正在生成中, 点停止按钮后再发', 'info');
+      }
     }
   });
 
@@ -319,7 +378,13 @@
     if (!inp) return;
     inp.style.height = 'auto';
     inp.style.height = Math.min(inp.scrollHeight, 164) + 'px';
-    App.els.sendBtn.disabled = !inp.value.trim() || App.streaming;
+    /* 修复"发送后不能再次发送 + 不能停止": 旧实现 !inp.value.trim() || App.streaming
+       在 streaming=true 残留时, 即使输入框有内容按钮也点不动, 且 streaming class 未同步
+       时 stopBtn 不可见。现改为: 只根据输入内容禁用(空内容不可发), streaming 状态
+       交给 setStreaming() 独立管理 send/stop 按钮显隐与 disabled, 两条路互不干扰。 */
+    if (!App.streaming) {
+      App.els.sendBtn.disabled = !inp.value.trim();
+    }
     /* P2-13: 把 footer 实际高度写入 --composer-h, backToBottom 按钮跟随定位,
        避免 composer 增高时与输入框重叠(旧实现 bottom:120px 硬编码) */
     try {
@@ -329,6 +394,12 @@
         document.documentElement.style.setProperty('--composer-h', h + 'px');
       }
     } catch (_) { /* 非 DOM 环境忽略 */ }
+  };
+  /* 修复"不知道是否可发送": 提供统一的状态查询, 供发送按钮/快捷键/
+     任何 UI 决策使用单一事实源, 避免各处自行判断 streaming 状态不一致 */
+  App.canSend = function () {
+    const inp = App.els.input;
+    return !!(inp && inp.value.trim()) && !App.streaming;
   };
 
   /* ---------- 图片识别 ---------- */
@@ -461,6 +532,11 @@
     promptHintIndex = -1;
     renderPromptHint();
     App.syncComposer();
+    /* 修复"不知道是否可发送": 输入内容变化时同步刷新按钮可点状态,
+       用户随时能看出"此刻能不能发" */
+    if (App.els.sendBtn && !App.streaming) {
+      App.els.sendBtn.disabled = !App.els.input.value.trim();
+    }
   });
   App.els.input.addEventListener('keydown', (e) => {
     if (!promptHint) return;
@@ -516,7 +592,7 @@
   };
 
   /* ---------- 设置 ---------- */
-  App.els.themeToggle.addEventListener('click', () => App.Settings.toggleTheme());
+  if (App.els.themeToggle) App.els.themeToggle.addEventListener('click', () => App.Settings.toggleTheme());
 
   /* ---------- 执行面板切换 ---------- */
   const toggleSidePanelBtn = document.getElementById('toggleSidePanel');
@@ -547,20 +623,22 @@
   });
 
   /* ---------- 灯箱 ---------- */
-  App.els.lbClose.addEventListener('click', () => App.closeLb());
-  App.els.lbDownload.addEventListener('click', () => App.downloadLb());
-  App.els.lbCopy.addEventListener('click', () => App.copyLb());
-  App.els.lightbox.addEventListener('click', (e) => {
+  /* P2-16: 缺失守卫, 避免任一 DOM id 缺失中断后续绑定 */
+  if (App.els.lbClose) App.els.lbClose.addEventListener('click', () => App.closeLb());
+  if (App.els.lbDownload) App.els.lbDownload.addEventListener('click', () => App.downloadLb());
+  if (App.els.lbCopy) App.els.lbCopy.addEventListener('click', () => App.copyLb());
+  if (App.els.lightbox) App.els.lightbox.addEventListener('click', (e) => {
     if (e.target === App.els.lightbox) App.closeLb();
   });
-  // Markdown/历史中渲染的图片点击放大(事件委托)
-  App.els.messages.addEventListener('click', (e) => {
-    if (e.target && e.target.tagName === 'IMG') App.openLb(e.target.src, e.target.alt || '图片');
-  });
-  // 加载失败的图片自动隐藏(捕获阶段委托,替代内联 onerror,修复 XSS 风险)
-  App.els.messages.addEventListener('error', (e) => {
-    if (e.target && e.target.tagName === 'IMG') e.target.style.display = 'none';
-  }, true);
+  if (App.els.messages) {
+    App.els.messages.addEventListener('click', (e) => {
+      if (e.target && e.target.tagName === 'IMG') App.openLb(e.target.src, e.target.alt || '图片');
+    });
+    /* 加载失败的图片自动隐藏(捕获阶段委托,替代内联 onerror,修复 XSS 风险) */
+    App.els.messages.addEventListener('error', (e) => {
+      if (e.target && e.target.tagName === 'IMG') e.target.style.display = 'none';
+    }, true);
+  }
   /* ---------- 协作模式(单一状态源 + 就地配置,见 js/mode.js) ---------- */
   // App.Mode.init() 在 loadAllData 中调用(provider/model 数据就绪后)
 
@@ -654,7 +732,7 @@
     const safe = async (label, fn) => {
       try { return await fn(); } catch (e) { console.error(`[init] ${label} 失败:`, e); }
     };
-    const ids = (await safe('renderSidebarHistory', () => App._renderSidebarHistory())) || [];
+    const ids = (await safe('renderSidebarHistory', () => renderSidebarHistory())) || [];
 
     safe('KB', () => App.KB.refresh());
     safe('Tools', () => App.Tools.load());
@@ -668,8 +746,6 @@
     // provider 数据就绪后通知 Mode 刷新(若 init 时数据尚未加载完毕)
     if (App.Mode && App.Mode.reinitAfterProviders) App.Mode.reinitAfterProviders();
 
-    // 渲染侧边栏会话历史
-    renderSidebarHistory();
     await safe('restoreLast', () => App.Session.restoreLast(ids));
     safe('CtxMeter', () => App.CtxMeter.refresh());
   }
@@ -681,7 +757,7 @@
     try {
       const res = await App.apiJSON('/v1/chat/sessions');
       if (!res.success || !res.data?.sessions?.length) {
-        el.innerHTML = '<div style="padding:8px 12px;font-size:11px;color:var(--muted);">暂无会话</div>';
+        el.innerHTML = '<div class="sh-empty">暂无会话</div>';
         return [];
       }
       const sessions = res.data.sessions.slice(0, 30);
@@ -701,12 +777,12 @@
       });
       return sessionIds;
     } catch (_) {
-      el.innerHTML = '<div style="padding:8px 12px;font-size:11px;color:var(--muted);">加载失败</div>';
+      el.innerHTML = '<div class="sh-empty">加载失败</div>';
       return [];
     }
   }
-  // 暴露给 session.js 调用
-  App._renderSidebarHistory = renderSidebarHistory;
+  // 注意: 不要将 renderSidebarHistory 赋值给 App._renderSidebarHistory,
+  // session.js 的 renderCards 会调用它,会导致无限递归
 
   async function init() {
     const splash = document.getElementById('splashScreen');
@@ -789,6 +865,13 @@
       if (okNow && !App._dataLoaded) {
         App._dataLoaded = true;
         await loadAllData();
+        /* P2-18: 后端中途恢复时, 隐藏 splash 上的重试按钮 + 解除 sidebar/main 隐藏 */
+        const splash = document.getElementById('splashScreen');
+        if (splash) splash.classList.add('hidden');
+        const sidebar = document.getElementById('sidebar');
+        if (sidebar) sidebar.classList.remove('init-hidden');
+        const mainEl = document.getElementById('main');
+        if (mainEl) mainEl.classList.remove('init-hidden');
       } else if (okNow && App._dataLoaded) {
         // 后端恢复后刷新 provider（单线程，不重复 restore）
         if (App.Settings && App.Settings.loadProviders) await App.Settings.loadProviders();
@@ -823,7 +906,7 @@
     // 初始化语音和视频模块
     if (App.Voice) App.Voice.init();
     if (App.Video) App.Video.init();
-    if (App.Workflow) App.Workflow.init();
+    if (App.Workflow && typeof App.Workflow.init === 'function') App.Workflow.init();
   }
 
   init();

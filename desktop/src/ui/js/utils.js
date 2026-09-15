@@ -33,7 +33,7 @@
   // 刷新欢迎页显隐
   App.refreshWelcomePage = function () {
     const msgs = App.els.messages;
-    const hasUserMsg = msgs ? Array.from(msgs.querySelectorAll('.msg.user')).length > 0 : false;
+    const hasUserMsg = msgs ? Array.from(msgs.querySelectorAll('.msg.user, .msg.msg-user')).length > 0 : false;
     if (hasUserMsg) {
       document.body.classList.add('has-messages');
     } else {
@@ -41,11 +41,18 @@
     }
   };
 
-  // 去除 thinking 标签
+  // 去除 thinking 标签(包括内容)
   App.stripThinkingTags = function (content) {
     if (!content) return '';
     return content
+      .replace(/<thinking[\s\S]*?<\/thinking>/gi, '')
       .replace(/<\/?thinking[^>]*>/gi, '')
+      .replace(/<\/?tool_call[^>]*>/gi, '')
+      .replace(/<\/?function[^>]*>/gi, '')
+      .replace(/<\/?parameter[^>]*>/gi, '')
+      .replace(/<\/?summary[^>]*>/gi, '')
+      .replace(/<\/?details[^>]*>/gi, '')
+      .replace(/<detailsopen>/gi, '')
       .replace(/\n{3,}/g, '\n\n')
       .trim();
   };
