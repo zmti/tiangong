@@ -708,6 +708,7 @@ class LLMClient:
         reasoning = ""
         content_buf = ""
         tool_call_bufs: list[dict] = []  # 每个 tool_call 的累积数据
+        finish_reason = ""
         idle_timeout = float(getattr(settings, "agent_llm_stream_idle_timeout", 0) or 0)
         total_deadline = (
             time.time() + int(settings.agent_llm_stream_total_timeout)
@@ -726,6 +727,10 @@ class LLMClient:
                     continue
                 choice = chunk.choices[0]
                 delta = choice.delta
+                # 追踪 finish_reason(截断检测用)
+                fr = getattr(choice, "finish_reason", None)
+                if fr:
+                    finish_reason = fr
                 rc = getattr(delta, "reasoning_content", None)
                 if rc and self._is_reasoning_model():
                     reasoning += rc
@@ -765,6 +770,12 @@ class LLMClient:
             raise LLMError(f"LLM 流式调用失败: {e}") from e
         logger.debug("[chat_stream_with_tools] stream loop ended, content_len=%d", len(content_buf))
         self._reasoning = reasoning
+
+        # 检测截断: finish_reason=length 表示达到 max_tokens 上限
+        if finish_reason == "length" and not tool_call_bufs:
+            logger.warning("LLM 响应被截断(finish_reason=length, content_len=%d)", len(content_buf))
+            # 追加截断提示,让前端显示
+            content_buf += "\n\n⚠️ 回复被截断: 已达到输出长度上限。可尝试缩短上下文或增加 max_output_tokens。"
 
         # 构建最终结果
         tool_calls = []

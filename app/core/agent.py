@@ -321,8 +321,11 @@ class Agent:
         self._search_query_history = []
         # 记忆注入提示块:清空(下一次 _node_prepare 会重新检索)
         self._memory_note = ""
-        # 运行中批准集合:清空(仅当次运行有效)
-        self._runtime_approved = set()
+        # 运行中批准集合:回到"实例级基线批准"(调用方显式预设的跨轮放行意图),
+        # 只清掉"本次运行动态批准"的部分。此前直接 set() 会把 CLI 在 init 阶段预设的
+        # _runtime_approved(本地放行工具名单)在第 1 轮 run_stream 入口就冲掉,
+        # 导致 --yolo 形同虚设、危险工具仍触发 interrupt 卡死。
+        self._runtime_approved = set(getattr(self, "_baseline_approved", set()))
 
     # ---- 对外接口 ----
 
@@ -956,9 +959,6 @@ class Agent:
         if not answer:
             # 先尝试 reasoning 作为兜底
             answer = state.metadata.get("reasoning", "") or ""
-            if answer and state.metadata.get("stream"):
-                for ch in answer:
-                    state.emit({"type": "token", "content": ch})
             # 如果仍然为空，非流式模式下补一次 LLM 调用（带超时保护）
             if not answer and not state.metadata.get("stream"):
                 try:
@@ -2409,7 +2409,7 @@ class Agent:
         # 改进：提高保留比例，从 50% 提高到 60%
         keep: list[dict] = []
         acc = 0
-        keep_budget = int(token_budget * 0.6)  # 从 0.5 提高到 0.6
+        keep_budget = int(token_budget * 0.4)  # 从 0.6 降低到 0.4, 更积极压缩
         for m in reversed(history):
             c = estimate_tokens(str(m.get("content", "")))
             if acc + c <= keep_budget:

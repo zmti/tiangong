@@ -108,8 +108,9 @@ class Settings(BaseSettings):
     agent_task_max_tokens: int = 0
 
     # ---- 上下文配额硬控制 ----
-    # 请求级 max_output_tokens 上限;0 = 使用合理默认值(16384)。超过上限后停止生成。
-    agent_default_max_output_tokens: int = 16384
+    # 请求级 max_output_tokens 上限;0 = 不限制(由 provider 默认值决定)。
+    # 推理模型的 thinking token 也计入此限制, 设置过小会导致 tool_calls 被截断。
+    agent_default_max_output_tokens: int = 0
 
     # ---- 工作流生成服务地址 ----
     # Agent 通过 create_workflow_from_desc 工具调用此地址生成工作流。
@@ -158,10 +159,12 @@ class Settings(BaseSettings):
     agent_system_prompt: str = "你是一个智能助手,请用中文回答。"
     # 单条历史消息最大字符数(防止大工具结果/图片 base64 塞爆上下文)
     message_char_cap: int = 20000
-    # 注入上下文的历史总字符预算(约 100k 字符 ≈ 35k~50k token,留足模型余量)
-    context_char_budget: int = 100000
-    # Token 级上下文预算(0 = 关闭,沿用字符预算;>0 时用 estimate_tokens 精确裁剪)
-    agent_token_budget: int = 0
+    # 注入上下文的历史总字符预算(约 60k 字符 ≈ 15k~20k token,留足模型余量)
+    # 注意: agnes-3.0-flash 上下文窗口 50k token, 需预留 ~15k 给工具结果和输出
+    context_char_budget: int = 60000
+    # Token 级上下文预算(>0 时用 estimate_tokens 精确裁剪,比字符预算更准确)
+    # 设置为 30000 留足余量给工具调用和输出
+    agent_token_budget: int = 30000
 
     # ---- 原生工具调用(function calling)----
     # 开启时走 LLM 原生 tool_calls(参数结构化、支持并行),失败自动降级为 JSON 文本解析
@@ -227,8 +230,8 @@ class Settings(BaseSettings):
     # ---- 会话摘要压缩 ----
     # 历史超过预算时,不再粗暴截断,而是用 LLM 把较早对话压成摘要再注入
     agent_summarize: bool = True
-    # 历史字符数超过 context_char_budget*该比例时触发摘要压缩
-    agent_summary_threshold_ratio: float = 0.6
+    # 历史字符数超过 context_char_budget*该比例时触发摘要压缩(降低阈值更早触发)
+    agent_summary_threshold_ratio: float = 0.4
     # 喂给摘要模型的旧消息合并后最大字符数
     agent_summary_chars: int = 60000
 
