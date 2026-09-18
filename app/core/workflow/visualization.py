@@ -35,22 +35,38 @@ def generate_dag_visualization(workflow: Workflow) -> dict:
     layer_y = {layer_idx: -layer_idx * 100 for layer_idx in range(len(layers))}
     node_x = {}
     for layer_idx, layer_nodes in enumerate(layers):
-        for i, node in enumerate(layer_nodes):
-            node_x[node.id] = i * 150
+        # _compute_layers 返回的是节点 ID 字符串列表(非节点对象), 直接按 ID 取 x 坐标
+        for i, node_id in enumerate(layer_nodes):
+            node_x[node_id] = i * 150
+    # 兜底: 未参与层次布局的节点也给坐标, 避免前端拿到缺失值导致 SVG path 出现 NaN
+    for index, node_id in enumerate(workflow.nodes):
+        node_x.setdefault(node_id, index * 150)
 
+    node_width = 180
+    node_height = 96
     for node_id, node in workflow.nodes.items():
         layer_idx = _get_layer(node_id, layers)
+        position = node.position or {}
+        x = _safe_float(position.get("x"), node_x.get(node_id, 0))
+        y = _safe_float(position.get("y"), layer_y.get(layer_idx, 0))
+        # 纯函数语义: 可视化数据独立计算, 不原地修改调用方 Workflow 对象的节点坐标
+        # (旧实现在此处写回 node.position, 导致调用方后续读取时拿到"被可视化改写"的坐标)
         nodes.append({
             "id": node_id,
             "type": node.type.value,
             "label": node.name,
             "description": node.description,
-            "x": node_x.get(node_id, 0),
-            "y": layer_y.get(layer_idx, 0),
+            "x": x,
+            "y": y,
+            "width": node_width,
+            "height": node_height,
+            "position": {"x": x, "y": y, "width": node_width, "height": node_height},
             "config": node.config,
             "error_strategy": node.error_strategy.value if hasattr(node.error_strategy, 'value') else str(node.error_strategy),
         })
 
+    node_ids = set(workflow.nodes)
+    node_by_id = {n["id"]: n for n in nodes}
     for edge in workflow.edges:
         condition_label = None
         if edge.condition_expr:
@@ -58,24 +74,92 @@ def generate_dag_visualization(workflow: Workflow) -> dict:
         elif edge.condition:
             condition_label = edge.condition[:50] + ("..." if len(edge.condition) > 50 else "")
 
-        edges.append({
+        source_node = node_by_id.get(edge.source)
+        target_node = node_by_id.get(edge.target)
+        edge_item = {
             "source": edge.source,
             "target": edge.target,
             "label": condition_label,
             "id": edge.id,
-        })
+            "valid": edge.source in node_ids and edge.target in node_ids,
+            "path": _build_edge_path(source_node, target_node, node_width, node_height),
+        }
+        edges.append(edge_item)
+
+    x_values = [n["x"] for n in nodes]
+    y_values = [n["y"] for n in nodes]
+    min_x = min(x_values) if x_values else 0.0
+    min_y = min(y_values) if y_values else 0.0
+    max_x = max((n["x"] + n["width"] for n in nodes), default=min_x + node_width)
+    max_y = max((n["y"] + n["height"] for n in nodes), default=min_y + node_height)
+    padding = 60
+    viewbox = {
+        "x": round(_safe_float(min_x, 0.0) - padding, 2),
+        "y": round(_safe_float(min_y, 0.0) - padding, 2),
+        "width": round(_safe_float(max_x, 0.0) - _safe_float(min_x, 0.0) + padding * 2, 2),
+        "height": round(_safe_float(max_y, 0.0) - _safe_float(min_y, 0.0) + padding * 2, 2),
+    }
+    if viewbox["width"] <= 0:
+        viewbox["width"] = float(node_width + padding * 2)
+    if viewbox["height"] <= 0:
+        viewbox["height"] = float(node_height + padding * 2)
 
     return {
         "nodes": nodes,
         "edges": edges,
-        "layout": "dagre",
+        "viewBox": viewbox,
+        "layout": "manual" if all(node.position and _is_finite_number(node.position.get("x")) and _is_finite_number(node.position.get("y")) for node in workflow.nodes.values()) else "dagre",
         "meta": {
             "workflow_id": workflow.id,
             "name": workflow.name,
             "nodes_count": len(nodes),
             "edges_count": len(edges),
+            "has_missing_positions": False,
         }
     }
+
+
+def _build_edge_path(source_node: Optional[dict], target_node: Optional[dict], node_width: int, node_height: int) -> str:
+    """生成可直接赋给 SVG path d 属性的连线路径。"""
+    if not source_node or not target_node:
+        return ""
+    source_x = _safe_float(source_node.get("x"), None)
+    source_y = _safe_float(source_node.get("y"), None)
+    target_x = _safe_float(target_node.get("x"), None)
+    target_y = _safe_float(target_node.get("y"), None)
+    if source_x is None or source_y is None or target_x is None or target_y is None:
+        return ""
+    start_x = source_x + node_width
+    start_y = source_y + node_height / 2
+    end_x = target_x
+    end_y = target_y + node_height / 2
+    mid_x = (start_x + end_x) / 2
+    return (
+        f"M {start_x:.2f} {start_y:.2f} "
+        f"C {mid_x:.2f} {start_y:.2f}, "
+        f"{mid_x:.2f} {end_y:.2f}, "
+        f"{end_x:.2f} {end_y:.2f}"
+    )
+
+
+def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    """把节点坐标转成有限 float, 异常/缺失时回退默认值。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if number != number or number in (float("inf"), float("-inf")):
+        return default
+    return number
+
+
+def _is_finite_number(value: Any) -> bool:
+    """判断值是否为有限数字。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return False
+    return number == number and number not in (float("inf"), float("-inf"))
 
 
 def generate_execution_snapshot(run: WorkflowRun) -> dict:

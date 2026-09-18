@@ -30,8 +30,13 @@
       const answer = document.createElement('div');
       answer.className = 'answer-doc';
       if (type === 'bot') {
-        if (text) answer.innerHTML = App.renderMarkdown(text);
-        else answer.textContent = '';
+        if (text) {
+          try { answer.innerHTML = App.renderMarkdown(text); }
+          catch (e) {
+            console.error('[appendMessage] renderMarkdown ERROR:', e);
+            answer.innerHTML = '<p style="white-space:pre-wrap;">' + App.escapeHtml(text) + '</p>';
+          }
+        } else answer.textContent = '';
       } else {
         answer.textContent = text;
       }

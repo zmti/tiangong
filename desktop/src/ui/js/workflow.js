@@ -180,11 +180,15 @@ App.Workflow = (() => {
   function _svgCoord(e) {
     if (!svgEl) return { x: 0, y: 0 };
     const r = svgEl.getBoundingClientRect();
-    const vb = svgEl.viewBox.baseVal;
-    if (!vb.width) return { x: e.clientX - r.left, y: e.clientY - r.top };
+    // SVG 用 CSS transform: scale() 做缩放(见 applyZoom), getBoundingClientRect 返回
+    // 的是缩放后的尺寸, 而节点 _x/_y 是缩放前(用户坐标系)的值。要把鼠标屏坐标换算回
+    // 用户坐标系, 必须除以 viewScale; 否则一缩放, 端口拖线/落点/双击加节点全对不齐
+    // (表现为"画线画不出来/画到错位"。旧版误以为要按 viewBox 算比例, 但本 SVG 从不
+    // 设 viewBox, 实际缩放系数一直是 1, 缩放后坐标就漂了)。
+    const scale = viewScale || 1;
     return {
-      x: (e.clientX - r.left) * (vb.width  / r.width),
-      y: (e.clientY - r.top)  * (vb.height / r.height),
+      x: (e.clientX - r.left) / scale,
+      y: (e.clientY - r.top)  / scale,
     };
   }
 
@@ -825,21 +829,26 @@ App.Workflow = (() => {
     _capturePositions();
     try {
       const data = await _fetch(`/v1/workflows/${currentWorkflow.id}`);
-      renderDesigner(data);
+      renderDesigner(data, true);  // 保留当前缩放/视图, 避免保存后画面跳变
     } catch (e) { App.toast?.('刷新失败: ' + e.message, 'err'); }
   }
 
-  function renderDesigner(wf) {
+  // 区分两种渲染:
+  //  - load/切换工作流: keepView=false, 重置缩放为 1(全新画布)。
+  //  - 保存/增删节点后的 _reloadWorkflow: keepView=true, 保留当前 viewScale,
+  //    避免"保存后缩放跳回 100% / 画布跳动"造成"画线对不上/丢布局"的错觉。
+  function renderDesigner(wf, keepView = false) {
     currentWorkflow = wf;
     nodes = wf.nodes ? wf.nodes.map(n => ({ ...n })) : [];
     edges = (wf.edges || []).map(e => ({ ...e }));
     selectedNodeId = null;
-    viewScale = 1;
+    if (!keepView) viewScale = 1;
     const svg = ensureSvg();
     if (!svg) return;
     buildDefs(svg);
     renderNodes(svg, wf);
     renderEdges();
+    applyZoom();  // 同步 transform, 保证缩放状态下重绘后坐标一致
     setTimeout(_updateSvgSize, 50);
     if (svgEl && typeof ResizeObserver !== 'undefined') {
       if (svgEl._resizeObserver) svgEl._resizeObserver.disconnect();
@@ -1242,8 +1251,6 @@ App.Workflow = (() => {
       Object.keys(_posCache).forEach(k => { delete _posCache[k]; });
       currentWorkflow = null; nodes = []; edges = []; nodeElements.clear();
       selectedNodeId = null; activeRunId = null; runHistory = [];
-      const toolbar = $('wfToolbar');
-      if (toolbar) toolbar.hidden = true;
       const historyWrap = $('wfRunHistoryWrap');
       if (historyWrap) historyWrap.hidden = true;
       const svg = $('wfSvg');

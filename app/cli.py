@@ -256,22 +256,26 @@ async def run_interactive(args: argparse.Namespace) -> None:
                 use_history=True
             )
 
+            answer = ""
             if args.stream:
                 print("AI: ", end="")
                 async for event in agent.run_stream(user_input, history=history):
                     if event["type"] == "token":
                         print(event["content"], end="", flush=True)
+                        answer += event["content"]
                 print()
             else:
                 result = await agent.run(user_input, history=history)
-                print(f"\nAI: {result.answer}")
+                answer = result.answer or ""
+                print(f"\nAI: {answer}")
 
-            # 更新历史
+            # 更新历史: 无论流式与否, 都有 answer 可存(避免 NameError); 有内容才记
             if not args.no_history:
                 from app.memory.session import get_session_store
                 store = get_session_store()
                 await store.add_message(session_id, "user", content=user_input)
-                await store.add_message(session_id, "assistant", content=result.answer)
+                if answer:
+                    await store.add_message(session_id, "assistant", content=answer)
                 history = await store.get_history(session_id)
 
         except Exception as e:

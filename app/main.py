@@ -178,6 +178,8 @@ async def _init_tool_route_cache():
 async def _init_workflow_schedules():
     """启动工作流定时调度后台循环"""
     try:
+        import uuid as _uuid
+
         from app.api.workflow import _schedules, _load_workflow, _ensure_executor
         from app.core.workflow.db import get_db
         import asyncio
@@ -195,7 +197,7 @@ async def _init_workflow_schedules():
                             wf = _load_workflow(wf_id)
                             if wf:
                                 executor = _ensure_executor(wf_id)
-                                run_id = f"run_{int(now * 1000)}_{uuid.uuid4().hex[:6]}"
+                                run_id = f"run_{int(now * 1000)}_{_uuid.uuid4().hex[:6]}"
                                 await executor.run(
                                     wf, sched.get("inputs", {}),
                                     run_id=run_id, session_id=sched.get("session_id", "default"),

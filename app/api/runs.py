@@ -29,7 +29,7 @@ async def list_runs(
     status = str(status or "")
     tenant = get_tenant()
     mgr = _manager()
-    runs = mgr.list(limit=limit, offset=offset, status=status or None, tenant_id=tenant)
+    runs = await mgr.list(limit=limit, offset=offset, status=status or None, tenant_id=tenant)
     return {"runs": runs, "total": len(runs)}
 
 
@@ -38,7 +38,7 @@ async def get_run(run_id: str) -> dict:
     """单个运行详情(含计划/步骤/答案等摘要)。"""
     mgr = _manager()
     # 直接按主键加载,避免全量扫描
-    state = mgr.load(run_id)
+    state = await mgr.load(run_id)
     if state is None:
         raise HTTPException(status_code=404, detail=f"未找到运行记录: {run_id}")
     return state.summary()
@@ -53,7 +53,7 @@ async def resume_run(run_id: str) -> dict:
     """
     mgr = _manager()
     # 直接按主键加载
-    state = mgr.load(run_id)
+    state = await mgr.load(run_id)
     if state is None:
         raise HTTPException(status_code=404, detail=f"未找到运行记录: {run_id}")
     session_id = state.session_id
@@ -81,7 +81,7 @@ async def resume_run(run_id: str) -> dict:
 @router.delete("/{run_id}")
 async def delete_run(run_id: str) -> dict:
     """删除一条运行记录(checkpoint)。"""
-    ok = _manager().delete(run_id)
+    ok = await _manager().delete(run_id)
     if not ok:
         raise HTTPException(status_code=404, detail=f"未找到运行记录: {run_id}")
     return {"run_id": run_id, "deleted": True}
@@ -92,5 +92,5 @@ async def cleanup_runs() -> dict:
     """清理过期 checkpoint(超过 checkpoint_ttl_days 天的已完成/已取消记录)。"""
     from app.config import settings as _cfg
     ttl = int(getattr(_cfg, "checkpoint_ttl_days", 7) or 7)
-    removed = _manager().cleanup_expired(ttl_days=ttl)
+    removed = await _manager().cleanup_expired(ttl_days=ttl)
     return {"removed": removed, "ttl_days": ttl}

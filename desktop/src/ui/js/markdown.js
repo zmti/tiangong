@@ -21,7 +21,10 @@
 
   // 内联渲染
   function renderInline(line) {
+    try {
     let s = escapeHtml(line);
+    // 段落内换行:单个 \n → <br>(GFM 软换行)
+    s = s.replace(/\n/g, '<br>');
     // 图片
     s = s.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (m, alt, u) => {
       const url = safeUrl(u);
@@ -31,9 +34,9 @@
     // 代码
     s = s.replace(/`([^`]+)`/g, (m, code) => `<code>${code}</code>`);
     // 加粗
-    s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+    s = s.replace(/\*\*([\s\S]+?)\*\*/g, '<strong>$1</strong>');
     // 斜体
-    s = s.replace(/([^*])\*([^*\s][^*]*?)\*(?!\*)/g, '$1<em>$2</em>');
+    s = s.replace(/([^*])\*([^*\s][\s\S]*?)\*(?!\*)/g, '$1<em>$2</em>');
     // 链接
     s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, t, u) => {
       const url = safeUrl(u);
@@ -41,6 +44,10 @@
       return `<a href="${escapeAttr(url)}" target="_blank" rel="noopener noreferrer">${t}</a>`;
     });
     return s;
+    } catch (e) {
+      console.warn('[renderInline] error:', e.message, 'line_preview:', line.slice(0, 100));
+      return escapeHtml(line).replace(/\n/g, '<br>');
+    }
   }
 
   // 代码高亮关键词表
@@ -103,14 +110,35 @@
   }
 
 // Markdown 渲染
+// 简单缓存:避免相同内容重复渲染(流式过程中频繁调用)
+let _mdCacheKey = '';
+let _mdCacheHtml = '';
 function renderMarkdown(md) {
     if (!md) return '';
     const text = String(md);
     if (!text.trim()) return '';
+    if (text === _mdCacheKey) { console.log('[renderMarkdown] cache hit, len:', text.length); return _mdCacheHtml; }
+    console.log('[renderMarkdown] start, len:', text.length, 'preview:', text.slice(0, 100));
+    try {
     // 严格剥离thinking标签(多行、贪婪匹配)
     let cleaned = text.replace(/<thinking[\s\S]*?<\/thinking>/gi, '').trim();
     // 也剥离无对应关闭标签的残留 open/close tag
     cleaned = cleaned.replace(/<thinking[^>]*>/gi, '').replace(/<\/thinking>/gi, '').trim();
+    // 剥离 LLM 内部 XML 标签块(不渲染)
+    cleaned = cleaned.replace(/<system[\s\S]*?<\/system>/gi, '').trim();
+    cleaned = cleaned.replace(/<plan[\s\S]*?<\/plan>/gi, '').trim();
+    cleaned = cleaned.replace(/<phase[\s\S]*?<\/phase>/gi, '').trim();
+    cleaned = cleaned.replace(/<analysis[\s\S]*?<\/analysis>/gi, '').trim();
+    cleaned = cleaned.replace(/<reflection[\s\S]*?<\/reflection>/gi, '').trim();
+    cleaned = cleaned.replace(/<context[\s\S]*?<\/context>/gi, '').trim();
+    cleaned = cleaned.replace(/<instruction[\s\S]*?<\/instruction>/gi, '').trim();
+    cleaned = cleaned.replace(/<output[\s\S]*?<\/output>/gi, '').trim();
+    cleaned = cleaned.replace(/<reasoning[\s\S]*?<\/reasoning>/gi, '').trim();
+    cleaned = cleaned.replace(/<tool_call[\s\S]*?<\/tool_call>/gi, '').trim();
+    cleaned = cleaned.replace(/<function[\s\S]*?<\/function>/gi, '').trim();
+    cleaned = cleaned.replace(/<parameter[\s\S]*?<\/parameter>/gi, '').trim();
+    // 剥离残留的单个 open/close LLM 标签
+    cleaned = cleaned.replace(/<\/?(?:system|plan|phase|analysis|reflection|context|instruction|output|reasoning|tool_call|function|parameter)[^>]*>/gi, '').trim();
     // 剥离 LLM 输出的 summary/details 等 HTML 标签(不渲染)
     cleaned = cleaned.replace(/<\/?summary[^>]*>/gi, '')
       .replace(/<\/?details[^>]*>/gi, '')
@@ -119,8 +147,12 @@ function renderMarkdown(md) {
       .trim();
     // thinking 块被移除后通常会前后各留一个空行, 先合并多余的空行(4+ → 2)
     cleaned = cleaned.replace(/\n[ \t]*\n[ \t]*\n[ \t]*\n+/g, '\n\n');
-    // 合并行首行尾空白
-    cleaned = cleaned.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+    // 合并"单个换行"为"双换行"会让段落之间多一个空行; 但绝不合并行首行尾空白 ——
+    // 旧版此处 [ \t]+ → ' ' 会把整段(含代码块/缩进)的首尾空白全吃掉, 造成:
+    //   ① 代码块内缩进/空行丢失 ② 段落被错误拆分 ③ 列表对齐错乱, 观感"乱码/看不懂"。
+    cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
+    // 展开 LLM 压缩表格: ||分隔的行展开为独立行(如 | A | B ||| C | D | → 两行)
+    cleaned = cleaned.replace(/\|\|(\s*\|)/g, '\n|$1');
     const lines = cleaned.replace(/\r\n/g, '\n').split('\n');
     let html = '';
     let inCode = false;
@@ -133,8 +165,13 @@ function renderMarkdown(md) {
       if (!listBuf.length) return;
       html += `<${listType}>`;
       for (const item of listBuf) {
-        if (typeof item === 'string') html += `<li>${renderInline(item)}</li>`;
-        else html += `<li>${item}</li>`;
+        try {
+          if (typeof item === 'string') html += `<li>${renderInline(item)}</li>`;
+          else html += `<li>${escapeHtml(String(item))}</li>`;
+        } catch (e) {
+          console.warn('[flushList] item error:', e.message);
+          html += `<li>${escapeHtml(String(item || ''))}</li>`;
+        }
       }
       html += `</${listType}>`;
       listBuf = [];
@@ -199,6 +236,36 @@ function renderMarkdown(md) {
       } else if (/^\s*>\s?/.test(line)) {
         flushPara(); flushList();
         html += `<blockquote>${renderInline(line.replace(/^\s*>\s?/, ''))}</blockquote>`;
+      } else if (/^\s*\|/.test(line) && i + 1 < lines.length && /^\s*\|[\s:]*-+[\s:]*\|/.test(lines[i + 1])) {
+        // GFM 表格:当前行是表头,下一行是分隔行
+        flushPara(); flushList();
+        const parseRow = (row) => row.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map(c => c.trim());
+        const headers = parseRow(line);
+        const aligns = parseRow(lines[i + 1]).map(c => {
+          if (/^:-+:$/.test(c)) return 'center';
+          if (/^-+:$/.test(c)) return 'right';
+          return 'left';
+        });
+        i += 2; // 跳过表头和分隔行
+        let tableHtml = '<div class="md-table-wrap"><table><thead><tr>';
+        headers.forEach((h, j) => {
+          const align = aligns[j] || 'left';
+          tableHtml += `<th style="text-align:${align}">${renderInline(h)}</th>`;
+        });
+        tableHtml += '</tr></thead><tbody>';
+        while (i < lines.length && /^\s*\|/.test(lines[i])) {
+          const cells = parseRow(lines[i]);
+          tableHtml += '<tr>';
+          cells.forEach((c, j) => {
+            const align = aligns[j] || 'left';
+            tableHtml += `<td style="text-align:${align}">${renderInline(c)}</td>`;
+          });
+          tableHtml += '</tr>';
+          i++;
+        }
+        tableHtml += '</tbody></table></div>';
+        html += tableHtml;
+        continue; // while 循环的 i++ 已在上方跳过,这里 continue 防止多加
       } else if (/^\s*---+\s*$/.test(line)) {
         flushPara(); flushList();
         html += '<hr>';
@@ -213,7 +280,15 @@ function renderMarkdown(md) {
     }
     flushPara(); flushList();
     if (inCode) flushCodeBlock();
+    console.log('[renderMarkdown] done, html_len:', html.length, 'html_preview:', html.slice(0, 200));
+    _mdCacheKey = text;
+    _mdCacheHtml = html;
     return html;
+    } catch (e) {
+      console.error('[renderMarkdown] CRASH:', e.message, e.stack, 'input_len:', md.length, 'input_preview:', md.slice(0, 200));
+      // 降级:至少把换行和基础转义保留
+      return '<p style="white-space:pre-wrap;">' + md.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</p>';
+    }
   }
 
   // 复制到剪贴板

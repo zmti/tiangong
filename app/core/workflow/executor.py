@@ -81,18 +81,20 @@ class WorkflowExecutor:
         Returns:
             WorkflowRun 运行结果
         """
+        effective_run_id = run_id or f"run_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+        resolved_inputs = self._resolve_resume_inputs(effective_run_id, inputs)
         run = WorkflowRun(
-            run_id=run_id or f"run_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}",
+            run_id=effective_run_id,
             workflow_id=workflow.id,
-            context=inputs.copy(),
-            variables=inputs.copy(),
+            context=resolved_inputs.copy(),
+            variables=resolved_inputs.copy(),
             session_id=session_id,
         )
 
         # 检查是否存在可恢复的 checkpoint
         skippable_nodes = set()
-        if run_id and self._checkpoint_mgr:
-            skippable_nodes = self._checkpoint_mgr.get_skippable_nodes(run_id)
+        if effective_run_id and self._checkpoint_mgr:
+            skippable_nodes = self._checkpoint_mgr.get_skippable_nodes(effective_run_id)
             if skippable_nodes:
                 logger.info(f"发现 {len(skippable_nodes)} 个可跳过的已完成节点")
 
@@ -103,7 +105,7 @@ class WorkflowExecutor:
         for node_id in workflow.nodes:
             if node_id in skippable_nodes:
                 # 加载 checkpoint 恢复状态
-                cp = self._checkpoint_mgr.load_checkpoint(run_id, node_id)
+                cp = self._checkpoint_mgr.load_checkpoint(effective_run_id, node_id)
                 run.node_states[node_id] = {
                     "status": NodeStatus.SUCCESS.value,
                     "result": cp.result if cp else None,
@@ -113,7 +115,8 @@ class WorkflowExecutor:
                     "skipped": True,
                     "checkpoint_timestamp": cp.timestamp if cp else None,
                 }
-                run.variables[node_id] = cp.result.get("output") if cp and cp.result else None
+                run.variables[node_id] = self._extract_node_output(cp.result) if cp else None
+                run.variables[f"{node_id}.output"] = run.variables[node_id]
             else:
                 run.node_states[node_id] = {
                     "status": NodeStatus.PENDING.value,
@@ -123,9 +126,9 @@ class WorkflowExecutor:
                     "ended_at": None,
                 }
 
-        # 保存运行元数据
+        # 保存运行元数据(保存实际生效的输入, 恢复时优先复用)
         if self._checkpoint_mgr:
-            self._checkpoint_mgr.save_run_metadata(run.run_id, workflow.id, inputs, inputs)
+            self._checkpoint_mgr.save_run_metadata(run.run_id, workflow.id, resolved_inputs, resolved_inputs)
 
         # 发送运行开始事件
         self._emit_event(run.run_id, "__run__", "running", None, None)
@@ -214,6 +217,7 @@ class WorkflowExecutor:
             run.output = {
                 "nodes": outputs,
                 "variables": dict(run.variables),
+                "results": {nid: self._extract_node_output(state.get("result")) for nid, state in run.node_states.items()},
             }
 
             self._emit_event(run.run_id, "__run__", "completed", run.output, None)
@@ -325,7 +329,8 @@ class WorkflowExecutor:
                     "duration": round(duration, 3),
                     "attempt": attempt + 1,
                 }
-                run.variables[node.id] = result.get("output") if result else None
+                run.variables[node.id] = self._extract_node_output(result)
+                run.variables[f"{node.id}.output"] = run.variables[node.id]
                 run.history.append({
                     "node_id": node.id,
                     "name": node.name,
@@ -444,6 +449,7 @@ class WorkflowExecutor:
         elif node.type == NodeType.CONDITION:
             result = await self._exec_condition(node, run)
             run.variables[node.id] = result.get("output")
+            run.variables[f"{node.id}.output"] = result.get("output")
             return result
 
         elif node.type == NodeType.LOOP:
@@ -482,14 +488,17 @@ class WorkflowExecutor:
         full_prompt = f"{context_info}\n\n{prompt}" if context_info else prompt
 
         # 执行 Agent
-        result = await agent.run(full_prompt)
+        agent_result = await agent.run(full_prompt)
+        output = {
+            "answer": agent_result.answer,
+            "steps": agent_result.steps,
+            "model": agent_result.model,
+        }
+        run.variables[node.id] = output
+        run.variables[f"{node.id}.output"] = output
         return {
             "status": "success",
-            "output": {
-                "answer": result.answer,
-                "steps": result.steps,
-                "model": result.model,
-            }
+            "output": output,
         }
 
     async def _exec_tool(self, agent, node: WorkflowNode, run: WorkflowRun) -> dict:
@@ -684,6 +693,28 @@ class WorkflowExecutor:
     # 工具方法
     # ============================================================
 
+    def _resolve_resume_inputs(self, run_id: str, inputs: dict[str, Any]) -> dict[str, Any]:
+        """恢复运行时尽量复用上次输入, 缺失字段才用本次输入补位。"""
+        if not run_id or not self._checkpoint_mgr:
+            return dict(inputs or {})
+        metadata = self._checkpoint_mgr.load_run_metadata(run_id)
+        saved = dict(metadata.get("variables") or metadata.get("context") or {}) if metadata else {}
+        merged = dict(saved)
+        merged.update(inputs or {})
+        return merged
+
+    @staticmethod
+    def _extract_node_output(result: Any) -> Any:
+        """把节点结果统一为可模板引用的值, 支持 {{node_id.output}}。"""
+        if isinstance(result, dict):
+            if "output" in result:
+                return result.get("output")
+            if "answer" in result:
+                return result.get("answer")
+            if "result" in result:
+                return result.get("result")
+        return result
+
     def _topological_layers(self, workflow: Workflow) -> Optional[list[list[WorkflowNode]]]:
         """Kahn's algorithm: 返回层次列表,每层内的节点可并行执行。"""
         in_degree = {nid: 0 for nid in workflow.nodes}
@@ -721,7 +752,7 @@ class WorkflowExecutor:
         return layers
 
     def _render_template(self, text: str, variables: dict[str, Any]) -> str:
-        """替换 {{var_name}} 为运行时变量值。"""
+        """替换 {{var_name}} 为运行时变量值, 支持 {{node_id.output}}。"""
         if not text:
             return text
         for var_name, var_value in variables.items():

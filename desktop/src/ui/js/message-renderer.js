@@ -184,7 +184,10 @@
     content.className = 'msg-content';
     const bubble = document.createElement('div');
     bubble.className = 'answer-doc';
-    bubble.textContent = text;
+    // 用 innerHTML + 转义, 把 \n 转成 <br> 让多行在气泡里逐行显示(与复制内容一致,
+    // 解决"多行信息看着折叠成一行、复制出来却是一坨"的观感错位)。
+    // 保留原始 text(含换行)供复制, 不做 trim —— 复制出的就是用户输入的原样。
+    bubble.innerHTML = App.escapeHtml ? App.escapeHtml(text).replace(/\n/g, '<br>') : text;
     content.appendChild(bubble);
     const footer = document.createElement('div');
     footer.className = 'msg-footer';
@@ -192,12 +195,23 @@
     actions.className = 'msg-actions';
     actions.appendChild(createActionBtn('复制', '复制', async (btn) => {
       try {
-        await navigator.clipboard.writeText(text.trim());
+        // 复制用户"输入的原样文本"(含多行换行), 而不是从 DOM textContent 反推
+        await navigator.clipboard.writeText(text);
         return true;
-      } catch (_) { return false; }
+      } catch (_) {
+        // 剪贴板 API 不可用时(如非安全上下文)回退 execCommand
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.position = 'fixed'; ta.style.left = '-9999px';
+          document.body.appendChild(ta); ta.select();
+          document.execCommand('copy'); ta.remove();
+          return true;
+        } catch (__) { return false; }
+      }
     }));
     actions.appendChild(createActionBtn('引用回复', '引用此消息', () => {
-      App.setReplyQuote && App.setReplyQuote(text.trim());
+      App.setReplyQuote && App.setReplyQuote(text);
     }));
     footer.appendChild(actions);
     footer.appendChild(createTime());
@@ -272,10 +286,21 @@
     actions.className = 'msg-actions';
     actions.appendChild(createActionBtn('复制', '复制回答', async (btn) => {
       const txt = (answer.textContent || '').trim();
+      if (!txt) return false;
       try {
         await navigator.clipboard.writeText(txt);
         return true;
-      } catch (_) { return false; }
+      } catch (_) {
+        // navigator.clipboard 在 file:// 非安全上下文不可用时, 回退 execCommand
+        try {
+          const ta = document.createElement('textarea');
+          ta.value = txt;
+          ta.style.position = 'fixed'; ta.style.left = '-9999px';
+          document.body.appendChild(ta); ta.select();
+          document.execCommand('copy'); ta.remove();
+          return true;
+        } catch (__) { return false; }
+      }
     }));
     actions.appendChild(createActionBtn('引用回复', '引用此回复', () => {
       const txt = (answer.textContent || '').trim();
@@ -479,10 +504,14 @@
 
   // ── 思考内容 ──
   function addThinking(wrap, content) {
-    if (!wrap || !wrap._thinkingBody) return;
+    if (!wrap || !wrap._thinkingBody) {
+      console.warn('[addThinking] wrap or _thinkingBody missing');
+      return;
+    }
     wrap._thinkingSection.style.display = 'block';
+    // 无论内容是否为空,始终添加 open class 使思考区域可见
+    wrap._thinkingSection.classList.add('open');
     const body = wrap._thinkingBody;
-    // Strip thinking tags from content
     let cleanContent = content || '';
     if (App.stripThinkingTags) {
       cleanContent = App.stripThinkingTags(cleanContent);
@@ -493,8 +522,10 @@
     if (!cleanContent.trim()) return;
     const text = body.textContent;
     body.textContent = text + (text ? '\n' : '') + cleanContent;
-    // 修复: open类应加在section上，CSS选择器是 .thinking-section.open .thinking-body
-    wrap._thinkingSection.classList.add('open');
+    const MAX_THINKING = 4000;
+    if (body.textContent.length > MAX_THINKING) {
+      body.textContent = body.textContent.slice(-MAX_THINKING);
+    }
     if (wrap._railSummary) {
       wrap._railSummary.textContent = '💭 思考中...';
     }
@@ -509,7 +540,12 @@
   function showAnswer(wrap, markdown) {
     if (!wrap || !wrap._answer) return;
     if (App.renderMarkdown) {
-      wrap._answer.innerHTML = App.renderMarkdown(markdown);
+      try {
+        wrap._answer.innerHTML = App.renderMarkdown(markdown);
+      } catch (e) {
+        console.error('[showAnswer] renderMarkdown failed, falling back:', e);
+        wrap._answer.innerHTML = '<p style="white-space:pre-wrap;">' + App.escapeHtml(markdown) + '</p>';
+      }
     } else {
       wrap._answer.textContent = markdown;
     }

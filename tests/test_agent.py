@@ -18,6 +18,9 @@ class MockLLM(LLMClient):
         self.model = "mock-model"
         self.client = None  # 供 _native_enabled 检查(有 client 才启用原生 tool calling)
         self._custom = None
+        # client 为 None 时禁止 native 路径(避免 chat_with_tools 内部访问 self.client.xxx 报 NoneType),
+        # 显式关闭;测试 native 的 NativeMockLLM 单独覆盖
+        self.chat_with_tools = None  # type: ignore[attr-defined]
         self._api_key = ""
         self._initial_provider = self.provider
         self._circuit_fails: dict[str, int] = {}
@@ -35,6 +38,46 @@ class MockLLM(LLMClient):
         self._i += 1
         for ch in text:
             yield ch
+
+    async def chat_json(self, messages, temperature=0.2):
+        """结构化 JSON 默认返回空 plans,与 LLMClient 语义一致(简单任务不规划)。
+
+        MockLLM 覆写了 chat() 返回任意文本,LLMClient.chat_json 内部失败时会
+        回退到 self.chat() 拿到的非 JSON 文本 → 解析失败。这里提供干净的默认
+        实现,各测试可按需覆写(ReplanMockLLM / ReflectMockLLM 等已覆写)。
+        """
+        return {"needs_plan": False, "steps": []}
+
+    async def chat_json_schema(self, messages, schema, temperature=0.2,
+                               max_retries=2, validator=None):
+        """结构化 schema 默认通过/通过,各测试类按需覆写。
+
+        LLMClient.chat_json_schema 依赖 chat_json → chat 回退链,Mock 覆写 chat()
+        后拿到的可能是非 JSON 文本导致失败;提供独立默认实现保证 mock 链路可用。
+        """
+        import json as _json
+
+        try:
+            text = await self.chat(messages, temperature=temperature)
+            data = _json.loads(text) if text and text.strip().startswith("{") else {}
+        except Exception:  # noqa: BLE001
+            data = {}
+        if not isinstance(data, dict) or not data:
+            # 按 schema 必填字段构造最小合法响应:score/verdict → 通过,
+            # supported/unsupported → 支撑通过,其余 → 空 dict
+            props = (schema or {}).get("properties", {})
+            if "score" in props and "verdict" in props:
+                data = {"score": 9, "verdict": "pass", "issues": []}
+            elif "supported" in props:
+                data = {"supported": True, "unsupported": []}
+            else:
+                data = {}
+        if validator is not None:
+            ok, err = validator(data)
+            if not ok:
+                import logging as _logging
+                _logging.getLogger("test_agent").warning("chat_json_schema 默认响应未通过校验: %s", err)
+        return data
 
 
 class NativeMockLLM(LLMClient):
@@ -125,6 +168,17 @@ class RouterLLM(MockLLM):
         self._fail_json = fail_json
 
     async def chat_json(self, messages, temperature=0.2):
+        if self._fail_json:
+            raise RuntimeError("router LLM 故障")
+        return {"tools": self._selected_tools, "reason": "test"}
+
+    async def chat_json_schema(self, messages, schema, temperature=0.2,
+                                max_retries=2, validator=None):
+        # 工具路由第三级 LLM 兜底调用 chat_json_schema(旧实现调用 chat_json,
+        # 但 MockLLM.chat_json 返回 "tools" 键,与 select_tools 期望不一致)。
+        # 提供与 LLMClient 行为一致的默认实现:路由 LLM 返回 selected_tools。
+        import json as _json
+
         if self._fail_json:
             raise RuntimeError("router LLM 故障")
         return {"tools": self._selected_tools, "reason": "test"}

@@ -192,6 +192,7 @@
   flex-direction: column;
   min-height: 0;
   overflow: hidden;
+  position: relative;  /* 节点属性面板(wfProperties)的定位上下文, 悬浮在画布右上角, 不随画布滚动 */
 }
 
 /* ========== 工具栏 ========== */

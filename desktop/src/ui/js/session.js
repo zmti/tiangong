@@ -364,8 +364,12 @@ App.Session.enterRename = function (s, btn) {
   };
   input.dataset.orig = input.value;
 
+  // IME 输入法状态追踪:比 e.isComposing 更可靠
+  let composing = false;
+  input.addEventListener('compositionstart', () => { composing = true; });
+  input.addEventListener('compositionend', () => { composing = false; });
   input.addEventListener('keydown', (e) => {
-    if (e.isComposing || e.keyCode === 229) return;
+    if (composing || e.isComposing || e.keyCode === 229) return;
     e.stopPropagation();
     if (e.key === 'Enter') { e.preventDefault(); finish(true); }
     else if (e.key === 'Escape') { finish(false); }
@@ -555,9 +559,12 @@ App.Session.select = async function (id) {
           const raw = msgText(m);
           if (raw && App.renderMarkdown) {
             try { bubble.innerHTML = App.renderMarkdown(raw); }
-            catch (_) { bubble.textContent = raw; }
+            catch (e) {
+              console.error('[session] renderMarkdown ERROR:', e);
+              bubble.innerHTML = '<p style="white-space:pre-wrap;">' + App.escapeHtml(raw) + '</p>';
+            }
           } else {
-            bubble.textContent = raw;
+            bubble.innerHTML = raw ? '<p style="white-space:pre-wrap;">' + App.escapeHtml(raw) + '</p>' : '';
           }
           content.appendChild(bubble);
           const thinkingText = m.meta?.thinking || m.meta?.thinking_content;
@@ -650,6 +657,7 @@ App.Session.select = async function (id) {
     App.scrollMessagesToBottom(true);
 
     // 滚动加载更多:监听 scroll 事件
+    const MAX_DOM_MSGS = 100; // DOM 中最多保留的消息数,防止内存溢出
     function onScroll() {
       if (App._sessionLoadingMore || App._sessionLoadIdx <= 0) return;
       // 距顶部不足 200px 时触发加载
@@ -665,6 +673,13 @@ App.Session.select = async function (id) {
       msgs.insertBefore(moreFrag, msgs.firstChild);
       // 保持滚动位置不跳动
       msgs.scrollTop = msgs.scrollHeight - oldScrollHeight + msgs.scrollTop;
+      // DOM 节点上限:超过限制时移除底部(最新)的消息节点(滚动加载往顶部插最旧的,
+      // 尾部是最新交互区, 最旧节点在 DOM 顶部)
+      const msgNodes = Array.from(msgs.querySelectorAll('.msg')); // 静态快照, 移除后不会失效
+      const excess = msgNodes.length - MAX_DOM_MSGS;
+      if (excess > 0) {
+        for (let k = 0; k < excess; k++) msgNodes[msgNodes.length - 1 - k].remove();
+      }
       App._sessionLoadingMore = false;
     }
     // 先移除旧监听器再绑定

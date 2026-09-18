@@ -299,7 +299,12 @@ def code_context(
     line: int = Field(1, description="起始行号(1 开始)"),
     lines: int = Field(40, description="向下读取的行数,最大 200"),
 ) -> str:
-    full = os.path.abspath(os.path.expanduser(path))
+    from app.tools.project_context import resolve_cwd
+    # 优先用 resolve_cwd() 解析相对路径
+    if not os.path.isabs(path):
+        full = os.path.join(resolve_cwd(), path)
+    else:
+        full = os.path.abspath(os.path.expanduser(path))
     if not os.path.isfile(full):
         return {"path": full, "error": f"文件不存在: {full}"}
     try:

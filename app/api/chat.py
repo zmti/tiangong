@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from typing import Optional
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
@@ -37,12 +38,25 @@ def _store():
 
 
 def _strip_thinking(text: str) -> str:
-    """Strip thinking and tool_call XML tags from LLM response."""
-    stripped = re.sub(r'<thinking[\s\S]*?</thinking>', '', text, flags=re.IGNORECASE)
+    """Strip thinking, tool_call, system, plan and other LLM-internal XML tags."""
+    # 先剥离成对的 XML 块(thinking/tool_call/system/plan/phase 等)
+    stripped = text
+    for tag in ('thinking', 'tool_call', 'system', 'plan', 'phase', 'analysis',
+                'reflection', 'context', 'instruction', 'output', 'reasoning'):
+        stripped = re.sub(r'<' + tag + r'[\s\S]*?</' + tag + r'>', '', stripped, flags=re.IGNORECASE)
+    # 剥离 tool_call 的特殊闭合格式
     stripped = re.sub(r'<tool_call[\s\S]*?</tool_call>', '', stripped, flags=re.IGNORECASE)
-    for tag in ('thinking', 'tool_call', 'function', 'parameter'):
-        stripped = re.sub(r'<' + tag + r'[^>]*>', '', stripped, flags=re.IGNORECASE)
-        stripped = re.sub(r'</' + tag + r'>', '', stripped, flags=re.IGNORECASE)
+    # 通用剥离: 单标签 <tag_name> 和闭合 </tag_name>(不含空格的单单词标签,排除 HTML 常见标签)
+    _HTML_TAGS = {'p','div','span','br','hr','img','a','b','i','u','em','strong','h1','h2','h3','h4','h5','h6',
+                  'ul','ol','li','table','tr','td','th','thead','tbody','pre','code','blockquote','sup','sub'}
+    def _strip_generic(m):
+        tag_name = m.group(2).split()[0].lower().rstrip('/')
+        if tag_name in _HTML_TAGS:
+            return m.group(0)  # 保留 HTML 标签
+        return ''
+    stripped = re.sub(r'<(/?)([a-zA-Z_][\w.-]*)[^>]*>', _strip_generic, stripped)
+    # 清理多余空行
+    stripped = re.sub(r'\n{3,}', '\n\n', stripped)
     return stripped.strip()
 
 
@@ -255,7 +269,7 @@ async def chat_resume(req: ChatResumeRequest):
     """
     agent = _build_agent(ChatRequest(message=" ", session_id=req.session_id, project_path=req.project_path))
     try:
-        gen = agent.resume(req.run_id, resume_value=req.resume_value, stream=req.stream)
+        gen = await agent.resume(req.run_id, resume_value=req.resume_value, stream=req.stream)
         import types
         if isinstance(gen, types.AsyncGeneratorType):
             async def event_gen():
@@ -332,12 +346,15 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
         客户端断开(超时/手动停止)后,agent 继续执行并保存结果到数据库。
         用户稍后刷新会话即可看到完整回复。
         """
-        q: asyncio.Queue = asyncio.Queue(maxsize=10000)
+        q: asyncio.Queue = asyncio.Queue(maxsize=50000)
         full_answer: list[str] = []
         thinking_events: list[dict] = []
         guardrail_overwrite: Optional[dict] = None
         assistant_msg_id: Optional[str] = None
         token_count = 0
+        _done_model = ""
+        _done_steps: list[dict] = []
+        _was_cancelled = False
 
         def _fire_save(sid: str, msg_id: str, content: str):
             """fire-and-forget: 后台更新消息内容。"""
@@ -348,42 +365,93 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                     pass
             asyncio.create_task(_do())
 
+        async def _send_to_queue(evt, terminal: bool = False):
+            """把事件入队。
+
+            普通事件(terminal=False):队列满时丢最旧腾位后立即入队——丢一条中间增量可接受。
+            终结事件/哨兵(terminal=True,done/error/None):不可丢,队列满时等待 consumer 消费腾位,
+            但有 30s 上限兜底,避免 consumer 已断开不再消费时本路径自身永久阻塞。
+            """
+            try:
+                q.put_nowait(evt)
+                return
+            except asyncio.QueueFull:
+                _log.getLogger("chat").warning(
+                    "[bg_agent] queue full, dropping oldest (evt=%s)",
+                    evt.get("type", "?") if isinstance(evt, dict) else "sentinel")
+            if not terminal:
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    q.put_nowait(evt)
+                    return
+                except asyncio.QueueFull:
+                    await asyncio.sleep(0.05)
+                    try:
+                        q.put_nowait(evt)
+                    except asyncio.QueueFull:
+                        _log.getLogger("chat").error("[bg_agent] 普通事件入队仍失败,放弃 type=%s", evt.get("type", "?"))
+                    return
+            # 终结事件:有界等待腾位(最多 30s),避免 consumer 死后本路径永久阻塞
+            deadline = time.time() + 30
+            while True:
+                try:
+                    await q.put(evt)
+                    return
+                except asyncio.QueueFull:
+                    if time.time() >= deadline:
+                        _log.getLogger("chat").error("[bg_agent] 30s 内队列未腾出空间,终结事件/哨兵可能丢失: type=%s",
+                                                     evt.get("type", "?") if isinstance(evt, dict) else "sentinel")
+                        return
+                    await asyncio.sleep(0.05)
+
         async def _bg_agent_run():
             """独立后台任务:运行 agent,所有事件写入队列。客户端断开后此任务继续。
 
             注意:不使用 _stream_with_heartbeat,心跳由 SSE consumer 自己处理。
             避免双层队列+yield 导致的死锁风险。
             """
-            nonlocal assistant_msg_id, guardrail_overwrite
+            nonlocal assistant_msg_id, guardrail_overwrite, _done_model, _done_steps
             import logging as _log
             _log.getLogger("chat").info("[bg_agent] start session=%s", req.session_id)
+            _was_cancelled = False
             try:
                 async for event in agent.run_stream(injected_message, history=history):
+                    # 捕获 agent 的 done/cancelled 事件数据,但不放入队列(finally 统一发送)
+                    if event.get("type") in ("done", "cancelled"):
+                        _done_model = event.get("model", "")
+                        _done_steps = event.get("steps", [])
+                        if event.get("type") == "cancelled":
+                            _was_cancelled = True
+                        continue
                     try:
-                        q.put_nowait(event)
-                    except asyncio.QueueFull:
-                        try:
-                            q.get_nowait()
-                        except asyncio.QueueEmpty:
-                            pass
-                        q.put_nowait(event)
+                        await _send_to_queue(event)
+                    except Exception as put_exc:  # noqa: BLE001
+                        _log.getLogger("chat").warning("[bg_agent] 事件入队失败 type=%s: %s", event.get("type", "?"), put_exc)
             except Exception as exc:
                 _log.getLogger("chat").warning("[bg_agent] error: %s", exc)
                 _friendly = _friendly_llm_error(str(exc))
+                # error 事件不可丢:丢了前端只能靠 finally 的 done 兜底感知失败
                 try:
-                    q.put_nowait({"type": "error", "message": _friendly})
-                except asyncio.QueueFull:
-                    pass
-                # 确保异常时也发送 done 事件,防止前端永远等待
-                try:
-                    q.put_nowait({"type": "done", "model": "", "steps": []})
-                except asyncio.QueueFull:
-                    pass
+                    await _send_to_queue({"type": "error", "message": _friendly}, terminal=True)
+                except Exception as put_exc:  # noqa: BLE001
+                    _log.getLogger("chat").warning("[bg_agent] error 事件入队失败: %s", put_exc)
+                # done 由 finally 统一发送,避免重复
             finally:
-                try:
-                    q.put_nowait(None)
-                except asyncio.QueueFull:
-                    pass
+                # 统一发送终结事件:携带实际的 model 和 steps 数据
+                # 队列满时先清空再发送,确保 done 不丢失
+                _evt_type = "cancelled" if _was_cancelled else "done"
+                _done_evt = {"type": _evt_type, "model": _done_model, "steps": list(_done_steps)}
+                if q.full():
+                    _log.getLogger("chat").warning("[bg_agent] queue full on done, draining")
+                    while not q.empty():
+                        try: q.get_nowait()
+                        except asyncio.QueueEmpty: break
+                await _send_to_queue(_done_evt, terminal=True)
+                # None 哨兵确保 consumer 退出(不可丢,见 _send_to_queue 说明)
+                await _send_to_queue(None, terminal=True)
                 _log.getLogger("chat").info("[bg_agent] done session=%s", req.session_id)
 
         async def _heartbeat_loop():
@@ -405,6 +473,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
         injected_message, mm_parts = await _prepare_attachments(req, req.message)
         agent.with_multimodal(mm_parts)
         heartbeat_task = None
+        agent_task = None
         try:
             await _store().add_message(req.session_id, "user", content=req.message)
 
@@ -475,6 +544,17 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 heartbeat_task.cancel()
                 try:
                     await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+            # 客户端主动断开(用户停止/关闭/切会话)且 agent 仍在跑:取消后台任务,
+            # 避免"用户以为停了、后端还在烧 LLM 配额把整图跑完"的中断失效。
+            # 若是 agent 自然结束(已 done),此处 no-op,不影响"断连后台存库"的既有设计。
+            if agent_task is not None and not agent_task.done():
+                import logging as _lg2
+                _lg2.getLogger(__name__).info("[sse_consumer] client disconnected, cancelling background agent_task session=%s", req.session_id)
+                agent_task.cancel()
+                try:
+                    await agent_task
                 except asyncio.CancelledError:
                     pass
             # 最终保存 assistant 回复
@@ -813,6 +893,7 @@ _PROVIDER_DEFAULT_MODELS: dict[str, list[dict]] = {
         {"id": "o1", "name": "O1", "speed": "very_slow", "quality": "outstanding"},
     ],
     "compat": [
+        {"id": "agnes-3.0-flash", "name": "Agnes 3.0 Flash", "speed": "fast", "quality": "excellent"},
         {"id": "agnes-2.0-flash", "name": "Agnes 2.0 Flash", "speed": "fast", "quality": "good"},
         {"id": "agnes-2.5-flash", "name": "Agnes 2.5 Flash", "speed": "very_fast", "quality": "good"},
         {"id": "agnes-2.5-pro", "name": "Agnes 2.5 Pro", "speed": "medium", "quality": "excellent"},

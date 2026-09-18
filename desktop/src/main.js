@@ -25,6 +25,14 @@ let backendRestartTimer = null;
 let backendUpTimer = null;
 let backendGaveUp = false; // 已放弃自动重启,需手动重启
 
+// 全局异常兜底:防止主进程因未捕获异常直接退出
+process.on('uncaughtException', (err) => {
+  console.error('[main] uncaughtException:', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[main] unhandledRejection:', reason);
+});
+
 // 程序化生成托盘图标(16x16 紫色圆角方块,中心白点),避免依赖外部 .ico 资源
 function createTrayIcon() {
   const size = 16;
@@ -366,6 +374,20 @@ function createWindow() {
       e.preventDefault();
       mainWindow.hide();
     }
+  });
+
+  // 渲染进程崩溃恢复:OOM/JS 异常导致 renderer 挂掉时自动重建窗口
+  mainWindow.webContents.on('render-process-gone', (event, details) => {
+    console.error('[renderer] 进程崩溃, reason:', details.reason, 'exitCode:', details.exitCode);
+    if (isQuitting) return;
+    // 2 秒后自动重建窗口,避免用户看到空白
+    setTimeout(() => {
+      if (isQuitting) return;
+      if (!mainWindow || mainWindow.isDestroyed()) {
+        createWindow();
+        showWindow();
+      }
+    }, 2000);
   });
 }
 

@@ -160,6 +160,7 @@ class LLMClient:
         self._api_key = self._get_key()
         self.last_usage: Optional[dict] = None  # 最近一次调用返回的 token 用量
         self._reasoning: str = ""  # 最近一次推理模型的思维链(reasoning_content)
+        self._finish_reason: str = ""  # 最近一次调用的 finish_reason(length=输出截断)
         # 实例级熔断状态
         self._circuit_fails: dict[str, int] = {}
         self._circuit_open_until: dict[str, float] = {}
@@ -567,7 +568,7 @@ class LLMClient:
                     continue
                 delta = chunk.choices[0].delta
                 rc = getattr(delta, "reasoning_content", None)
-                if rc and self._is_reasoning_model():
+                if rc:
                     reasoning += rc
                     yield {"type": "thinking", "content": rc}
                     continue
@@ -732,7 +733,7 @@ class LLMClient:
                 if fr:
                     finish_reason = fr
                 rc = getattr(delta, "reasoning_content", None)
-                if rc and self._is_reasoning_model():
+                if rc:
                     reasoning += rc
                     yield {"type": "thinking", "content": rc}
                     continue
@@ -770,6 +771,7 @@ class LLMClient:
             raise LLMError(f"LLM 流式调用失败: {e}") from e
         logger.debug("[chat_stream_with_tools] stream loop ended, content_len=%d", len(content_buf))
         self._reasoning = reasoning
+        self._finish_reason = finish_reason
 
         # 检测截断: finish_reason=length 表示达到 max_tokens 上限
         if finish_reason == "length" and not tool_call_bufs:
@@ -780,10 +782,24 @@ class LLMClient:
         # 构建最终结果
         tool_calls = []
         for buf in tool_call_bufs:
+            args = buf.get("arguments", "")
+            name = buf.get("name", "")
+            # 工具调用参数完整性校验:流中途被截断时 arguments 可能是残缺 JSON,
+            # 直接塞给执行器会让下一轮 Agent 拿着坏参数崩。残缺时抛可操作 LLMError,
+            # 让上层(流式降级 / error 事件)感知,而不是喂给工具。
+            # 空参数视为合法({}),仅非空且解析失败时拦截。
+            if args:
+                try:
+                    json.loads(args)
+                except (json.JSONDecodeError, TypeError):
+                    raise LLMError(
+                        f"工具调用参数被截断(名称={name or '未知'}),流式响应中途断开。"
+                        "请重试或检查 provider 网络稳定性。"
+                    )
             tool_calls.append(ToolCall(
                 id=buf.get("id", ""),
-                name=buf.get("name", ""),
-                arguments=buf.get("arguments", "{}"),
+                name=name,
+                arguments=args or "{}",
             ))
         result = ChatResult(
             content=content_buf,

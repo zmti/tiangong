@@ -16,14 +16,28 @@ from pydantic import Field
 
 from app.config import settings
 from app.tools.registry import tool
-from app.tools.code_sandbox import _safe_env
 
 MAX_OUTPUT_CHARS = 8000
 DEFAULT_TIMEOUT = 120
 
-# 修复: 终端命令在用户环境执行时也不应继承宿主机全量环境变量(含 API Key)。
-# 使用沙箱最小环境变量, 用户需手动 source 环境或使用交互式 shell 获取凭据。
-_TERMINAL_SAFE_ENV = _safe_env()
+# 终端命令在用户环境执行:继承完整用户环境变量(用户凭据需可用),
+# 但剥离 API 密钥类变量, 防止 LLM 生成命令通过 env 读取密钥外传(密钥泄露防护)。
+_SENSITIVE_ENV_PREFIXES = ("AGENT_API_KEY", "API_KEY", "APIKEY", "SECRET", "PASSWORD", "PASSWD", "TOKEN")
+_SENSITIVE_ENV_EXACT = {
+    "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "QWEN_API_KEY", "QWEN_DASHSCOPE_API_KEY",
+    "ANTHROPIC_API_KEY", "GITHUB_TOKEN", "GITLAB_TOKEN", "HUGGINGFACE_TOKEN",
+    "DATABASE_PASSWORD", "DB_PASSWORD", "MYSQL_PASSWORD", "PGPASSWORD",
+}
+
+def _terminal_safe_env() -> dict:
+    """用户全量环境 + 剥离明文凭据变量(密钥名),保留 PATH 等运行必需变量。"""
+    env = {k: v for k, v in os.environ.items()
+           if k not in _SENSITIVE_ENV_EXACT and not any(
+               k.startswith(p) or p in k for p in _SENSITIVE_ENV_PREFIXES)}
+    env["PYTHONPATH"] = ""  # 防 subprocess 误导入业务代码
+    return env
+
+_TERMINAL_SAFE_ENV = _terminal_safe_env()
 
 # 从 security.py 导入统一的命令分类列表
 from app.core.security import BLOCKED_COMMAND_PATTERNS, _classify_command
@@ -33,32 +47,39 @@ DANGEROUS_PATTERNS = [(p, p) for p in BLOCKED_COMMAND_PATTERNS]
 
 
 def _blocked_reason(command: str) -> str:
-    """检查命令是否被硬拦截。返回拦截原因或空字符串。"""
+    """检查命令是否被硬拦截。返回拦截原因或空字符串。
+
+    分层拦截:
+    1. 硬拦截黑名单(危险操作: 删除根目录/格式化/关机/注册表等)
+    2. shell 元字符组合注入拦截(多分隔符 + 重定向到系统文件)
+    3. 解释器嵌套执行拦截(python -c/node -e/base64 解码等, 可绕过 blacklist)
+    """
+    low = command.strip().lower()
+    # 1. 危险命令黑名单
     classification = _classify_command(command)
     if classification == "blocked":
         return f"命令包含危险操作已被拦截: {command.strip()[:100]}"
-    # 额外检查: 禁止 shell 元字符组合(防止通过参数注入)
-    # 虽然 _build_argv 使用列表传递，但检查命令内容可提前拦截
-    # 改进: 增加 ~$ 通配符转义绕过检测、命令解释器嵌套检测、base64 解码执行检测
+    # 2. shell 元字符组合注入拦截: 多分隔符视为注入; 单重定向目标落在系统路径时拦截
     dangerous_meta = [';', '&&', '||', '|', '`', '$(', '${', '>', '>>']
-    low = command.strip().lower()
+    _SYSTEM_FILE_DIRS = ("/etc/", "c:\\windows", "c:\\winnt", "/system32",
+                         "/boot/", "/sbin/", "/usr/", "/bin/", "/lib", "/dev/", "registry", "regedit")
     for meta in dangerous_meta:
-        # 排除合法用途(如管道在 ls | grep 中是合法的)
-        if meta in ('|', '&&', '||') and ('echo' in low or 'printf' in low or 'grep' in low):
-            continue
         if meta in low:
-            # 检查是否在引号内(简单启发式)
             parts = command.split(meta)
             if len(parts) > 2:  # 多个分隔符说明是注入尝试
                 return f"命令包含危险字符 '{meta}' 被拦截"
-    # 改进: 检测编码/解释器嵌套绕过(blacklist 中 rm -rf / 子串检测可被 python -c 绕过)
+            if meta in ('>', '>>'):  # 单重定向: 目标落在系统路径才拦截(允许正常日志重定向)
+                target = parts[1].strip().lower()
+                if any(d in target for d in _SYSTEM_FILE_DIRS):
+                    return f"重定向目标为系统文件/目录, 已被拦截: {meta}{target[:60]}"
+    # 3. 解释器嵌套执行拦截(内部 payload 可能绕过 blacklist)
     _INTERPRETER_EXEC = (
         "python -c", "python3 -c", "node -e", "node --eval", "perl -e", "ruby -e",
         "php -r", "bash -c", "sh -c", "/bin/sh -c", "cmd /c", "powershell -command",
+        "powershell -enc", "powershell -encodedcommand",
         "base64 -d", "base64 --decode", "certutil -decode",
     )
     if any(marker in low for marker in _INTERPRETER_EXEC):
-        # 解释器嵌套执行: 内部 payload 可能绕过 blacklist, 一律需确认(返回非空 reason)
         return f"命令通过解释器/解码器执行, 可能绕过安全检查, 已被拦截: {command.strip()[:100]}"
     return ""
 

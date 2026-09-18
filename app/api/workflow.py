@@ -83,10 +83,18 @@ class NodeUpdateRequest(BaseModel):
 
 
 class EdgeCreateRequest(BaseModel):
-    source: str = Field(..., description="源节点 ID")
-    target: str = Field(..., description="目标节点 ID")
+    source: Optional[str] = Field(None, description="源节点 ID")
+    target: Optional[str] = Field(None, description="目标节点 ID")
+    from_node: Optional[str] = Field(None, description="源节点 ID(前端兼容字段)")
+    to_node: Optional[str] = Field(None, description="目标节点 ID(前端兼容字段)")
     condition: Optional[str] = None
     condition_expr: Optional[str] = None
+
+    def resolve_source(self) -> str:
+        return self.source or self.from_node or ""
+
+    def resolve_target(self) -> str:
+        return self.target or self.to_node or ""
 
 
 class WorkflowGenerateRequest(BaseModel):
@@ -183,18 +191,29 @@ def _ensure_executor(workflow_id: str) -> WorkflowExecutor:
     return _executors[workflow_id]
 
 
+def _safe_coordinate(value: Any, default: float = 0.0) -> float:
+    """把坐标值转换为有限 float, 异常/NaN/Inf 时回退默认值, 防止前端渲染 NaN。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    if number != number or number in (float("inf"), float("-inf")):
+        return float(default)
+    return number
+
+
+def _normalize_position(raw_position: Any) -> Optional[dict]:
+    """规范化节点坐标, 保证保存进数据库的 position 始终可用。"""
+    if raw_position is None:
+        return None
+    if not isinstance(raw_position, dict):
+        return None
+    return {"x": _safe_coordinate(raw_position.get("x", 0), 0.0), "y": _safe_coordinate(raw_position.get("y", 0), 0.0)}
+
+
 def _parse_node(n: dict) -> WorkflowNode:
     """从请求字典解析节点。"""
-    position = n.get("position")
-    if position is not None:
-        # 校验并归一化 position 字段(防止前端传入脏数据导致渲染异常)
-        if not isinstance(position, dict):
-            position = None
-        else:
-            try:
-                position = {"x": float(position.get("x", 0)), "y": float(position.get("y", 0))}
-            except (TypeError, ValueError):
-                position = None
+    position = _normalize_position(n.get("position"))
     return WorkflowNode(
         id=n["id"],
         type=NodeType(n["type"]),
@@ -457,6 +476,13 @@ async def update_workflow(workflow_id: str, req: WorkflowUpdateRequest):
                 existing.condition_expr = n.get("condition_expr", existing.condition_expr)
                 existing.branches = n.get("branches", existing.branches)
                 existing.timeout = n.get("timeout", existing.timeout)
+                # 完整保留编辑器需要的节点字段, 避免编辑保存后读取不到 loop/http/script 配置
+                if "loop_config" in n:
+                    existing.loop_config = n.get("loop_config")
+                if "http_config" in n:
+                    existing.http_config = n.get("http_config")
+                if "script_code" in n:
+                    existing.script_code = n.get("script_code")
                 # 错误恢复配置
                 if "error_strategy" in n:
                     existing.error_strategy = ErrorStrategy(n["error_strategy"])
@@ -472,14 +498,7 @@ async def update_workflow(workflow_id: str, req: WorkflowUpdateRequest):
                 if "subgraph_ids" in n:
                     existing.subgraph_ids = n["subgraph_ids"]
                 if "position" in n:
-                    _p = n.get("position")
-                    if isinstance(_p, dict):
-                        try:
-                            existing.position = {"x": float(_p.get("x", 0)), "y": float(_p.get("y", 0))}
-                        except (TypeError, ValueError):
-                            existing.position = None
-                    else:
-                        existing.position = None
+                    existing.position = _normalize_position(n.get("position"))
                 new_nodes[nid] = existing
             else:
                 node = _parse_node(n)
@@ -535,6 +554,9 @@ async def get_workflow(workflow_id: str):
                 "retry_count": n.retry_count,
                 "retry_delay": n.retry_delay,
                 "fallback_node_id": n.fallback_node_id,
+                "loop_config": n.loop_config,
+                "http_config": n.http_config,
+                "script_code": n.script_code,
                 "loop_mode": n.loop_mode.value,
                 "subgraph_ids": n.subgraph_ids,
                 "position": n.position,
@@ -586,14 +608,7 @@ async def add_node(workflow_id: str, req: NodeCreateRequest):
     loop_mode = LoopMode(req.config.get("loop_mode", "sequential")) if req.config else LoopMode.SEQUENTIAL
     subgraph_ids = req.config.get("subgraph_ids", []) if req.config else []
 
-    pos = req.config.get("position") if req.config else None
-    if isinstance(pos, dict):
-        try:
-            pos = {"x": float(pos.get("x", 0)), "y": float(pos.get("y", 0))}
-        except (TypeError, ValueError):
-            pos = None
-    else:
-        pos = None
+    pos = _normalize_position(req.config.get("position") if req.config else None)
 
     node = WorkflowNode(
         id=req.node_id,
@@ -667,14 +682,7 @@ async def update_node(workflow_id: str, node_id: str, req: NodeUpdateRequest):
         node.subgraph_ids = req.subgraph_ids
     # 手动排版位置
     if req.position is not None:
-        _p = req.position
-        if isinstance(_p, dict):
-            try:
-                node.position = {"x": float(_p.get("x", 0)), "y": float(_p.get("y", 0))}
-            except (TypeError, ValueError):
-                node.position = None
-        else:
-            node.position = None
+        node.position = _normalize_position(req.position)
 
     wf.updated_at = time.time()
     _workflows[workflow_id] = wf
@@ -692,13 +700,33 @@ async def delete_node(workflow_id: str, node_id: str):
     if wf.entry_node == node_id:
         raise HTTPException(400, "不能删除入口节点")
 
+    removed_edges = 0
+    kept_edges = []
+    for edge in wf.edges:
+        if edge.source == node_id or edge.target == node_id:
+            removed_edges += 1
+            continue
+        kept_edges.append(edge)
+    wf.edges = kept_edges
+
+    # 节点删除后, 清掉其他节点对它的残留引用, 避免校验/渲染时再出现悬空节点
+    for remaining_node in wf.nodes.values():
+        if remaining_node.fallback_node_id == node_id:
+            remaining_node.fallback_node_id = None
+        if remaining_node.branches:
+            remaining_node.branches = {
+                k: v for k, v in remaining_node.branches.items() if v != node_id
+            }
+        if remaining_node.subgraph_ids:
+            remaining_node.subgraph_ids = [nid for nid in remaining_node.subgraph_ids if nid != node_id]
+
     del wf.nodes[node_id]
-    wf.edges = [e for e in wf.edges if e.source != node_id and e.target != node_id]
+
     wf.updated_at = time.time()
     _workflows[workflow_id] = wf
     _executors[workflow_id] = WorkflowExecutor(_get_agent())
     get_db().save_workflow(wf)
-    return {"message": f"节点 {node_id} 已删除"}
+    return {"deleted_node": node_id, "removed_edges": removed_edges, "message": f"节点 {node_id} 已删除"}
 
 
 # ============================================================
@@ -711,13 +739,25 @@ async def add_edge(workflow_id: str, req: EdgeCreateRequest):
     wf = _load_workflow(workflow_id)
     if not wf:
         raise HTTPException(404, "工作流不存在")
-    if req.source not in wf.nodes:
-        raise HTTPException(400, f"源节点不存在: {req.source}")
-    if req.target not in wf.nodes:
-        raise HTTPException(400, f"目标节点不存在: {req.target}")
-    existing = [e for e in wf.edges if e.source == req.source and e.target == req.target]
+
+    source = req.resolve_source()
+    target = req.resolve_target()
+    if not source:
+        raise HTTPException(400, "缺少源节点: source/from_node 至少传一个")
+    if not target:
+        raise HTTPException(400, "缺少目标节点: target/to_node 至少传一个")
+    if source == target:
+        raise HTTPException(400, "源节点和目标节点不能相同")
+    if source not in wf.nodes:
+        raise HTTPException(400, f"源节点不存在: {source}")
+    if target not in wf.nodes:
+        raise HTTPException(400, f"目标节点不存在: {target}")
+
+    # 编辑器里两个节点之间允许双向连接(A->B 和 B->A 是两条不同的边),
+    # 只有完全相同的同向重复边才幂等返回, 否则会导致“两个节点不能连接”。
+    existing = next((e for e in wf.edges if e.source == source and e.target == target), None)
     if existing:
-        raise HTTPException(400, "此边已存在")
+        return {"id": existing.id, "message": "边已存在", "existing": True}
 
     # 新边 id:避免与现有边 id 撞车(旧实现直接用 len 做 id, 删除中间边后会产生重复 id)
     used_ids = {e.id for e in wf.edges}
@@ -726,8 +766,8 @@ async def add_edge(workflow_id: str, req: EdgeCreateRequest):
         seq += 1
     edge = WorkflowEdge(
         id=f"edge_{seq}",
-        source=req.source,
-        target=req.target,
+        source=source,
+        target=target,
         condition=req.condition,
         condition_expr=req.condition_expr,
     )
@@ -736,7 +776,7 @@ async def add_edge(workflow_id: str, req: EdgeCreateRequest):
     _workflows[workflow_id] = wf
     _executors[workflow_id] = WorkflowExecutor(_get_agent())
     get_db().save_workflow(wf)
-    return {"id": edge.id, "message": "边已添加"}
+    return {"id": edge.id, "message": "边已添加", "existing": False}
 
 
 @router.delete("/{workflow_id}/edges/{edge_id}")
@@ -1453,7 +1493,7 @@ async def rollback_to_version(workflow_id: str, version_id: str):
             error_strategy=error_strategy, retry_count=n.get("retry_count", 0),
             retry_delay=n.get("retry_delay", 0.5), fallback_node_id=n.get("fallback_node_id"),
             loop_mode=loop_mode, subgraph_ids=n.get("subgraph_ids", []),
-            position=n.get("position"),
+            position=_normalize_position(n.get("position")),
         )
     edges = [
         WorkflowEdge(id=e.get("id") or f"edge_{i}", source=e["source"], target=e["target"],
@@ -1547,7 +1587,7 @@ async def import_workflow(req: WorkflowImportRequest):
             error_strategy=error_strategy, retry_count=n.get("retry_count", 0),
             retry_delay=n.get("retry_delay", 0.5), fallback_node_id=n.get("fallback_node_id"),
             loop_mode=loop_mode, subgraph_ids=n.get("subgraph_ids", []),
-            position=n.get("position"),
+            position=_normalize_position(n.get("position")),
         )
         nodes[node.id] = node
 

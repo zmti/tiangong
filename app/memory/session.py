@@ -35,12 +35,16 @@ def sanitize_history_for_llm(history: list[dict]) -> list[dict]:
             continue
         role = m.get("role", "")
         content = m.get("content", "") or m.get("kind", "")
-        if not str(content).strip():
+        # 带 tool_calls 的 assistant 消息即使正文为空也保留,
+        # 否则丢失工具调用上下文,后续 tool_call_id 配对的 tool 消息无法被 LLM 理解。
+        if not str(content).strip() and not m.get("tool_calls"):
             continue
         content = str(content)
         llm_role = role if role in _VALID_ROLES else "user"
         msg: dict = {"role": llm_role, "content": content}
         if llm_role == "tool" and m.get("tool_call_id"):
+            # 合法 tool 消息(自带 tool_call_id):保留 tool 角色与 id,
+            # 供 OpenAI 网关校验 tool_call 配对。
             msg["tool_call_id"] = m["tool_call_id"]
         elif llm_role == "tool":
             # 孤立 tool 消息 → user

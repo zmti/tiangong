@@ -82,8 +82,7 @@ App.Chat.send = async function () {
   }
   const input = App.els.input;
   const text = input.value.trim();
-  /* 修复"不知道是否可发送": send 的"可否发送"判断走 App.canSend()(renderer.js 单一事实源),
-     避免各处自行判断 streaming/input 状态不一致 */
+  /* 统一判断"是否可发送": 非流式 且 有内容 */
   if (!App.canSend()) {
     if (text && App.streaming) App.toast && App.toast('正在生成中, 点停止按钮后再发新消息', 'info');
     return;
@@ -212,6 +211,11 @@ App.Chat._installStreamingGuard = function () {
       if (!App.Chat._streamingStart) App.Chat._streamingStart = Date.now();
       if (Date.now() - App.Chat._streamingStart > 600000) {
         console.warn('[StreamingGuard] streaming stuck > 10min, force resetting');
+        // 关键:abort fetch 连接,防止僵尸连接
+        if (App.abortController) {
+          try { App.abortController.abort(); } catch (_) {}
+          App.abortController = null;
+        }
         App.Chat.setStreaming(false);
         App.Chat._streamingStart = null;
       }
@@ -221,6 +225,11 @@ App.Chat._installStreamingGuard = function () {
   }, 5000);
 };
 App.Chat._installStreamingGuard();
+
+/* 统一判断是否可发送:非流式 且 有输入内容 */
+App.canSend = function () {
+  return !App.streaming && App.els.input && App.els.input.value.trim().length > 0;
+};
 
 /* 核心发送逻辑 */
 App.Chat.doSend = async function (text, opts = {}) {
@@ -295,6 +304,8 @@ App.Chat.doSend = async function (text, opts = {}) {
   /* 从 token 流中提取 <thinking>...</thinking> 块，避免思考原文进入主答案气泡 */
   function processTokenChunk(chunk) {
     if (!chunk) return { text: '', thinking: '' };
+    // 剥离 LLM 内部 XML 标签
+    chunk = chunk.replace(/<\/?(?:system|plan|phase|analysis|reflection|context|instruction|output|reasoning|tool_call|function|parameter)[^>]*>/gi, '');
     if (!inThinking) {
       // 先检查是否有完整的 <thinking>...</thinking> 块在同一 chunk 内
       const openIdx = chunk.indexOf('<thinking');
@@ -322,6 +333,15 @@ App.Chat.doSend = async function (text, opts = {}) {
     }
     // 已在 thinking 模式
     thinkingBuf += chunk;
+    // 安全限制:thinkingBuf 超过 8000 字符仍未闭合,强制退出 thinking 模式
+    // 防止 </thinking> 丢失导致后续所有 token 被吞
+    if (thinkingBuf.length > 8000) {
+      console.warn('[processTokenChunk] thinkingBuf exceeded 8000 chars without closing tag, forcing exit');
+      const leftover = thinkingBuf;
+      inThinking = false;
+      thinkingBuf = '';
+      return { text: leftover, thinking: '' };
+    }
     const endIdx = thinkingBuf.indexOf('</thinking>');
     if (endIdx === -1) return { text: '', thinking: '' };
     const thinking = thinkingBuf.slice(0, endIdx + 11);
@@ -368,73 +388,33 @@ App.Chat.doSend = async function (text, opts = {}) {
   function cleanupStream() {
     if (streamTimeout !== null) { clearTimeout(streamTimeout); streamTimeout = null; }
     if (hardTimeout !== null) { clearTimeout(hardTimeout); hardTimeout = null; }
-    if (renderTimer !== null) { clearTimeout(renderTimer); renderTimer = null; }
+    if (renderTimer !== null) { cancelAnimationFrame(renderTimer); renderTimer = null; }
   }
 
-  // 增量渲染优化：记录已渲染的偏移量，只渲染新增部分
-  let _mdRenderedOffset = 0;
   let _lastRenderedHtml = '';
   
   function scheduleRender() {
-    if (renderTimer !== null) return;
-    // 已完成渲染则跳过,防止 done 之后 scheduleRender 再次触发造成重复渲染
-    if (renderDone) return;
+    if (renderTimer !== null) { console.log('[scheduleRender] skipped: renderTimer pending'); return; }
+    if (renderDone) { console.log('[scheduleRender] skipped: renderDone=true'); return; }
     renderTimer = requestAnimationFrame(() => {
       renderTimer = null;
-      if (!answerDiv) return;
+      if (!answerDiv) { console.log('[scheduleRender] skipped: no answerDiv'); return; }
       const md = App._mdBuf || '';
-      if (!md) return;
+      if (!md) { console.log('[scheduleRender] skipped: empty _mdBuf'); return; }
+      console.log('[scheduleRender] rendering, md_len:', md.length);
       
-      // 增量渲染：检查是否有新内容
-      if (md.length <= _mdRenderedOffset) return;
-      
-      // 对于短文本或首次渲染，使用全量渲染
-      if (_mdRenderedOffset === 0 || md.length < 500) {
-        let html = '';
-        try {
-          html = App.renderMarkdown(md);
-        } catch (renderErr) {
-          console.error('[renderMarkdown] scheduleRender ERROR:', renderErr);
-          html = '<p style="white-space:pre-wrap;word-break:break-word;">' + App.escapeHtml(md) + '</p>';
-        }
-        answerDiv.innerHTML = html;
-        _lastRenderedHtml = html;
-        _mdRenderedOffset = md.length;
-      } else {
-        // 增量渲染：只渲染新增部分并追加
-        const newContent = md.slice(_mdRenderedOffset);
-        // 检查新增内容是否包含块级元素的开始（如代码块、列表等）
-        // 如果包含，需要全量重渲染以确保正确解析
-        const hasBlockElement = /```|^\s*[-*]\s|^\s*\d+\.\s|^\s*>|^\s*#{1,6}\s|<\/?think/m.test(newContent);
-        
-        if (hasBlockElement) {
-          // 包含块级元素，全量重渲染
-          let html = '';
-          try {
-            html = App.renderMarkdown(md);
-          } catch (renderErr) {
-            console.error('[renderMarkdown] scheduleRender ERROR:', renderErr);
-            html = '<p style="white-space:pre-wrap;word-break:break-word;">' + App.escapeHtml(md) + '</p>';
-          }
-          answerDiv.innerHTML = html;
-          _lastRenderedHtml = html;
-        } else {
-          // 纯文本增量，直接追加
-          const appendedHtml = App.renderMarkdown(newContent);
-          // 移除包裹的<p>标签（如果只有一个）
-          const tempDiv = document.createElement('div');
-          tempDiv.innerHTML = appendedHtml;
-          if (tempDiv.children.length === 1 && tempDiv.children[0].tagName === 'P') {
-            answerDiv.appendChild(tempDiv.children[0]);
-          } else {
-            answerDiv.insertAdjacentHTML('beforeend', appendedHtml);
-          }
-          _lastRenderedHtml = answerDiv.innerHTML;
-        }
-        _mdRenderedOffset = md.length;
+      // 始终全量渲染,确保跨 token 的列表/段落/缩进结构正确
+      let html = '';
+      try {
+        html = App.renderMarkdown(md);
+        console.log('[scheduleRender] renderMarkdown ok, html_len:', html.length, 'preview:', html.slice(0, 150));
+      } catch (renderErr) {
+        console.error('[renderMarkdown] scheduleRender ERROR:', renderErr);
+        html = '<p style="white-space:pre-wrap;word-break:break-word;">' + App.escapeHtml(md) + '</p>';
       }
+      answerDiv.innerHTML = html;
+      _lastRenderedHtml = html;
       
-      // 使用统一的滚动函数
       App.scrollMessagesToBottom();
     });
   }
@@ -529,6 +509,22 @@ App.Chat.doSend = async function (text, opts = {}) {
       }, 180000); // 180s 空闲间隙 (原 120s，搜索等耗时操作需要更多时间)
     }
     resetStreamTimeout();
+    // 绝对上限:即使后端持续发事件/心跳续期空闲计时器,10 分钟仍未结束则强制断开,
+    // 防止永久挂住(配合后端 SSE 哨兵修复,双保险)。收到任何事件时不清此计时器。
+    if (hardTimeout !== null) clearTimeout(hardTimeout);
+    hardTimeout = setTimeout(() => {
+      hardTimeout = null;
+      if (!done && !isError) {
+        done = true;
+        isError = true;
+        cleanupStream();
+        if (App.abortController) App.abortController.abort(new DOMException('HardTimeout', 'TimeoutError'));
+        App.clearImageGenerating();
+        if (typingShown) App.removeTyping();
+        App.appendMessage('会话超时(超过 10 分钟未完成),已中止。可重试。', 'error');
+        _finishGroup();
+      }
+    }, 600000);
 
     while (true) {
       let isDone;
@@ -788,16 +784,37 @@ App.Chat.doSend = async function (text, opts = {}) {
             if (text) {
               // 防护: 即使 processTokenChunk 未捕获, 也剥离残留 thinking 标签
               const cleanText = App.stripThinkingTags ? App.stripThinkingTags(text) : text;
+              // 英文 token 间距修复:LLM token 之间可能无空格,在拼接时自动补空格
+              if (cleanText && App._mdBuf) {
+                const lastChar = App._mdBuf.charAt(App._mdBuf.length - 1);
+                const firstChar = cleanText.charAt(0);
+                const isLetterOrDigit = c => /[a-zA-Z0-9]/.test(c);
+                if (isLetterOrDigit(lastChar) && isLetterOrDigit(firstChar)) {
+                  App._mdBuf += ' ';
+                }
+              }
               App._mdBuf += cleanText;
+              // 防止 _mdBuf 无限增长:超过 200KB 时截断头部(保留最近内容)
+              const MAX_MD_BUF = 200000;
+              if (App._mdBuf.length > MAX_MD_BUF) {
+                App._mdBuf = App._mdBuf.slice(App._mdBuf.length - MAX_MD_BUF);
+              }
+              console.log('[token] text_len:', cleanText.length, 'buf_len:', App._mdBuf.length, 'calling scheduleRender');
               scheduleRender();
             }
           } else if (evt.type === 'error') {
             done = true;
             isError = true;
-            renderDone = true; // 必须在 cleanupStream 之前设置
+            inThinking = false;
+            thinkingBuf = '';
             App.clearImageGenerating();
             cleanupStream();
             if (typingShown) App.removeTyping();
+            const errBotMsg = App._currentBotMsg || (App.els && App.els.messages && App.els.messages.querySelector('.msg.bot:last-child, .msg.msg-bot:last-child'));
+            if (errBotMsg) {
+              errBotMsg.classList.add('no-animation');
+              errBotMsg.querySelectorAll('.process-rail, .step-counter, .steps-flow').forEach(el => { el.style.display = 'none'; });
+            }
             if (answerDiv) {
               const md = App._mdBuf || '';
               let h = '';
@@ -809,6 +826,7 @@ App.Chat.doSend = async function (text, opts = {}) {
               answerDiv.innerHTML = h;
             }
             App.ExecTrace.finish(answerDiv ? (answerDiv.textContent || '') : null);
+            renderDone = true; // 错误路径最终渲染完成后标记
             // 同一次请求里后端可能对同一失败发多条相同 error(多阶段各自上报),只提示一次
             const errMsg = evt.message || '发生错误';
             if (errMsg !== lastErrMsg) {
@@ -819,35 +837,45 @@ App.Chat.doSend = async function (text, opts = {}) {
             break; // 流已结束,退出事件处理循环
           } else if (evt.type === 'done') {
             done = true;
-            renderDone = true; // 必须在 cleanupStream 之前设置，防止 scheduleRender 定时器在 done 后仍触发
+            // 注意:renderDone 延迟到最终渲染之后设置,避免跳过待处理的 scheduleRender
+            // 强制退出 thinking 模式:防止 </thinking> 丢失导致内容被吞
+            inThinking = false;
+            thinkingBuf = '';
             App.clearImageGenerating();
             cleanupStream();
             if (typingShown) App.removeTyping();
+            // 无条件隐藏流式专属元素,与历史消息样式统一
+            const botMsg = App._currentBotMsg || (App.els && App.els.messages && App.els.messages.querySelector('.msg.bot:last-child, .msg.msg-bot:last-child'));
+            if (botMsg) {
+              botMsg.classList.add('no-animation');
+              botMsg.querySelectorAll('.process-rail, .step-counter, .steps-flow').forEach(el => { el.style.display = 'none'; });
+              const think = botMsg.querySelector('.thinking-section');
+              if (think && !think.classList.contains('open')) think.style.display = 'none';
+            }
             // 流式完成后整段重渲染,确保最终内容(含跨切片块级结构)正确
             if (answerDiv) {
               const rawMd = App._mdBuf || '';
-              // 剥离 thinking 标签:防止思考内容重复显示在答案区
               const finalMd = (App.stripThinkingTags ? App.stripThinkingTags(rawMd) : rawMd)
                 .replace(/\n{3,}/g, '\n\n').trim();
               let finalHtml = '';
               try {
                 finalHtml = App.renderMarkdown(finalMd);
+                console.log('[done] renderMarkdown ok, html_len:', finalHtml.length, 'preview:', finalHtml.slice(0, 150));
               } catch (renderErr) {
                 console.error('[renderMarkdown] done handler ERROR:', renderErr);
                 finalHtml = '<p>' + App.escapeHtml(finalMd) + '</p>';
               }
-              if (App._currentBotMsg && App.showAnswer) {
-                App.showAnswer(App._currentBotMsg, finalMd);
-              } else if (answerDiv) {
-                answerDiv.innerHTML = finalHtml;
+              answerDiv.innerHTML = finalHtml;
+              if (App._currentBotMsg) {
+                App._currentBotMsg._answer = answerDiv;
               }
             } else if (App._currentBotMsg) {
-              // answerDiv 为 null 但 bot 消息已创建(思考先到、token 未到):显示占位提示
               const placeholder = App._currentBotMsg.querySelector('.answer-doc');
               if (placeholder && !placeholder.textContent.trim()) {
                 placeholder.innerHTML = '<p style="color:var(--text-tertiary);font-style:italic;">思考完成, 等待回答...</p>';
               }
             }
+            renderDone = true; // 最终渲染完成后才标记,防止跳过待处理的 scheduleRender
             // ── 从 done 事件的 steps 中补全执行轨迹(后端聚合结果,兜底未增量上报的步骤) ──
             if (evt.steps && Array.isArray(evt.steps) && evt.steps.length > 0) {
               for (const step of evt.steps) {
@@ -864,6 +892,14 @@ App.Chat.doSend = async function (text, opts = {}) {
             _finishGroup(answerDiv ? (answerDiv.textContent || '') : null);
             // 关闭执行轨迹面板
             App.ExecTrace.finish(answerDiv ? (answerDiv.textContent || '') : null);
+            // 截断检测:finish_reason=length 表示 LLM 输出被 max_tokens 截断
+            if (evt.finish_reason === 'length' && answerDiv) {
+              const truncDiv = document.createElement('div');
+              truncDiv.className = 'truncation-warning';
+              truncDiv.style.cssText = 'margin-top:8px;padding:8px 12px;background:rgba(251,191,36,0.1);border-left:3px solid #f59e0b;border-radius:4px;font-size:13px;color:#f59e0b;';
+              truncDiv.textContent = '⚠ 回复被截断:已达到输出长度上限。可尝试缩短上下文或增加 max_output_tokens。';
+              answerDiv.appendChild(truncDiv);
+            }
             // 检查是否有待确认的中断
             const intr = evt.interrupt;
             if (intr && intr.type === 'confirmation' && intr.requests) {
@@ -881,6 +917,16 @@ App.Chat.doSend = async function (text, opts = {}) {
               App.appendMessage('未收到响应,请重试', 'error');
             }
             break; // 流已完成,退出事件处理循环
+          } else if (evt.type === 'cancelled') {
+            done = true;
+            inThinking = false;
+            thinkingBuf = '';
+            App.clearImageGenerating();
+            cleanupStream();
+            if (typingShown) App.removeTyping();
+            renderDone = true;
+            App.appendMessage('已取消', 'error');
+            break;
           } else {
             // 兜底:未识别的事件类型 → 仅日志,绝不允许原始事件字符串进入聊天内容或 mdBuf
             if (App.DEBUG) console.log('[SSE] unhandled event type:', evt.type, 'keys:', Object.keys(evt));
@@ -926,6 +972,8 @@ App.Chat.doSend = async function (text, opts = {}) {
           if (evt.type === 'done' && !done) {
             done = true;
             renderDone = true; // 必须在 cleanupStream 之前设置
+            inThinking = false;
+            thinkingBuf = '';
             App.clearImageGenerating();
             cleanupStream();
             if (typingShown) App.removeTyping();
@@ -955,6 +1003,14 @@ App.Chat.doSend = async function (text, opts = {}) {
             }
             _finishGroup(answerDiv ? (answerDiv.textContent || '') : null);
             App.ExecTrace.finish(answerDiv ? (answerDiv.textContent || '') : null);
+            // 截断检测(残余 buffer 路径)
+            if (evt.finish_reason === 'length' && answerDiv) {
+              const truncDiv = document.createElement('div');
+              truncDiv.className = 'truncation-warning';
+              truncDiv.style.cssText = 'margin-top:8px;padding:8px 12px;background:rgba(251,191,36,0.1);border-left:3px solid #f59e0b;border-radius:4px;font-size:13px;color:#f59e0b;';
+              truncDiv.textContent = '⚠ 回复被截断:已达到输出长度上限。可尝试缩短上下文或增加 max_output_tokens。';
+              answerDiv.appendChild(truncDiv);
+            }
             const intr = evt.interrupt;
             if (intr && intr.type === 'confirmation' && intr.requests) {
               if (App.Confirmation && App.Confirmation.show) {
@@ -970,7 +1026,8 @@ App.Chat.doSend = async function (text, opts = {}) {
             break; // 流已完成,退出残余处理循环
           } else if (evt.type === 'error' && !done && !isError) {
             done = true; isError = true;
-            renderDone = true; // 必须在 cleanupStream 之前设置
+            inThinking = false;
+            thinkingBuf = '';
             App.clearImageGenerating(); cleanupStream();
             if (typingShown) App.removeTyping();
             if (answerDiv) {
@@ -984,6 +1041,7 @@ App.Chat.doSend = async function (text, opts = {}) {
               answerDiv.innerHTML = h;
             }
             App.ExecTrace.finish(answerDiv ? (answerDiv.textContent || '') : null);
+            renderDone = true;
             const errMsg = evt.message || '发生错误';
             if (errMsg !== lastErrMsg) { lastErrMsg = errMsg; App.appendMessage(errMsg, 'error'); }
             _finishGroup();
@@ -997,7 +1055,7 @@ App.Chat.doSend = async function (text, opts = {}) {
                 const thinkText = App.stripThinkingTags ? App.stripThinkingTags(thinking) : thinking;
                 App.appendThinking(thinkText);
               }
-              if (text) { const cleanText = App.stripThinkingTags ? App.stripThinkingTags(text) : text; App._mdBuf += cleanText; scheduleRender(); }
+              if (text) { const cleanText = App.stripThinkingTags ? App.stripThinkingTags(text) : text; if (cleanText && App._mdBuf) { const lastChar = App._mdBuf.charAt(App._mdBuf.length - 1); const firstChar = cleanText.charAt(0); if (/[a-zA-Z0-9]/.test(lastChar) && /[a-zA-Z0-9]/.test(firstChar)) { App._mdBuf += ' '; } } App._mdBuf += cleanText; if (App._mdBuf.length > 200000) { App._mdBuf = App._mdBuf.slice(-200000); } scheduleRender(); }
             }
           } else if (evt.type === 'heartbeat') {
             // no-op
@@ -1054,7 +1112,7 @@ App.Chat.doSend = async function (text, opts = {}) {
     // 场景2: 收到过事件(工具执行等)但流未正常完成(连接中断/后端异常) → "执行中断"
     if (!done && !isError) {
       App.removeTyping();
-      if (renderTimer !== null) { clearTimeout(renderTimer); renderTimer = null; }
+      if (renderTimer !== null) { cancelAnimationFrame(renderTimer); renderTimer = null; }
       if (receivedAnyEvent) {
         App.appendMessage('执行中断,结果可能不完整。请检查上下文长度后重试', 'error');
       } else {
@@ -1088,8 +1146,9 @@ App.Chat.doSend = async function (text, opts = {}) {
     // 重置 mdBuf 防止下次流式时累积
     App._mdBuf = '';
     renderDone = false;
-    _mdRenderedOffset = 0;
     _lastRenderedHtml = '';
+    inThinking = false;
+    thinkingBuf = '';
     /* 代次保护: 旧流不得强制复位 sendBtn/streaming, 否则新流刚显示的 stopBtn
        会被 setStreaming(false) 隐藏。仅最新代次才启用按钮 + 同步 streaming。 */
     if (!isStale) {

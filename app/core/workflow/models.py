@@ -197,6 +197,25 @@ class Workflow:
                 if not incoming:
                     errors.append(f"节点 {node_id} 没有入边")
 
+        # 检查边引用: 边只能连接真实存在的节点
+        for edge in self.edges:
+            if edge.source not in self.nodes:
+                errors.append(f"边 {edge.id} 的源节点 {edge.source} 不存在")
+            if edge.target not in self.nodes:
+                errors.append(f"边 {edge.id} 的目标节点 {edge.target} 不存在")
+
+        # 检查节点坐标: 防止脏数据导致前端 SVG path 渲染出现 NaN
+        for node in self.nodes.values():
+            if node.position is not None:
+                try:
+                    x = float(node.position.get("x", 0))
+                    y = float(node.position.get("y", 0))
+                except (TypeError, ValueError):
+                    errors.append(f"节点 {node.id} 的坐标不是有效数字")
+                    continue
+                if x != x or y != y or x in (float("inf"), float("-inf")) or y in (float("inf"), float("-inf")):
+                    errors.append(f"节点 {node.id} 的坐标不是有限数值")
+
         # 检查循环引用（简单检测）
         try:
             self._check_cycles()

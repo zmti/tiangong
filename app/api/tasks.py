@@ -121,7 +121,7 @@ async def task_status(task_id: str) -> dict:
         from app.core.agent import Agent
         try:
             a = Agent()
-            versions = a.versions(rec.run_id) if rec.run_id else []
+            versions = await a.versions(rec.run_id) if rec.run_id else []
             if versions:
                 latest = versions[-1] if versions else {}
                 total_steps = latest.get("steps", 0) or 0

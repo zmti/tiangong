@@ -235,13 +235,23 @@ class Agent:
         # 工具路由:预选后只把相关工具子集暴露给模型;None=未路由(全量)
         self._active_tools: Optional[list[str]] = None
         self._always_tools = list(SYSTEM_TOOLS)
-        # 原生工具调用开关:初始化时探测 LLM 是否支持
-        self._native_enabled = settings.agent_native_tools and hasattr(self.llm, "chat_with_tools")
+        # 原生工具调用开关:初始化时探测 LLM 是否支持。
+        # 注意:不能只判断 hasattr —— LLMClient 子类(测试 Mock、降级占位等)
+        # 可能把 chat_with_tools 设为 None(不支持),hasattr 仍为 True,
+        # 运行时调用才抛 'NoneType' object is not callable。必须同时校验可调用性。
+        self._native_enabled = (
+            settings.agent_native_tools
+            and callable(getattr(self.llm, "chat_with_tools", None))
+        )
         # 基线值: 该实例"意图"的原生工具开关。_reset_run_state 每轮恢复到基线,
         # 而非无条件用全局 settings —— 允许调用方(CLI)通过覆盖 _native_enabled
         # 一次性关闭原生路径, 且多轮复用实例时不被 _reset_run_state 重置回去。
         self._native_baseline = self._native_enabled
         self._schemas_cache = None
+        # 工具连续失败追踪: 键=(工具名, 参数哈希), 值=连续失败次数。
+        # 挂在实例上跨轮共享, 每个 tools 轮次内递增, 成功即清零该工具条目,
+        # 达到阈值(3 次)强制 finalize, 避免同参数死循环重试。
+        self._tool_failure: dict[tuple, int] = {}
         # 任务计划状态(Plan-then-Execute)
         self._plan: Optional[TaskPlan] = None
         self._plan_dirty = False
@@ -326,6 +336,8 @@ class Agent:
         # _runtime_approved(本地放行工具名单)在第 1 轮 run_stream 入口就冲掉,
         # 导致 --yolo 形同虚设、危险工具仍触发 interrupt 卡死。
         self._runtime_approved = set(getattr(self, "_baseline_approved", set()))
+        # 工具连续失败追踪:清空, 避免上一问的失败计数导致本问直接 giveup
+        self._tool_failure = {}
 
     # ---- 对外接口 ----
 
@@ -355,7 +367,7 @@ class Agent:
         """
         if self._checkpoint is None:
             raise RuntimeError("checkpoint 未启用,无法恢复运行")
-        state = self._checkpoint.load(run_id)
+        state = await self._checkpoint.load(run_id)
         if state is None:
             raise RuntimeError(f"未找到运行记录: {run_id}")
         if new_input is not None:
@@ -366,17 +378,17 @@ class Agent:
         self._sync_from_state(state)
         return await self._run_state(state, state.metadata.get("history", []) or [], stream=stream)
 
-    def checkpoints(self, limit: int = 50, status: Optional[str] = None) -> list[dict]:
+    async def checkpoints(self, limit: int = 50, status: Optional[str] = None) -> list[dict]:
         """列出已持久化的运行记录(供后台任务/断点续跑管理)。"""
         if self._checkpoint is None:
             return []
-        return self._checkpoint.list(limit=limit, status=status)
+        return await self._checkpoint.list(limit=limit, status=status)
 
-    def versions(self, run_id: str) -> list[dict]:
+    async def versions(self, run_id: str) -> list[dict]:
         """列出某次运行的全部历史版本(时间旅行)。"""
         if self._checkpoint is None:
             return []
-        return self._checkpoint.versions(run_id)
+        return await self._checkpoint.versions(run_id)
 
     async def rollback(self, run_id: str, version: int,
                        resume_value: Optional[dict] = None) -> AgentResult:
@@ -386,7 +398,7 @@ class Agent:
         """
         if self._checkpoint is None:
             raise RuntimeError("checkpoint 未启用,无法回滚")
-        state = self._checkpoint.rollback(run_id, version)
+        state = await self._checkpoint.rollback(run_id, version)
         if state is None:
             raise RuntimeError(f"未找到运行记录 {run_id} 的版本 {version}")
         if state.status == "interrupted" and state.interrupt is not None:
@@ -445,18 +457,22 @@ class Agent:
             if state.status == "interrupted" and state.interrupt:
                 interrupt = state.interrupt.get("value")
             done = {"type": "done", "model": model, "steps": state.steps}
+            # 传递 finish_reason:前端检测截断(d=length)用
+            fr = state.metadata.get("finish_reason", "")
+            if fr:
+                done["finish_reason"] = fr
             if interrupt is not None:
                 done["interrupt"] = interrupt
             if state.status == "failed" and state.error:
                 done["error"] = state.error
             yield done
         except asyncio.CancelledError:
-            # 取消传播: 记录 trace 后向外抛出, 让调用方(任务管理器)感知并终止
             if not cancelled:
                 logger.warning("run_stream 被外部取消: run_id=%s", run_id)
                 tracer.record({"type": "run_end", "run_id": run_id, "ok": False,
                                "error": "cancelled", "duration": round(time.time() - t0, 3)})
                 _current_run_id.reset(token)
+                yield {"type": "cancelled", "model": state.metadata.get("model", ""), "steps": state.steps}
             raise
         except Exception as e:  # noqa: BLE001
             logger.warning("run() 运行异常，记录 trace 后终止: %s", e)
@@ -464,6 +480,9 @@ class Agent:
                            "error": str(state.error or "")[:300],
                            "duration": round(time.time() - t0, 3)})
             _current_run_id.reset(token)
+            # 异常时 yield done 事件,确保前端不会永远等待
+            yield {"type": "done", "model": state.metadata.get("model", ""),
+                   "steps": state.steps, "error": str(e)[:200]}
             raise
         tracer.record({"type": "run_end", "run_id": run_id, "ok": True,
                        "steps": len(state.steps), "answer_len": len(state.answer or ""),
@@ -540,7 +559,7 @@ class Agent:
         base_max = self.max_steps
         # Graph.max_iters 需要预留足够余量，实际检查在 _node_llm 中进行
         g = Graph(name="agent", checkpoint=self._checkpoint,
-                  max_iters=base_max + 100,  # 增加余量到100步
+                  max_iters=base_max + 10,  # 余量10步,防止无限循环
                   cancel_check=self._make_cancel_check(),
                   batch_checkpoint=True,
                   batch_flush_interval=float(getattr(settings, "agent_checkpoint_batch_flush_interval", 2.0) or 2.0),
@@ -608,10 +627,13 @@ class Agent:
             consecutive_empty = int(state.metadata.get("consecutive_empty_answers", 0)) + 1
             state.metadata["consecutive_empty_answers"] = consecutive_empty
             logger.warning("[_route_finalize] empty answer #%d, will retry", consecutive_empty)
-            # 连续 2 次空答案即放弃(避免 LLM 只输出 thinking 标签导致无限循环)
-            if consecutive_empty >= 2:
+            # 工具密集任务中 LLM 可能多次只输出 thinking,提高阈值到 4
+            # 仅在无任何工具调用时保持较低阈值(首次空直接重试)
+            giveup_threshold = 2 if not has_tool_steps else 4
+            if consecutive_empty >= giveup_threshold:
                 state.metadata["giveup"] = True
-                logger.warning("[_route_finalize] giving up after %d consecutive empty answers", consecutive_empty)
+                logger.warning("[_route_finalize] giving up after %d consecutive empty answers (has_tools=%s)",
+                               consecutive_empty, has_tool_steps)
                 return "giveup"
             return "llm"
         # 有答案时重置计数器
@@ -822,6 +844,14 @@ class Agent:
         state.metadata["tool_call_mode"] = tool_call_mode
         state.metadata["resp"] = resp or ""
         state.metadata["tool_calls"] = [tc.to_dict() for tc in tool_calls]
+        # 追踪 finish_reason:截断检测(finish_reason=length)用。
+        # 必须在每次 LLM 调用结束后立即从 LLMClient 实例读取(调用结束才写完),
+        # 否则跨调用实例属性会把上一次的 finish_reason 误判为本次截断。
+        finish_reason = getattr(self.llm, "_finish_reason", "") or ""
+        if finish_reason:
+            state.metadata["finish_reason"] = finish_reason
+        else:
+            state.metadata.pop("finish_reason", None)  # 无 finish_reason 时清除残留, 防止误报截断
         # 提升日志级别以便更容易诊断问题
         logger.info("[_node_llm] round=%d resp_len=%d tool_calls=%d mode=%s",
                     rounds, len(resp or ""), len(tool_calls), tool_call_mode)
@@ -838,11 +868,13 @@ class Agent:
                 "content": resp or "",
                 "tool_calls": [tc.to_openai() for tc in tool_calls],
             })
-            if resp:
+            # thinking 事件只发"非正文"的思考内容: 流式模式下 resp 的 token 已经
+            # 通过 _call_llm_stream 的 token 事件实时渲染到答案区, 再发一遍会造成
+            # 内容显示两遍; 非流式模式则保留 thinking 事件供前端折叠展示
+            if resp and not state.metadata.get("stream"):
                 state.emit({"type": "thinking", "content": resp})
         elif tool_calls:
             state.messages.append({"role": "assistant", "content": resp or ""})
-            state.emit({"type": "thinking", "content": resp or ""})
         # 无工具调用:最终回答由 finalize 节点处理
 
     async def _node_tools(self, state: AgentState, graph: Graph) -> Optional[str]:
@@ -937,6 +969,23 @@ class Agent:
                     state.emit({"type": "token", "content": ch})
             return END
 
+        # 连续失败检测:同一工具+同一参数连续失败3次才终止(避免路径错误直接放弃)
+        # 失败计数挂在 Agent 实例的 metadata 上(跨运行共享), 每次 tools 轮次前重置,
+        # 成功时清零对应条目
+        for tc, result_str, is_err in batch:
+            key = (tc.name, hash(tc.arguments) % 100000)
+            if is_err:
+                self._tool_failure[key] = self._tool_failure.get(key, 0) + 1
+            else:
+                # 成功则清除该工具的所有失败计数(重置)
+                self._tool_failure = {k: v for k, v in self._tool_failure.items() if k[0] != tc.name}
+        for (tname, targs), fail_count in self._tool_failure.items():
+            if fail_count >= 3:
+                logger.warning("consecutive failure detected: tool=%s args_hash=%s fails=%d, forcing finalize",
+                               tname, targs % 10000, fail_count)
+                state.metadata["giveup"] = True
+                return None
+
         # 计划失败后重新规划:同工具连续失败达阈值时,基于失败原因生成修订版计划
         if await self._maybe_replan(state, batch):
             state.emit({"type": "plan", "action": "replan",
@@ -957,17 +1006,30 @@ class Agent:
 
         # 空答案兜底:如果 resp 为空，尝试重新生成
         if not answer:
-            # 先尝试 reasoning 作为兜底
+            # 先尝试 reasoning 作为兜底(agnes 等模型可能把所有输出放在 reasoning_content 里)
             answer = state.metadata.get("reasoning", "") or ""
-            # 如果仍然为空，非流式模式下补一次 LLM 调用（带超时保护）
-            if not answer and not state.metadata.get("stream"):
+            if answer:
+                logger.info("[_node_finalize] resp 为空,使用 reasoning 作为 answer (len=%d)", len(answer))
+            # 如果仍然为空,注入提示让 LLM 生成最终回答(流式/非流式都补调)
+            if not answer:
+                logger.info("[_node_finalize] resp 和 reasoning 均为空,补调 LLM 生成回答")
                 try:
+                    # 追加提示消息,要求基于工具结果给出总结
+                    state.messages.append({
+                        "role": "user",
+                        "content": "请基于以上工具执行结果,给出最终回答。直接输出回答内容,不要调用工具。"
+                    })
                     answer = await asyncio.wait_for(
                         self.llm.chat(state.messages, temperature=self.temperature),
                         timeout=float(getattr(settings, "agent_llm_timeout", 60) or 60)
                     )
-                except asyncio.TimeoutError:
-                    logger.warning("finalize 阶段 LLM 补调用超时")
+                    # 流式模式:补调结果需要手动发射 token
+                    if state.metadata.get("stream") and answer:
+                        for ch in answer:
+                            state.emit({"type": "token", "content": ch})
+                except (asyncio.TimeoutError, Exception) as e:
+                    logger.warning("finalize 阶段补调 LLM 失败: %s", e)
+                    answer = "抱歉,我无法生成有效回答。请简化需求或提供更多背景信息。"
 
         # 输出 token 配额硬控制
         if self.max_output_tokens > 0 and answer:
@@ -979,17 +1041,24 @@ class Agent:
                                 "content": f"[已达输出配额上限 {self.max_output_tokens} token,回答已截断]"})
 
         state.answer = answer
-        # 剥离 <thinking>...</thinking> 标签,确保存储的答案不含思考内容
+        # 剥离 LLM 内部 XML 标签,确保存储的答案不含内部内容
         if state.answer:
-            # 丢弃完整的 thinking 块（思考过程），保留正文
-            state.answer = re.sub(r'<thinking[^>]*>[\s\S]*?</thinking>', '', state.answer, flags=re.IGNORECASE)
-            # 清理可能残留的孤立标签
-            state.answer = re.sub(r'<thinking[^>]*>', '', state.answer, flags=re.IGNORECASE)
-            state.answer = re.sub(r'</thinking>', '', state.answer, flags=re.IGNORECASE)
+            # 丢弃完整的 thinking/system/plan 等块
+            for tag in ('thinking', 'system', 'plan', 'phase', 'analysis',
+                        'reflection', 'context', 'instruction', 'output', 'reasoning'):
+                state.answer = re.sub(r'<' + tag + r'[^>]*>[\s\S]*?</' + tag + r'>', '', state.answer, flags=re.IGNORECASE)
+            # 清理残留的孤立标签
+            for tag in ('thinking', 'system', 'plan', 'phase', 'analysis',
+                        'reflection', 'context', 'instruction', 'output', 'reasoning'):
+                state.answer = re.sub(r'<' + tag + r'[^>]*>', '', state.answer, flags=re.IGNORECASE)
+                state.answer = re.sub(r'</' + tag + r'>', '', state.answer, flags=re.IGNORECASE)
             # 规范化空白
             state.answer = state.answer.strip()
             state.answer = re.sub(r'[ \t]+', ' ', state.answer)
             state.answer = re.sub(r'\n{3,}', '\n\n', state.answer)
+        # 空答案最终兜底
+        if not state.answer:
+            state.answer = "抱歉,我无法生成有效回答。请简化需求或提供更多背景信息。"
         state.steps.append({"step": step + 1, "type": "answer", "content": state.answer})
 
         # 输出护栏:敏感信息/提示词泄露检测(流式模式也强制拦截, 通过 guardrail_overwrite 事件更正)
@@ -1633,32 +1702,86 @@ class Agent:
             return {"type": "tool_route", "tools": cached.tools, "reason": cached.reason, "cached": True}
 
         # 使用智能路由(关键词+embedding+LLM 三级缓存 + 置信度评分)
+        # 第三级 LLM 路由: 通过 llm_adapter 统一抽象 select_tools 对 LLM 的结构化调用,
+        # 避免 LLMClient.chat_json_schema 回退到 LLMClient.chat(需要真实 client),
+        # 让自定义 LLM(Mock 子类 / LLMClient 子类) 的 chat_json / chat_json_schema
+        # 都能被调用, 同时保留 LLMClient 完整行为。
+        from app.core.smart_router import select_tools_enhanced
+
+        # 优先用底层 LLM 的 chat_json(如果 Mock/自定义 LLM 已覆写),
+        # 否则走 LLMClient 的 chat_json_schema(原生 OpenAI 客户端)。
+        # 这样 select_tools 内部对 llm.chat_json 的 hasattr 判断能命中 Mock 子类,
+        # 而 LLMClient 仍走原生的结构化输出链路(不破坏原生响应)。
+        adapter_llm = self.llm
+        selected: list[str] = []
+        conf = 0.0
+        reason = ""
         try:
-            from app.core.smart_router import select_tools_enhanced
             # 添加超时保护
             route_timeout = 30.0
             selected, conf, reason = await asyncio.wait_for(
                 select_tools_enhanced(
-                    self.llm, user_input, self.registry,
+                    adapter_llm, user_input, self.registry,
                     max_tools=max_tools,
                     min_confidence=min_confidence,
                     user_tech_stack=getattr(self, "_tech_stack", []),
                 ),
                 timeout=route_timeout
             )
-            if selected and conf >= min_confidence:
-                self._active_tools = selected
-                self._schemas_cache = None
-                # 写入缓存
-                await cache.set(user_input, selected, conf, reason)
-                steps.append({"step": step, "type": "tool_route", "tools": selected, "reason": reason})
-                return {"type": "tool_route", "tools": selected, "reason": reason}
         except asyncio.TimeoutError:
             logger.warning("智能工具路由超时，回退到全量工具集")
+            selected, conf, reason = [], 0.0, "route_timeout"
         except Exception as e:  # noqa: BLE001
             logger.warning("智能工具路由失败，回退到全量工具集: %s", e)
+            selected, conf, reason = [], 0.0, f"route_error: {str(e)[:80]}"
 
-        return None
+        # 改进: 路由结果过少(< 3 个)时自动补充兜底工具,避免模型缺少关键工具
+        # 使用 LLM 路由(LLM 路由是三级兜底的最后一级,结果少通常意味着任务简单)
+        if reason.startswith("llm_fallback") or conf < min_confidence:
+            selected = self._supplement_routing(selected, conf, user_input, max_tools)
+            reason = f"supplemented({reason})"
+            conf = max(conf, 0.5)
+
+        if not selected:
+            return None
+
+        self._active_tools = selected
+        self._schemas_cache = None
+        # 写入缓存
+        await cache.set(user_input, selected, conf, reason)
+        steps.append({"step": step, "type": "tool_route", "tools": selected, "reason": reason})
+        return {"type": "tool_route", "tools": selected, "reason": reason}
+
+    def _supplement_routing(self, selected: list[str], conf: float, user_input: str, max_tools: int) -> list[str]:
+        """路由结果过少时补充兜底工具。
+
+        策略: 优先保留已选工具,补充常用核心工具(read_file/write_file/edit_file/
+        run_code/web_search/search_files 等)至至少 3 个(不超 max_tools)。
+        """
+        from app.tools.categories import get_category
+
+        if len(selected) >= 3:
+            return selected
+        all_tools = self.registry.list_sync()
+        priority = [
+            "read_file", "write_file", "edit_file", "list_directory",
+            "search_files", "run_code", "web_search", "fetch_webpage",
+            "query_sqlite", "generate_image",
+        ]
+        known = {t.name for t in all_tools}
+        active = list(selected)
+        for name in priority:
+            if len(active) >= 3:
+                break
+            if name in known and name not in active and name not in SYSTEM_TOOLS:
+                active.append(name)
+        # 仍不足 3 个:从全部工具中按注册顺序补足
+        for t in all_tools:
+            if len(active) >= 3:
+                break
+            if t.name not in active and t.name not in SYSTEM_TOOLS and t.enabled:
+                active.append(t.name)
+        return active[:max_tools] if max_tools else active
 
     async def _call_llm(self, messages: list[dict]) -> tuple[str, str, list[ToolCall]]:
         """调用 LLM。返回 (mode, content, tool_calls)。
@@ -1724,8 +1847,9 @@ class Agent:
                 return "text", full, tool_calls
             except LLMError as e:
                 # 流中途空闲/总时长超时:此时可能已向用户吐出部分 token,
-                # 降级到 text 模式会重新发起整个 LLM 请求,导致已输出内容重复 + 卡顿翻倍。
-                # 区分: 建连前失败(collected 为空,未输出任何内容)可安全降级; 流中途失败必须直接上抛。
+                # 降级到 text 模式会重新发起整个 LLM 请求,导致已输出内容重复 + 卡顿翻倍;
+                # 也不能静默吞掉错误(会造成"流正常结束"的假象,用户无法感知超时)。
+                # 区分: 建连前失败(collected 为空,未输出任何内容)可安全降级; 流中途失败直接上抛。
                 if collected:
                     logger.warning("native 流式中途失败(已输出 %d 段内容),不再降级: %s", len(collected), e)
                     raise
@@ -1991,9 +2115,26 @@ class Agent:
 
         d_token = set_delegate_context(self.llm, self.session_id, self._active_tools)
         try:
-            results = await asyncio.gather(
-                *[self._execute_tool(tc.name, tc.arguments) for tc in tool_calls]
-            )
+            batch_timeout = settings.agent_tool_timeout or 300
+            try:
+                results = await asyncio.wait_for(
+                    asyncio.gather(
+                        *[self._execute_tool(tc.name, tc.arguments) for tc in tool_calls],
+                        return_exceptions=True,
+                    ),
+                    timeout=batch_timeout,
+                )
+                results = [
+                    json.dumps({"error": f"工具执行异常: {r}"}, ensure_ascii=False) if isinstance(r, Exception) else r
+                    for r in results
+                ]
+            except asyncio.TimeoutError:
+                logger.warning("工具批量执行超时(%ds), tools=%s", batch_timeout,
+                               [tc.name for tc in tool_calls])
+                results = [
+                    json.dumps({"error": f"工具执行超时({batch_timeout}s)"}, ensure_ascii=False)
+                    for _ in tool_calls
+                ]
         finally:
             _current_session.reset(token)
             from app.tools.delegation_tool import _delegate_parent
@@ -2106,7 +2247,10 @@ class Agent:
                 return terminal
             stubborn = [n for n in set(error_names) if failures[n] >= 2]
             if stubborn:
-                hint = "以下工具已连续失败,请不要再使用它们,改用其他工具或方案:" + "、".join(stubborn)
+                hint = (
+                    "以下工具多次失败,请先用 list_directory/read_file 确认正确路径和文件内容,"
+                    "再用正确参数重试,不要重复相同的调用:" + "、".join(stubborn)
+                )
             else:
                 hint = (
                     "以下工具执行失败:" + "、".join(error_names)
@@ -2818,15 +2962,15 @@ class Agent:
             return None
         depth = 0
         in_string = False
-        escape = False
         i = start
         while i < len(text):
             ch = text[i]
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
+            if in_string and ch == "\\":
+                # 字符串内反斜杠转义:连同下一个字符一起跳过(必须跳 2 位,
+                # 否则循环尾部的 i += 1 会把转义目标也吞掉)
+                i += 2
+                continue
+            if ch == '"':
                 in_string = not in_string
             elif not in_string:
                 if ch == "{":

@@ -4764,7 +4764,7 @@ body.sidebar-collapsed .status-bar {
   pointer-events: none;
   z-index: 0;
 }
-.wf-canvas-wrap svg, .wf-canvas-wrap .wf-properties, .wf-canvas-wrap .wf-run-panel { position: relative; z-index: 1; }
+.wf-canvas-wrap svg, .wf-canvas-wrap .wf-run-panel { position: relative; z-index: 1; }
 
 /* 工具栏(选中工作流后显示) */
 .wf-toolbar {

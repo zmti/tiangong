@@ -302,10 +302,12 @@ def _safe_env() -> dict:
         "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
         "PYTHONIOENCODING": "utf-8",
         "PYTHONDONTWRITEBYTECODE": "1",
-        "PYTHONPATH": "",  # 禁 PYTHONPATH, 防导入业务代码
+        "PYTHONPATH": "",  # 禁 PYTHONPATH, 防导入业务代码(空串必须保留)
     }
-    # 仅保留非空值
-    return {k: v for k, v in allowed.items() if v}
+    # 仅保留非空值, 但 PYTHONPATH 例外: 它必须存在且为空串(防止父进程 PYTHONPATH 泄漏)
+    env = {k: v for k, v in allowed.items() if k == "PYTHONPATH" or v}
+    env["PYTHONPATH"] = ""
+    return env
 
 
 def _run_python(code: str, timeout: int, workdir: str) -> SandboxResult:

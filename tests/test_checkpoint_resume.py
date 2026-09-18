@@ -48,7 +48,7 @@ def test_agent_run_creates_checkpoint(tmp_path):
 
     result = run(agent.run("计算"))
     assert result.answer == "结果是 3"
-    cps = agent.checkpoints()
+    cps = run(agent.checkpoints())
     assert len(cps) >= 1
     assert cps[0]["status"] == "done"
 
@@ -66,7 +66,7 @@ def test_agent_resume_continues_from_node(tmp_path):
     ]
     state.node = "llm"
     state.metadata["history"] = []
-    cm.save(state)
+    run(cm.save(state))
     assert state.run_id
 
     mock = CountLLM(["最终答案 42"])
@@ -96,11 +96,11 @@ def test_agent_resume_replays_latest_checkpoint(tmp_path):
     cm = CheckpointManager(db_path=os.path.join(tmp_path, "ck4.db"))
     s1 = AgentState(session_id="a", user_input="q1")
     s1.node = "llm"
-    cm.save(s1)
+    run(cm.save(s1))
     s1.answer = "中间"
     s1.node = "tools"
-    cm.save(s1)
-    loaded = cm.load(s1.run_id)
+    run(cm.save(s1))
+    loaded = run(cm.load(s1.run_id))
     assert loaded.answer == "中间"
     assert loaded.node == "tools"
 
@@ -132,7 +132,7 @@ def test_agent_interrupt_confirmation_pauses_then_resumes(tmp_path):
         # 工具未执行
         assert not any(s["type"] == "tool" for s in result.steps)
         # checkpoint 存在且处于 interrupted
-        cps = agent.checkpoints(status="interrupted")
+        cps = run(agent.checkpoints(status="interrupted"))
         assert cps, "应存在 interrupted 状态的 checkpoint"
         run_id = result.interrupt["run_id"]
 

@@ -146,7 +146,7 @@ async def get_plan_status(task_id: str) -> dict:
 
     checkpoint_dir = os.path.join(settings.resolved_data_dir, "checkpoints.db")
     mgr = CheckpointManager(checkpoint_dir)
-    runs = mgr.list(limit=100)
+    runs = await mgr.list(limit=100)
     for r in runs:
         if task_id in r.get("run_id", ""):
             return {"task_id": task_id, "status": r.get("status", "unknown"), "plan": r}

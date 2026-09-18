@@ -64,7 +64,11 @@
   word-break: break-word;
   overflow-wrap: break-word;
 }
-.msg.user .answer-doc, .msg.msg-user .answer-doc { color: var(--text); }
+.msg.user .answer-doc, .msg.msg-user .answer-doc {
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 .msg.bot .answer-doc, .msg.msg-bot .answer-doc { color: var(--text); }
 
 /* P1-5: 10.5 → 11, 11.5 → 12 */
@@ -420,4 +424,14 @@
 }
 .step-row:first-child {
   margin-top: 0;
+}
+
+/* ── 流式完成后强制隐藏过程元素,与历史消息样式统一 ── */
+.msg.bot.no-animation .process-rail,
+.msg.bot.no-animation .step-counter,
+.msg.bot.no-animation .steps-flow,
+.msg.msg-bot.no-animation .process-rail,
+.msg.msg-bot.no-animation .step-counter,
+.msg.msg-bot.no-animation .steps-flow {
+  display: none !important;
 }

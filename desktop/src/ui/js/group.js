@@ -66,11 +66,12 @@
       return; 
     }
     const text = App.stripThinkingTags(content);
+    if (!text.trim()) return;
     if (!App._currentGroup.thinking) {
       const el = document.createElement('div');
       el.className = 'rg-thinking';
-      el.textContent = text.slice(0, 300);
-      el.title = text.slice(0, 2000);
+      el.textContent = text;
+      el.title = text;
       App._currentGroup.body.appendChild(el);
       App._currentGroup.thinking = el;
       if (!App._currentGroup._detailVisible) {
@@ -78,8 +79,13 @@
         App._currentGroup._detailVisible = true;
       }
     } else {
-      App._currentGroup.thinking.textContent = text.slice(0, 300);
-      App._currentGroup.thinking.title = text.slice(0, 2000);
+      const prev = App._currentGroup.thinking.textContent;
+      App._currentGroup.thinking.textContent = prev + (prev ? '\n' : '') + text;
+      App._currentGroup.thinking.title = App._currentGroup.thinking.textContent;
+    }
+    const MAX = 2000;
+    if (App._currentGroup.thinking.textContent.length > MAX) {
+      App._currentGroup.thinking.textContent = App._currentGroup.thinking.textContent.slice(-MAX);
     }
   }
 

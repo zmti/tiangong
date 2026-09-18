@@ -109,8 +109,9 @@ class Settings(BaseSettings):
 
     # ---- 上下文配额硬控制 ----
     # 请求级 max_output_tokens 上限;0 = 不限制(由 provider 默认值决定)。
-    # 推理模型的 thinking token 也计入此限制, 设置过小会导致 tool_calls 被截断。
-    agent_default_max_output_tokens: int = 0
+    # agnes-3.0-flash 推理模型的 thinking token 也计入此限制,
+    # 设 16384 留足输出空间, 同时避免 provider 默认值过低导致回答截断。
+    agent_default_max_output_tokens: int = 16384
 
     # ---- 工作流生成服务地址 ----
     # Agent 通过 create_workflow_from_desc 工具调用此地址生成工作流。

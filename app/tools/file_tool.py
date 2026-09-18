@@ -39,7 +39,10 @@ def _allowed_write_roots() -> list[str]:
 
 def _resolve_write_path(path: str) -> str:
     """解析写入路径并校验在可写白名单内(防越界写系统文件)。"""
-    full = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isabs(path):
+        full = os.path.join(resolve_cwd(), path)
+    else:
+        full = os.path.abspath(os.path.expanduser(path))
     for root in _allowed_write_roots():
         rp = os.path.abspath(root)
         if full == rp or full.startswith(rp + os.sep):
@@ -133,6 +136,9 @@ def read_document(
     path: str = Field(description="要读取的本地文件路径"),
     max_chars: int = Field(15000, description="最多返回的字符数"),
 ) -> str:
+    from app.tools.project_context import resolve_cwd
+    if not os.path.isabs(path):
+        path = os.path.join(resolve_cwd(), path)
     path = os.path.abspath(os.path.expanduser(path))
     if not os.path.isfile(path):
         return {"path": path, "error": f"文件不存在: {path}"}
