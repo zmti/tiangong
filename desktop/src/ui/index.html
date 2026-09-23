@@ -683,7 +683,16 @@
                 <span class="gen-card-name">图片生成模型</span>
                 <span class="gen-badge" id="genImageModelBadge" data-source="default">加载中</span>
               </div>
-              <select id="genImageModelSelect" class="gen-select"></select>
+              <div class="gen-combo" id="genImageModelCombo">
+                <button type="button" class="gen-combo-trigger" id="genImageModelTrigger"
+                        aria-haspopup="listbox" aria-expanded="false">
+                  <span class="gen-combo-text" id="genImageModelTriggerText">加载中…</span>
+                  <svg class="gen-combo-caret" width="13" height="13" viewBox="0 0 24 24" fill="none"
+                       stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"
+                       aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                </button>
+                <input type="hidden" id="genImageModelSelect" class="gen-combo-val">
+              </div>
               <div class="gen-meta">
                 <span class="gen-meta-key">当前生效</span>
                 <code class="gen-meta-val" id="genImageModelValue">-</code>
@@ -699,7 +708,16 @@
                 <span class="gen-card-name">视频生成模型</span>
                 <span class="gen-badge" id="genVideoModelBadge" data-source="default">加载中</span>
               </div>
-              <select id="genVideoModelSelect" class="gen-select"></select>
+              <div class="gen-combo" id="genVideoModelCombo">
+                <button type="button" class="gen-combo-trigger" id="genVideoModelTrigger"
+                        aria-haspopup="listbox" aria-expanded="false">
+                  <span class="gen-combo-text" id="genVideoModelTriggerText">加载中…</span>
+                  <svg class="gen-combo-caret" width="13" height="13" viewBox="0 0 24 24" fill="none"
+                       stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"
+                       aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>
+                </button>
+                <input type="hidden" id="genVideoModelSelect" class="gen-combo-val">
+              </div>
               <div class="gen-meta">
                 <span class="gen-meta-key">当前生效</span>
                 <code class="gen-meta-val" id="genVideoModelValue">-</code>

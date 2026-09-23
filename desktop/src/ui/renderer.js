@@ -237,11 +237,16 @@
     btn.addEventListener('click', () => {
       const modal = document.getElementById(btn.dataset.modal);
       if (modal) modal.hidden = true;
+      // 生成模型下拉弹层挂在 body 上,不随弹窗隐藏,需一并收起
+      if (App.Settings && App.Settings.closeGenCombos) App.Settings.closeGenCombos();
     });
   });
   document.querySelectorAll('.modal-overlay').forEach(overlay => {
     overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) overlay.hidden = true;
+      if (e.target === overlay) {
+        overlay.hidden = true;
+        if (App.Settings && App.Settings.closeGenCombos) App.Settings.closeGenCombos();
+      }
     });
   });
   // 保留旧式 nav-btn 触发能力(兼容遗留代码)

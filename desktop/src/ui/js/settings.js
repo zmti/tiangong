@@ -603,6 +603,317 @@ App.Settings._genModels = null;
 
 const _GEN_SRC_TEXT = { override: '桌面端覆盖', env: '环境变量', default: '代码默认' };
 
+/* ---------- 生成模型「可搜索组合框」 ----------
+ * 原生 <select> 在候选有几十个模型时:样式不可控(Windows 原生下拉很"老气"),
+ * 且完全不能搜索。这里自绘一个 combobox:
+ *   - 触发区(trigger)显示当前模型,点击展开;
+ *   - 弹层挂到 document.body(传送门)+ position:fixed,避开 .settings-content
+ *     的 overflow 裁切,也避开弹窗内部 stacking context;
+ *   - 弹层内带搜索框(按 名称/模型id/提供商 过滤)+ 按提供商分组;
+ *   - 键盘:↑↓ 移动、Enter 选择、Esc 关闭。
+ * 每个 key('genImageModel' / 'genVideoModel')对应一组 DOM 与状态,缓存在 _genCombos。
+ */
+App.Settings._genCombos = Object.create(null);
+
+const _GEN_CHECK_SVG =
+  '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+  'stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>';
+const _GEN_SEARCH_SVG =
+  '<svg class="gen-combo-search-icon" width="13" height="13" viewBox="0 0 16 16" fill="currentColor">' +
+  '<path d="M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85z' +
+  'm-5.242.656a5 5 0 1 1 0-10 5 5 0 0 1 0 10z"/></svg>';
+
+function _genEsc(s) {
+  const t = String(s == null ? '' : s);
+  return App.escapeHtml ? App.escapeHtml(t)
+    : t.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+// provider id -> 界面友好名:优先后端 provider_name;后端较旧(无该字段)时
+// 退回「模型设置」已缓存的 provider 名称,保证分组标题仍是人话。
+function _genProvLabel(c) {
+  if (c.provider_name) return c.provider_name;
+  const p = (App.Settings._providers || []).find((x) => x && x.id === c.provider);
+  if (p && p.name) return p.name;
+  return c.provider || '其他';
+}
+
+function _genComboEnsure(key) {
+  let c = App.Settings._genCombos[key];
+  if (c) return c;
+  const combo = document.getElementById(key + 'Combo');
+  const trigger = document.getElementById(key + 'Trigger');
+  const textEl = document.getElementById(key + 'TriggerText');
+  const hidden = document.getElementById(key + 'Select');
+  if (!combo || !trigger || !hidden) return null;
+
+  const pop = document.createElement('div');
+  pop.className = 'gen-combo-pop';
+  pop.hidden = true;
+  pop.innerHTML =
+    '<div class="gen-combo-search-wrap">' + _GEN_SEARCH_SVG +
+    '<input type="text" class="gen-combo-search" placeholder="搜索模型名 / 提供商…" autocomplete="off" spellcheck="false"></div>' +
+    '<div class="gen-combo-list" role="listbox"></div>' +
+    '<div class="gen-combo-empty" hidden>没有匹配的模型</div>';
+  document.body.appendChild(pop);
+
+  c = {
+    key, combo, trigger, textEl, hidden, pop,
+    search: pop.querySelector('.gen-combo-search'),
+    list: pop.querySelector('.gen-combo-list'),
+    empty: pop.querySelector('.gen-combo-empty'),
+    info: null, hi: -1, _visible: [],
+  };
+  App.Settings._genCombos[key] = c;
+
+  trigger.addEventListener('click', (e) => { e.stopPropagation(); _genComboToggle(key); });
+  // 弹层内点击不冒泡到 document,否则会被"点外关闭"立刻关掉
+  pop.addEventListener('click', (e) => e.stopPropagation());
+  c.search.addEventListener('input', () => _genComboRenderList(key, c.search.value));
+  c.search.addEventListener('keydown', (e) => _genComboKeydown(key, e));
+  c.list.addEventListener('click', (e) => {
+    const btn = e.target.closest && e.target.closest('.gen-opt');
+    if (btn) _genComboSelect(key, btn.dataset.value);
+  });
+  c.list.addEventListener('mousemove', (e) => {
+    const btn = e.target.closest && e.target.closest('.gen-opt');
+    if (btn) {
+      const i = Number(btn.dataset.idx);
+      if (i !== c.hi) { c.hi = i; _genComboHighlight(key); }
+    }
+  });
+
+  if (!App.Settings._genComboDocBound) {
+    App.Settings._genComboDocBound = true;
+    document.addEventListener('click', () => _genComboCloseAll());
+    document.addEventListener('keydown', (e) => { if (e.key === 'Escape') _genComboCloseAll(); });
+    window.addEventListener('resize', () => _genComboCloseAll());
+    // 设置内容区可滚动:滚动时弹层会错位,直接收起
+    const scroller = document.querySelector('.settings-content');
+    if (scroller) scroller.addEventListener('scroll', () => _genComboCloseAll(), { passive: true });
+  }
+  return c;
+}
+
+// 把候选拍成「行」描述:一行是分组标题,一行是选项
+function _genComboRows(c) {
+  const info = c.info || {};
+  const cands = info.candidates || [];
+  const rows = [{
+    kind: 'opt', value: '', name: '跟随默认',
+    sub: info.code_default || '', inherit: true, usable: true,
+  }];
+  const order = [];
+  const buckets = Object.create(null);
+  cands.forEach((x) => {
+    const g = _genProvLabel(x);
+    if (!buckets[g]) { buckets[g] = []; order.push(g); }
+    buckets[g].push(x);
+  });
+  order.forEach((g) => {
+    const items = buckets[g];
+    // 整组都发不到端点时,在组标题上直接标出来,免得选了注定失败
+    rows.push({ kind: 'group', label: g, bad: items.every((x) => x.usable === false) });
+    items.forEach((x) => {
+      rows.push({
+        kind: 'opt', value: x.id, name: x.name || x.id, sub: x.id,
+        usable: x.usable !== false, provider: g,
+      });
+    });
+  });
+  return rows;
+}
+
+function _genOptEl(r, idx, selected) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'gen-opt' + (r.inherit ? ' inherit' : '') + (selected ? ' selected' : '');
+  btn.dataset.value = r.value == null ? '' : r.value;
+  btn.dataset.idx = String(idx);
+  btn.setAttribute('role', 'option');
+  btn.setAttribute('aria-selected', selected ? 'true' : 'false');
+
+  const main = document.createElement('span');
+  main.className = 'gen-opt-main';
+  const nm = document.createElement('span');
+  nm.className = 'gen-opt-name';
+  nm.textContent = r.inherit ? (r.name + (r.sub ? '（' + r.sub + '）' : '')) : r.name;
+  main.appendChild(nm);
+  if (!r.inherit && r.sub) {
+    const idEl = document.createElement('span');
+    idEl.className = 'gen-opt-id';
+    idEl.textContent = r.sub;
+    main.appendChild(idEl);
+  }
+  btn.appendChild(main);
+
+  if (r.usable === false) {
+    const bad = document.createElement('span');
+    bad.className = 'gen-opt-bad';
+    bad.textContent = '⚠ 不可用';
+    bad.title = '该模型所属提供商无法承接此生成能力,选中后调用会失败';
+    btn.appendChild(bad);
+  }
+  const ck = document.createElement('span');
+  ck.className = 'gen-opt-check';
+  ck.innerHTML = _GEN_CHECK_SVG;
+  btn.appendChild(ck);
+  return btn;
+}
+
+function _genComboRenderList(key, filter) {
+  const c = App.Settings._genCombos[key];
+  if (!c) return;
+  const f = (filter || '').trim().toLowerCase();
+  const cur = c.hidden.value || '';
+  const match = (r) => !f ||
+    (r.name + ' ' + (r.sub || '') + ' ' + (r.provider || '')).toLowerCase().includes(f);
+
+  c.list.innerHTML = '';
+  const visible = [];
+  let pending = null;   // 待渲染的分组标题
+  let shown = 0;
+
+  _genComboRows(c).forEach((r) => {
+    if (r.kind === 'group') { pending = r; return; }
+    if (!match(r)) return;
+    if (pending) {
+      const gh = document.createElement('div');
+      gh.className = 'gen-combo-group';
+      gh.innerHTML = _genEsc(pending.label) +
+        (pending.bad ? ' <span class="gen-combo-group-bad">⚠ 端点不匹配</span>' : '');
+      c.list.appendChild(gh);
+      pending = null;
+    }
+    c.list.appendChild(_genOptEl(r, visible.length, cur === r.value));
+    visible.push(r);
+    shown++;
+  });
+
+  c._visible = visible;
+  c.empty.hidden = shown > 0;
+  // 搜索时默认高亮第一项,方便直接回车
+  c.hi = (f && visible.length) ? 0 : -1;
+  _genComboHighlight(key);
+}
+
+function _genComboUpdateTrigger(key) {
+  const c = App.Settings._genCombos[key];
+  if (!c || !c.textEl) return;
+  const info = c.info || {};
+  const val = c.hidden.value || '';
+  c.textEl.classList.remove('is-inherit');
+  if (!val) {
+    const def = info.code_default || '';
+    c.textEl.textContent = '跟随默认' + (def ? '（' + def + '）' : '');
+    c.textEl.classList.add('is-inherit');
+    return;
+  }
+  const hit = (info.candidates || []).find((x) => x.id === val);
+  c.textEl.textContent = hit ? (hit.name || hit.id) : val;
+}
+
+function _genComboHighlight(key) {
+  const c = App.Settings._genCombos[key];
+  if (!c) return;
+  const els = c.list.querySelectorAll('.gen-opt');
+  Array.prototype.forEach.call(els, (el) => {
+    el.classList.toggle('hi', Number(el.dataset.idx) === c.hi);
+  });
+  const cur = els[c.hi];
+  if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: 'nearest' });
+}
+
+function _genComboPosition(key) {
+  const c = App.Settings._genCombos[key];
+  if (!c) return;
+  const r = c.trigger.getBoundingClientRect();
+  const pop = c.pop;
+  pop.style.width = Math.max(200, Math.round(r.width)) + 'px';
+  pop.style.left = Math.round(r.left) + 'px';
+  const h = pop.offsetHeight || 320;
+  let top = r.bottom + 6;
+  // 下方放不下就翻到上方
+  if (top + h > window.innerHeight - 8) top = Math.max(8, Math.round(r.top - h - 6));
+  pop.style.top = Math.round(top) + 'px';
+}
+
+function _genComboClose(key) {
+  const c = App.Settings._genCombos[key];
+  if (!c) return;
+  c.pop.hidden = true;
+  c.combo.classList.remove('open');
+  c.trigger.setAttribute('aria-expanded', 'false');
+}
+
+function _genComboCloseAll(exceptKey) {
+  Object.keys(App.Settings._genCombos).forEach((k) => {
+    if (k !== exceptKey) _genComboClose(k);
+  });
+}
+
+function _genComboOpen(key) {
+  _genComboCloseAll(key);
+  const c = App.Settings._genCombos[key];
+  if (!c) return;
+  c.pop.hidden = false;
+  c.combo.classList.add('open');
+  c.trigger.setAttribute('aria-expanded', 'true');
+  c.search.value = '';
+  _genComboRenderList(key, '');
+  _genComboPosition(key);
+  const sel = c.list.querySelector('.gen-opt.selected');
+  if (sel && sel.scrollIntoView) sel.scrollIntoView({ block: 'nearest' });
+  c.search.focus();
+}
+
+function _genComboToggle(key) {
+  const c = App.Settings._genCombos[key];
+  if (!c) return;
+  if (c.pop.hidden) _genComboOpen(key);
+  else _genComboClose(key);
+}
+
+function _genComboSelect(key, value) {
+  const c = App.Settings._genCombos[key];
+  if (!c) return;
+  c.hidden.value = value == null ? '' : value;
+  _genComboUpdateTrigger(key);
+  Array.prototype.forEach.call(c.list.querySelectorAll('.gen-opt'), (el) => {
+    const sel = (el.dataset.value || '') === c.hidden.value;
+    el.classList.toggle('selected', sel);
+    el.setAttribute('aria-selected', sel ? 'true' : 'false');
+  });
+  _genComboClose(key);
+  if (c.trigger) c.trigger.focus();
+}
+
+function _genComboKeydown(key, e) {
+  const c = App.Settings._genCombos[key];
+  if (!c) return;
+  const vis = c._visible || [];
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (!vis.length) return;
+    if (c.hi < 0) c.hi = e.key === 'ArrowDown' ? 0 : vis.length - 1;
+    else c.hi = e.key === 'ArrowDown'
+      ? Math.min(vis.length - 1, c.hi + 1)
+      : Math.max(0, c.hi - 1);
+    _genComboHighlight(key);
+    return;
+  }
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    if (c.hi >= 0 && vis[c.hi]) _genComboSelect(key, vis[c.hi].value);
+    return;
+  }
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    _genComboClose(key);
+    if (c.trigger) c.trigger.focus();
+  }
+}
+
 App.Settings.loadGenModels = async function () {
   const imgSel = document.getElementById('genImageModelSelect');
   const vidSel = document.getElementById('genVideoModelSelect');
@@ -610,79 +921,41 @@ App.Settings.loadGenModels = async function () {
   const note = document.getElementById('genEndpointNote');
   if (!imgSel || !vidSel) return;
 
-  const esc = (s) => {
-    const t = String(s == null ? '' : s);
-    return App.escapeHtml ? App.escapeHtml(t) : t.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-  };
-  // provider id -> 界面友好名:优先用后端给的 provider_name;
-  // 后端较旧(无该字段)时退回「模型设置」已缓存的 provider 名称,保证分组标题仍是人话。
-  const provLabel = (c) => {
-    if (c.provider_name) return c.provider_name;
-    const p = (App.Settings._providers || []).find((x) => x && x.id === c.provider);
-    if (p && p.name) return p.name;
-    return c.provider || '其他';
-  };
-
-  // 一条模型配置 → 来源徽章 + 按提供商分组的 optgroup + 「当前生效」值
-  const fill = (sel, info, ui) => {
+  // 一条模型配置 → 来源徽章 + 可搜索组合框 + 「当前生效」值
+  const fill = (key, info, ui) => {
     const src = (info && info.source) || 'default';
     if (ui.badge) {
       ui.badge.dataset.source = src;
       ui.badge.textContent = _GEN_SRC_TEXT[src] || src;
       ui.badge.title = '代码默认: ' + ((info && info.code_default) || '-');
     }
-    if (!info) return;
+    const c = _genComboEnsure(key);
+    if (!c || !info) return;
 
-    const cands = info.candidates || [];
-    // 首项「跟随默认」= 清除本层覆盖,回退到 .env/代码默认值;其余候选按提供商分组(optgroup)。
-    const head = '<option value="">跟随默认' + (info.code_default ? '（' + esc(info.code_default) + '）' : '') + '</option>';
-    // 同一 provider 的候选收进同一个 optgroup;组的先后顺序 = 候选原始顺序,保持稳定
-    const order = [];
-    const buckets = Object.create(null);
-    cands.forEach((c) => {
-      const g = provLabel(c);
-      if (!buckets[g]) { buckets[g] = []; order.push(g); }
-      buckets[g].push(c);
-    });
-    const body = order.map((g) => {
-      const items = buckets[g];
-      // 整组候选都发不到当前生成端点时,直接在组标题上标出来,免得选了注定失败
-      const mark = items.every((c) => c.usable === false) ? ' ⚠ 端点不匹配' : '';
-      const inner = items
-        .map((c) => '<option value="' + esc(c.id) + '" title="' + esc(c.id) + '">' + esc(c.name || c.id) + '</option>')
-        .join('');
-      return '<optgroup label="' + esc(g + mark) + '">' + inner + '</optgroup>';
-    }).join('');
-    sel.innerHTML = head + body;
+    c.info = info;
     // 有覆盖则选中覆盖值,否则停在「跟随默认」
-    sel.value = info.overridden ? (info.value || '') : '';
-    // 兜底:覆盖值若不在候选里(后端已插入「列表外」项,理论上不会命中),
-    // 补一个 option 避免选中态丢失、被误存成「跟随默认」
-    if (info.overridden && info.value && sel.value !== info.value) {
-      const og = document.createElement('optgroup');
-      og.label = '其他（当前值）';
-      const opt = document.createElement('option');
-      opt.value = info.value;
-      opt.textContent = info.value;
-      opt.title = info.value;
-      og.appendChild(opt);
-      sel.appendChild(og);
-      sel.value = info.value;
-    }
+    c.hidden.value = info.overridden ? (info.value || '') : '';
+    _genComboUpdateTrigger(key);
+    if (!c.pop.hidden) _genComboRenderList(key, c.search.value);
 
     if (ui.value) ui.value.textContent = info.value || '-';
 
-    // 当前生效值的提供商 ≠ 生成端点归属的提供商 → 请求仍打到默认端点,大概率失败
+    // 覆盖值不在候选里(用户手填/旧配置):组合框仍能显示该值,但要留个说明
+    const known = (info.candidates || []).some((x) => x.id === info.value);
     if (ui.warn) {
-      const cur = cands.find((c) => c.id === info.value);
+      const cur = (info.candidates || []).find((x) => x.id === info.value);
       const bad = !!(cur && cur.usable === false);
-      ui.warn.hidden = !bad;
+      const orphan = !!info.value && !known;
+      ui.warn.hidden = !(bad || orphan);
       if (bad) {
         ui.warn.title =
-          '「' + (cur.name || cur.id) + '」属于「' + provLabel(cur) + '」' +
+          '「' + (cur.name || cur.id) + '」所属「' + _genProvLabel(cur) + '」' +
           (cur.provider_base_url ? '（' + cur.provider_base_url + '）' : '') +
-          ',而图片/视频生成请求固定发往 ' + (App.Settings._genEndpoint || '-') +
-          ' — 调用会失败。需要按提供商路由,或改选 Agnes AI 组的模型。';
+          ' 无法承接该生成能力(端点/契约不匹配),选中后调用会失败。请改选没有 ⚠ 标记的模型。';
+      } else if (orphan) {
+        ui.warn.title =
+          '「' + info.value + '」不在当前候选列表中(可能是手填或已下线的模型),' +
+          '将按提供商解析端点;若调用失败请改选列表内的模型。';
       }
     }
   };
@@ -696,23 +969,24 @@ App.Settings.loadGenModels = async function () {
     const ep = data.gen_endpoint || {};
     App.Settings._genEndpoint = (ep.base_url || '-') + (ep.provider_name ? '（' + ep.provider_name + '）' : '');
 
-    fill(imgSel, m.image_model, {
+    fill('genImageModel', m.image_model, {
       badge: document.getElementById('genImageModelBadge'),
       value: document.getElementById('genImageModelValue'),
       warn: document.getElementById('genImageModelWarn'),
     });
-    fill(vidSel, m.video_model, {
+    fill('genVideoModel', m.video_model, {
       badge: document.getElementById('genVideoModelBadge'),
       value: document.getElementById('genVideoModelValue'),
       warn: document.getElementById('genVideoModelWarn'),
     });
     if (note) {
-      // 旧后端没有 gen_endpoint 字段,这时不写"发往 -",直接只留优先级说明
+      // 按 provider 路由后端点随模型所属提供商而变;这里只说明"回退端点"与优先级
       const epTxt = ep.base_url
-        ? '当前生成请求发往 <code>' + esc(ep.base_url) + '</code>' +
-          (ep.provider_name ? '（' + esc(ep.provider_name) + '）' : '') + ';'
+        ? '未匹配到提供商时回退到 <code>' + _genEsc(ep.base_url) + '</code>' +
+          (ep.provider_name ? '（' + _genEsc(ep.provider_name) + '）' : '') + ';'
         : '';
-      note.innerHTML = epTxt + '优先级:桌面端覆盖 &gt; .env/环境变量 &gt; 代码默认值。';
+      note.innerHTML = '请求按所选模型所属提供商自动路由到对应端点;' +
+        epTxt + '优先级:桌面端覆盖 &gt; .env/环境变量 &gt; 代码默认值。';
     }
     if (status) status.textContent = '';
   } catch (e) {
@@ -727,6 +1001,10 @@ App.Settings.loadGenModels = async function () {
     ['genImageModelWarn', 'genVideoModelWarn'].forEach((id) => {
       const w = document.getElementById(id);
       if (w) w.hidden = true;
+    });
+    ['genImageModelTriggerText', 'genVideoModelTriggerText'].forEach((id) => {
+      const t = document.getElementById(id);
+      if (t) { t.textContent = '加载失败'; t.classList.add('is-inherit'); }
     });
     if (status) status.textContent = '加载失败: ' + e.message;
   }
@@ -757,6 +1035,10 @@ App.Settings.saveGenModels = async function () {
     if (status) status.textContent = '保存失败: ' + e.message;
   }
 };
+
+// 收起生成模型下拉弹层。弹层挂在 document.body(传送门),不随设置弹窗的
+// hidden 一起消失,故关闭弹窗时需显式调用(见 renderer.js 的 .close-modal/overlay)。
+App.Settings.closeGenCombos = function () { _genComboCloseAll(); };
 
 // 绑定按钮 + 首次加载(每次打开设置弹窗时调用,见 renderer.js openSettingsModal)
 App.Settings.bindGenModels = function () {
