@@ -5,6 +5,7 @@ import asyncio
 import json
 import re
 import time
+import types
 from typing import Optional
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
@@ -12,7 +13,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.core.agent import Agent
-from app.core.llm import LLMClient, LLMError
+from app.core.llm import LLMClient, LLMError, _looks_like_gateway_error
 from app.core.telemetry import tracer
 from app.config import settings
 from app.memory.session import get_session_store
@@ -20,6 +21,14 @@ from app.tools.registry import get_registry
 from app.api.security import require_api_key
 
 router = APIRouter(prefix="/v1", tags=["chat"])
+
+# 用户显式请求取消的会话(点"停止生成")。
+# 只有显式取消才会真正 cancel 后台 agent;SSE 连接意外断开(前端超时/网络抖动/
+# 窗口重载)不再盲目取消——否则"前端中断"会把后端正在跑的任务一起杀掉,
+# 历史里就永远拿不到完整结果。
+_CANCEL_REQUESTED: set[str] = set()
+# 会话 → 正在运行的后台 agent 任务,供 /v1/chat/cancel 精确中止
+_RUNNING_TASKS: dict[str, "asyncio.Task"] = {}
 
 
 def _auth_required():
@@ -41,9 +50,21 @@ def _strip_thinking(text: str) -> str:
     """Strip thinking, tool_call, system, plan and other LLM-internal XML tags."""
     # 先剥离成对的 XML 块(thinking/tool_call/system/plan/phase 等)
     stripped = text
+    # 伪 system-reminder 回显块:模型把训练语料中的系统提醒原文当正文吐出
+    # (实测: "<system-reminder>\nPlan mode: think carefully...\n</system-reminder>"),
+    # 必须在通用单标签剥离之前整块删除,否则只删标签、块内文字漏进落库正文。
+    stripped = re.sub(r'<system[_-]reminder>[\s\S]*?</system[_-]reminder>', '', stripped, flags=re.IGNORECASE)
+    # 未闭合 system-reminder(流中断时闭合标签不来):剩余部分整体剥离
+    stripped = re.sub(r'<system[_-]reminder>[\s\S]*$', '', stripped, flags=re.IGNORECASE)
     for tag in ('thinking', 'tool_call', 'system', 'plan', 'phase', 'analysis',
                 'reflection', 'context', 'instruction', 'output', 'reasoning'):
         stripped = re.sub(r'<' + tag + r'[\s\S]*?</' + tag + r'>', '', stripped, flags=re.IGNORECASE)
+    # 中文思考标签变体:agnes 等模型用 <思考要点>/<思考过程> 包裹思考内容,
+    # 不剥离会原样进入存储与历史回放(前端只认英文 thinking 变体)
+    stripped = re.sub(r'<思考[\u4e00-\u9fa5]{0,4}>[\s\S]*?</思考[\u4e00-\u9fa5]{0,4}>', '', stripped)
+    # 未闭合思考标签(流被限流/中断杀死时闭合标签永远不来):
+    # 剩余部分整体属于思考内容,一并剥离,避免残缺思考混进正文
+    stripped = re.sub(r'<思考[\u4e00-\u9fa5]{0,4}>[\s\S]*$', '', stripped)
     # 剥离 tool_call 的特殊闭合格式
     stripped = re.sub(r'<tool_call[\s\S]*?</tool_call>', '', stripped, flags=re.IGNORECASE)
     # 通用剥离: 单标签 <tag_name> 和闭合 </tag_name>(不含空格的单单词标签,排除 HTML 常见标签)
@@ -77,6 +98,7 @@ class ChatRequest(BaseModel):
     orch_subtasks: int = Field(0, ge=0, description="编排模式(层级/共识/顺序)的子任务数或候选执行体数提示,0=自动")
     orch_candidates: list[str] = Field(default_factory=list, description="编排模式候选执行体清单(执行模式),如 ['auto','review','ensemble'];空=默认")
     project_path: str = Field("", description="当前项目路径(前端选择的工作目录,工具将以此为默认工作目录)")
+    rule_ids: list[str] = Field(default_factory=list, description="本次仅注入这些智能体规则ID(来自 /v1/rules);空=注入全部启用规则")
 
 
 def _with_attachments(req: ChatRequest, message: str) -> str:
@@ -229,6 +251,11 @@ def _build_agent(req: ChatRequest) -> Agent:
             llm = LLMClient()
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=400, detail=f"模型配置错误: {e}") from e
+    # 智能体规则:软指令拼入 system_prompt,硬规则注入 Agent(工具拦截 + 护栏)。
+    # 无启用规则时 rules_block 为空 → 传 None → 回退全局 system_prompt(行为不变)。
+    from app.api.rules import get_active_rules, get_active_instructions
+    active = get_active_rules(req.rule_ids or None)
+    rules_block = get_active_instructions(req.rule_ids or None)
     return Agent(
         llm=llm,
         registry=registry,
@@ -243,6 +270,13 @@ def _build_agent(req: ChatRequest) -> Agent:
         orch_subtasks=req.orch_subtasks,
         orch_candidates=req.orch_candidates,
         project_path=req.project_path,
+        system_prompt=(rules_block or None),
+        rule_blocked_tools=list(active.get("blocked_tools") or []),
+        rule_terms=list(active.get("blocked_terms") or []),
+        rule_paths=list(active.get("blocked_paths") or []),
+        # warn-action 规则单独传,保留"仅记录不拦截"语义(get_active_rules 已分桶)
+        rule_warn_terms=list(active.get("warn_terms") or []),
+        rule_warn_paths=list(active.get("warn_paths") or []),
     )
 
 
@@ -261,33 +295,150 @@ class ChatResumeRequest(BaseModel):
     project_path: str = Field("", description="当前项目路径")
 
 
+async def _resume_sse(req: "ChatResumeRequest", gen):
+    """把续跑的 agent 事件流转成 SSE 帧(生产者/消费者分离)。
+
+    生产者 _pump 在独立任务里消费 agent 事件:转发给队列(SSE 消费者搬运给前端)
+    并把工具/计划/正文落库。这样即使客户端断开(窗口重载、看门狗超时、用户点停止
+    后的收尾),续跑本身也不会被掐死,结果仍会写进会话历史 —— 用户刷新就能看到。
+
+    背景(2026-09-20 "人工确认后会话卡顿"):续跑原先没有任何流式下发,前端点
+    "批准"后要等整轮跑完才拿到响应,期间只有一个打字指示器,5 分钟后前端看门狗
+    abort,界面跳出红条。现在续跑每个 token/工具事件都会即时推给前端。
+    """
+    q: asyncio.Queue = asyncio.Queue(maxsize=20000)
+    full_answer: list[str] = []
+    thinking_events: list[dict] = []
+    last_saved_plan: Optional[str] = None
+    done_extra: dict = {}
+    user_cancelled = False
+    _log = __import__("logging").getLogger("chat")
+
+    def _put(evt) -> None:
+        """入队;满则丢最旧(中间增量可丢,终态由 finally 单独保证)。"""
+        try:
+            q.put_nowait(evt)
+        except asyncio.QueueFull:
+            try:
+                q.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                q.put_nowait(evt)
+            except asyncio.QueueFull:
+                pass
+
+    async def _pump() -> None:
+        nonlocal user_cancelled
+        try:
+            async for evt in gen:
+                if not isinstance(evt, dict):
+                    continue
+                et = evt.get("type", "")
+                if et in ("done", "cancelled"):
+                    # 终态不直接下发:统一在 finally 里发一次,避免 done 重复
+                    for k, v in evt.items():
+                        if v is not None:
+                            done_extra[k] = v
+                    continue
+                if et == "token":
+                    full_answer.append(evt.get("content", ""))
+                elif et == "answer_reset":
+                    # 限流重试/reflect 重写:之前的残段作废,否则落库成"残段+全文"
+                    full_answer.clear()
+                    thinking_events.clear()
+                elif et == "thinking":
+                    thinking_events.append(evt)
+                elif et == "tool":
+                    try:
+                        await _store().add_message(
+                            req.session_id, "tool",
+                            content=json.dumps({
+                                "name": evt.get("name", ""),
+                                "arguments": evt.get("arguments", ""),
+                                "result": str(evt.get("result", "") or "")[:2000],
+                            }, ensure_ascii=False),
+                        )
+                    except Exception:
+                        pass
+                elif et == "plan":
+                    try:
+                        plan_json = json.dumps(evt.get("plan"), ensure_ascii=False)
+                        if plan_json and plan_json != last_saved_plan:
+                            last_saved_plan = plan_json
+                            await _store().add_message(req.session_id, "plan", content=plan_json)
+                    except Exception:
+                        pass
+                _put(evt)
+        except asyncio.CancelledError:
+            # 用户点"停止生成":不发 done,由 finally 落库已产出的部分并通知前端
+            user_cancelled = True
+            _put({"type": "cancelled", "reason": "user_cancelled"})
+            raise
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("[resume_sse] error: %s", exc)
+            _put({"type": "error", "message": _friendly_llm_error(str(exc))})
+        finally:
+            # 正文只落一次(interrupted 时不落:本轮没有最终答案,等下次续跑);
+            # 用户主动取消时也不落 —— 半截答案落库会变成条"以残段结尾"的正式回答
+            answer_text = _strip_thinking("".join(full_answer))
+            if (answer_text.strip() and not user_cancelled
+                    and not done_extra.get("interrupt")
+                    and not _looks_like_gateway_error(answer_text)):
+                try:
+                    meta = {}
+                    _pair_re = re.compile(r'<思考[\u4e00-\u9fa5]{0,4}>([\s\S]*?)</思考[\u4e00-\u9fa5]{0,4}>')
+                    _texts = [e.get("content", "") for e in thinking_events if e.get("content")]
+                    for _m in _pair_re.finditer(answer_text):
+                        if _m.group(1).strip():
+                            _texts.append(_m.group(1).strip())
+                    if _texts:
+                        meta["thinking"] = "\n\n".join(_texts)
+                    await _store().add_message(
+                        req.session_id, "assistant",
+                        content=_strip_thinking(answer_text), meta=meta or None,
+                    )
+                except Exception:
+                    pass
+            _put({"type": "done", "run_id": req.run_id, **done_extra})
+            _put(None)
+            _RUNNING_TASKS.pop(req.session_id, None)
+            _log.info("[resume_sse] done session=%s run=%s", req.session_id, req.run_id[:8])
+
+    pump_task = asyncio.create_task(_pump())
+    _RUNNING_TASKS[req.session_id] = pump_task
+    _log.info("[resume_sse] start session=%s run=%s", req.session_id, req.run_id[:8])
+    tracer.record({"type": "sse_start", "session_id": req.session_id, "resume": req.run_id})
+    try:
+        while True:
+            try:
+                event = await asyncio.wait_for(q.get(), timeout=30)
+            except asyncio.TimeoutError:
+                # 长工具/长思考期间保持连接活跃(与 /v1/chat/stream 一致)
+                yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
+                continue
+            if event is None:
+                break
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+    finally:
+        tracer.record({"type": "sse_end", "session_id": req.session_id})
+
+
 @router.post("/chat/resume")
 async def chat_resume(req: ChatResumeRequest):
     """从中断处恢复一次运行(interrupt 式确认流批准后继续执行)。
 
-    支持非流式和流式两种返回模式。
+    stream=True 时返回 SSE:续跑过程中的 token/thinking/tool/plan/confirmation
+    逐条实时下发。agent 跑在独立后台任务里,客户端断开(窗口重载/看门狗超时)
+    不会杀掉它,结果照常落库,用户刷新即可看到 —— 与 /v1/chat/stream 语义一致。
+    stream=False 时保持旧的一次性 JSON 返回。
     """
     agent = _build_agent(ChatRequest(message=" ", session_id=req.session_id, project_path=req.project_path))
     try:
         gen = await agent.resume(req.run_id, resume_value=req.resume_value, stream=req.stream)
-        import types
         if isinstance(gen, types.AsyncGeneratorType):
-            async def event_gen():
-                async for item in gen:
-                    if isinstance(item, dict) and item.get("type") in (
-                        "token", "thinking", "tool", "plan", "confirmation", "done", "tool_call_start"
-                    ):
-                        yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
-                    elif hasattr(item, "answer"):
-                        r = item
-                        if r.interrupted:
-                            yield f"data: {json.dumps({'type': 'done', 'interrupted': True, 'interrupt': r.interrupt}, ensure_ascii=False)}\n\n"
-                        else:
-                            for ch in r.answer:
-                                yield f"data: {json.dumps({'type': 'token', 'content': ch}, ensure_ascii=False)}\n\n"
-                            yield f"data: {json.dumps({'type': 'done', 'model': r.model, 'steps': r.steps, 'run_id': req.run_id}, ensure_ascii=False)}\n\n"
             return StreamingResponse(
-                event_gen(),
+                _resume_sse(req, gen),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
             )
@@ -300,6 +451,11 @@ async def chat_resume(req: ChatResumeRequest):
         raise HTTPException(status_code=500, detail=str(e)) from e
 
     if not result.interrupted:
+        # 逐 step 落"过程消息"(工具/计划),正文只落一次。
+        # 旧实现的 assistant 写入在循环体内 —— 一个 N 步的运行会把**同一段 answer
+        # 重复落库 N 次**(2026-09-20 截图里成排重复气泡的直接原因:
+        #  run c0939734 steps = 11×tool + 1×answer = 12,而库里在同一位置出现了
+        #  11 条 tool + 12 条内容完全相同的 assistant 消息)。
         for step in result.steps:
             if step.get("type") == "tool":
                 await _store().add_message(
@@ -316,7 +472,18 @@ async def chat_resume(req: ChatResumeRequest):
                     "plan",
                     content=json.dumps(step.get("plan"), ensure_ascii=False),
                 )
-            await _store().add_message(req.session_id, "assistant", content=_strip_thinking(result.answer))
+        answer_text = _strip_thinking(result.answer or "")
+        # 网关把自己的校验文案当正文回包时,它不是答案,不能落库
+        # (机制见 app/core/llm.py 文件头"网关校验错误被当正文回包")
+        if not answer_text.strip():
+            pass
+        elif _looks_like_gateway_error(answer_text):
+            import logging as _lg
+            _lg.getLogger(__name__).warning(
+                "[chat_resume] 丢弃网关诊断文案,不落库 assistant 消息: %r", answer_text[:120],
+            )
+        else:
+            await _store().add_message(req.session_id, "assistant", content=answer_text)
 
     resp = {
         "answer": result.answer,
@@ -334,6 +501,8 @@ async def chat_resume(req: ChatResumeRequest):
 async def chat_stream(req: ChatRequest) -> StreamingResponse:
     import logging as _log
     _log.getLogger("chat").info("chat_stream project_path=%s session=%s", req.project_path, req.session_id)
+    # 新一轮开始:清掉上一轮遗留的取消标记,避免误杀本次任务
+    _CANCEL_REQUESTED.discard(req.session_id)
     agent = _build_agent(req)
     history = []
     if req.use_history:
@@ -355,6 +524,11 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
         _done_model = ""
         _done_steps: list[dict] = []
         _was_cancelled = False
+        # agent 的 done 事件被 finally 重建,必须把 interrupt/error/finish_reason/run_id
+        # 一并保留下来:否则前端拿不到 run_id,确认卡片只能靠轮询渲染,
+        # 而轮询路径不记录 run_id → 点"批准"后无法续跑(表现为"弹窗后没下文")。
+        _done_extra: dict = {}
+        _last_saved_plan: Optional[str] = None  # plan 去重:仅内容变化时入库
 
         def _fire_save(sid: str, msg_id: str, content: str):
             """fire-and-forget: 后台更新消息内容。"""
@@ -425,6 +599,11 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                         _done_steps = event.get("steps", [])
                         if event.get("type") == "cancelled":
                             _was_cancelled = True
+                        # 保留终态附加字段(interrupt/run_id/error/finish_reason),
+                        # finally 重建 done 时不能丢:interrupt 缺失会让确认卡片无法续跑。
+                        for _k in ("interrupt", "error", "finish_reason", "run_id"):
+                            if event.get(_k) is not None:
+                                _done_extra[_k] = event.get(_k)
                         continue
                     try:
                         await _send_to_queue(event)
@@ -444,6 +623,9 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 # 队列满时先清空再发送,确保 done 不丢失
                 _evt_type = "cancelled" if _was_cancelled else "done"
                 _done_evt = {"type": _evt_type, "model": _done_model, "steps": list(_done_steps)}
+                # 回填 agent 原 done 事件的附加字段(interrupt/run_id/error/finish_reason)
+                if _done_extra:
+                    _done_evt.update(_done_extra)
                 if q.full():
                     _log.getLogger("chat").warning("[bg_agent] queue full on done, draining")
                     while not q.empty():
@@ -479,6 +661,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
 
             # 启动独立后台 agent 任务(不绑定 SSE 连接生命周期)
             agent_task = asyncio.create_task(_bg_agent_run())
+            _RUNNING_TASKS[req.session_id] = agent_task
             # 后台心跳:agent 执行期间每 30 秒向队列写入心跳,防止代理/Nginx read timeout 断连
             heartbeat_task = asyncio.create_task(_heartbeat_loop())
 
@@ -520,11 +703,50 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                             except Exception:
                                 pass
                         asyncio.create_task(_create_msg())
+                elif evt_type == "answer_reset":
+                    # agent 限流重试/reflect 重写:本轮内容将从头重新生成,
+                    # 之前累积的 token 属于被丢弃的残段,必须清空,
+                    # 否则落库内容 = 残段 + 重发全文(重复拼接,历史也被污染)。
+                    full_answer.clear()
+                    thinking_events.clear()
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                elif evt_type == "status":
+                    # 过程状态提示(如"模型限流,正在重试"),仅透传给前端展示
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 elif evt_type == "thinking":
                     thinking_events.append(event)
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 elif evt_type == "guardrail_overwrite":
                     guardrail_overwrite = event
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                elif evt_type == "tool":
+                    # 持久化工具步骤。此前流式路径从未保存 role=tool 消息,
+                    # 历史回放时全部工具调用消失(仅非流式/resume 路径有保存)。
+                    # result 截断存储,避免大结果撑爆会话记录。
+                    try:
+                        await _store().add_message(
+                            req.session_id, "tool",
+                            content=json.dumps({
+                                "name": event.get("name", ""),
+                                "arguments": event.get("arguments", ""),
+                                "result": str(event.get("result", "") or "")[:2000],
+                            }, ensure_ascii=False),
+                        )
+                    except Exception:
+                        pass
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                elif evt_type == "plan":
+                    # 持久化计划:仅内容变化时保存(_flush_plan 每个执行步骤都会推送,
+                    # 不去重会产生大量近重复的 plan 消息,历史里出现成排重复步骤)
+                    try:
+                        plan_json = json.dumps(event.get("plan"), ensure_ascii=False)
+                        if plan_json and plan_json != _last_saved_plan:
+                            _last_saved_plan = plan_json
+                            await _store().add_message(
+                                req.session_id, "plan", content=plan_json,
+                            )
+                    except Exception:
+                        pass
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 else:
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
@@ -546,27 +768,49 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                     await heartbeat_task
                 except asyncio.CancelledError:
                     pass
-            # 客户端主动断开(用户停止/关闭/切会话)且 agent 仍在跑:取消后台任务,
-            # 避免"用户以为停了、后端还在烧 LLM 配额把整图跑完"的中断失效。
-            # 若是 agent 自然结束(已 done),此处 no-op,不影响"断连后台存库"的既有设计。
+            # 客户端断开且 agent 仍在跑:只有用户**显式**点过"停止生成"才取消后台任务。
+            # 单纯断连(前端超时/网络抖动/重载窗口)保持运行,让 agent 跑完并把结果落库
+            # ——前端可从历史/兜底补全拿回完整结果(见 chat.js _recoverFromServer)。
             if agent_task is not None and not agent_task.done():
                 import logging as _lg2
-                _lg2.getLogger(__name__).info("[sse_consumer] client disconnected, cancelling background agent_task session=%s", req.session_id)
-                agent_task.cancel()
-                try:
-                    await agent_task
-                except asyncio.CancelledError:
-                    pass
+                _lg = _lg2.getLogger(__name__)
+                if req.session_id in _CANCEL_REQUESTED:
+                    _lg.info("[sse_consumer] user cancelled, stopping agent session=%s", req.session_id)
+                    agent_task.cancel()
+                    try:
+                        await agent_task
+                    except asyncio.CancelledError:
+                        pass
+                else:
+                    _lg.info("[sse_consumer] client disconnected but agent keeps running (no explicit cancel) session=%s", req.session_id)
+            _RUNNING_TASKS.pop(req.session_id, None)
             # 最终保存 assistant 回复
             answer_to_store = "".join(full_answer)
             if guardrail_overwrite is not None:
                 answer_to_store = guardrail_overwrite.get("content", "")
             if answer_to_store:
                 meta = {}
-                if thinking_events:
-                    thinking_texts = [e.get("content", "") for e in thinking_events if e.get("content")]
-                    if thinking_texts:
-                        meta["thinking"] = "\n".join(thinking_texts)
+                # 过滤 prepare 阶段的状态行("准备中: 模型 xxx")——是进度提示不是思考内容
+                thinking_texts = [e.get("content", "") for e in thinking_events
+                                  if e.get("content") and e.get("phase") != "prepare"]
+                # 中文思考标签:agnes 等模型的思考不走向 thinking 事件,而是随 token 流
+                # 以 <思考要点>...</思考要点> 混在答案里。提取进 meta.thinking,
+                # 历史回放才能还原思考区(否则 meta 里只有一条"准备中: 模型 xxx")。
+                _pair_re = re.compile(r'<思考[\u4e00-\u9fa5]{0,4}>([\s\S]*?)</思考[\u4e00-\u9fa5]{0,4}>')
+                for _m in _pair_re.finditer(answer_to_store):
+                    _t = _m.group(1).strip()
+                    if _t:
+                        thinking_texts.append(_t)
+                # 未闭合标签兜底:流被限流/中断杀死时 </思考要点> 永远不会到来,
+                # 成对正则匹配不到 → 思考内容全部丢失("思考内容没了"的根因之一)。
+                # 把成对块摘掉后,若还剩孤立的 <思考...> 开标签,其后的剩余部分整体视为思考。
+                _rest = _pair_re.sub('', answer_to_store)
+                _m2 = re.search(r'<思考[\u4e00-\u9fa5]{0,4}>([\s\S]*)$', _rest)
+                if _m2 and _m2.group(1).strip():
+                    thinking_texts.append(_m2.group(1).strip())
+                if thinking_texts:
+                    # 双换行连接:各思考块是独立段落,单换行在 Markdown 里不换段
+                    meta["thinking"] = "\n\n".join(thinking_texts)
                 if guardrail_overwrite is not None:
                     meta["guardrail"] = guardrail_overwrite
                 final_content = _strip_thinking(answer_to_store)
@@ -589,6 +833,24 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+@router.post("/chat/cancel")
+async def cancel_chat(payload: dict = Body(default=None)):
+    """用户显式"停止生成":标记取消并中止后台 agent 任务。
+
+    与"客户端断连"严格区分:断连(前端超时/网络抖动/重载窗口)不再取消,
+    agent 继续跑完并把结果落库,前端可从历史或兜底补全拿回完整结果;
+    只有显式调用本接口才真正中断,避免白烧 LLM 配额。
+    """
+    sid = str((payload or {}).get("session_id") or "default")
+    _CANCEL_REQUESTED.add(sid)
+    task = _RUNNING_TASKS.get(sid)
+    cancelled = False
+    if task is not None and not task.done():
+        task.cancel()
+        cancelled = True
+    return {"success": True, "cancelled": cancelled, "session_id": sid}
 
 
 @router.post("/stream")
@@ -817,6 +1079,14 @@ async def vision(
                          "请切换支持视觉的模型(如 qwen-vl、gpt-4o)后再试。",
                 "model": llm.info.get("model", ""),
             }
+        answer = (answer or "").strip()
+        if not answer:
+            return {
+                "answer": "",
+                "error": f"模型 {llm.info.get('model', '')} 返回了空内容,未能识别图片。"
+                         "请确认该模型支持视觉(如 qwen-vl、gpt-4o),或换一张清晰的图片后重试。",
+                "model": llm.info.get("model", ""),
+            }
         return {"answer": answer, "model": llm.info["model"], "session_id": session_id}
     except LLMError as e:
         msg = str(e)
@@ -898,6 +1168,12 @@ _PROVIDER_DEFAULT_MODELS: dict[str, list[dict]] = {
         {"id": "agnes-2.5-flash", "name": "Agnes 2.5 Flash", "speed": "very_fast", "quality": "good"},
         {"id": "agnes-2.5-pro", "name": "Agnes 2.5 Pro", "speed": "medium", "quality": "excellent"},
         {"id": "agnes-2.5-pro-alpha", "name": "Agnes 2.5 Pro Alpha", "speed": "medium", "quality": "outstanding"},
+        # 生成模型:与对话模型同属一套列表,用 capabilities 标记用途,
+        # 「设置 → 生成模型」直接从这里选,不再手填字符串。
+        {"id": "agnes-image-2.0-flash", "name": "Agnes 图像 2.0 Flash", "speed": "fast", "quality": "excellent",
+         "capabilities": ["image"]},
+        {"id": "agnes-video-v2.0", "name": "Agnes 视频 2.0", "speed": "slow", "quality": "excellent",
+         "capabilities": ["video"]},
     ],
     "ollama": [],
 }
@@ -932,17 +1208,22 @@ async def list_models(provider: str | None = None) -> dict:
             default = entry.get("default_model") or entry.get("model") or ""
             return {"provider": provider, "configured": True, "default": default, "models": models}
         if provider in _PROVIDER_DEFAULT_MODELS:
-            models = list(_PROVIDER_DEFAULT_MODELS[provider])
+            # 过滤掉带 capabilities 的生成模型(图片/视频专用),主模型选择器只该选对话模型,
+            # 否则用户能把 agnes-image/video 选成对话模型,一调用就报错。
+            models = [m for m in _PROVIDER_DEFAULT_MODELS[provider] if not m.get("capabilities")]
             # 合并"内置厂商扩展模型"(用户在设置页追加,无需改代码)
             from app.core.provider_registry import list_builtin_ext_models
 
             for ext in list_builtin_ext_models(provider):
+                if ext.get("capabilities"):
+                    continue  # 同样是生成专用模型,不进对话模型列表
                 models.append({
                     "id": ext.get("id"),
                     "name": ext.get("name") or ext.get("id"),
                     "speed": "",
                     "quality": "",
                     "context": ext.get("context"),
+                    "capabilities": list(ext.get("capabilities") or []),
                 })
             # 检查是否配置了 API key
             configured = False

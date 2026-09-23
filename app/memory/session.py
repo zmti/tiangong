@@ -20,6 +20,26 @@ from app.core.storage_backend import StorageBackend, get_storage_backend
 # _DB_LOCK 已移除,由 storage backend 内部保证线程安全
 
 
+_gateway_noise_checker = None
+
+
+def _is_gateway_noise(text: str) -> bool:
+    """这条历史内容是不是"网关校验文案被当正文回包"留下的噪音。
+
+    判定真源唯一在 app.core.llm._looks_like_gateway_error(全等匹配,不会误判
+    正常回答里对这句话的引用)。**惰性导入**是刻意的:记忆层不该在导入期把
+    core.llm 那一串依赖(openai SDK / telemetry)拉进来,也不制造反向依赖。
+    """
+    global _gateway_noise_checker
+    if _gateway_noise_checker is None:
+        try:
+            from app.core.llm import _looks_like_gateway_error
+            _gateway_noise_checker = _looks_like_gateway_error
+        except Exception:  # noqa: BLE001 — 清洗是增强项,拿不到判定函数就退化为不过滤
+            _gateway_noise_checker = lambda _t: False  # noqa: E731
+    return bool(_gateway_noise_checker(text or ""))
+
+
 def sanitize_history_for_llm(history: list[dict]) -> list[dict]:
     """把会话历史清洗成 LLM 安全消息(供记忆摘要/检索等非主链调用方使用)。
 
@@ -34,7 +54,15 @@ def sanitize_history_for_llm(history: list[dict]) -> list[dict]:
         if not isinstance(m, dict):
             continue
         role = m.get("role", "")
-        content = m.get("content", "") or m.get("kind", "")
+        # 修复: 旧写法 `m.get("content") or m.get("kind")` 会把空正文消息的
+        # kind 字面值("text")当成正文,产生 content='text' 的垃圾消息回喂给模型,
+        # 并在 giveup 详情里显示"最后尝试: text"。
+        # kind 是消息类型标记(text/tool/...),绝不是内容,绝不参与兜底。
+        raw_content = m.get("content")
+        if isinstance(raw_content, dict):
+            # tool 类消息的 content 可能是 dict(arguments/result 合并存储)
+            raw_content = raw_content.get("content") or raw_content.get("result") or ""
+        content = str(raw_content or "")
         # 带 tool_calls 的 assistant 消息即使正文为空也保留,
         # 否则丢失工具调用上下文,后续 tool_call_id 配对的 tool 消息无法被 LLM 理解。
         if not str(content).strip() and not m.get("tool_calls"):
@@ -252,6 +280,14 @@ class SessionStore:
         async with self._lock:
             session = self._read_session(session_id, tid)
             messages = list(session["messages"])
+            # 读侧清洗:滤掉"网关诊断文案被当答案落库"的历史噪音(见 _is_gateway_noise)。
+            # 只删 role=assistant 且内容与之全等的那种;DB 本身不动,原始记录
+            # 仍在数据表里可查(需要取证时直接读 sqlite),这里只是不再回放给
+            # 界面和模型上下文 —— 同时避免它继续污染后续每一轮的请求。
+            messages = [
+                m for m in messages
+                if not (str(m.get("role")) == "assistant" and _is_gateway_noise(m.get("content") or ""))
+            ]
             if last_n is not None:
                 messages = messages[-last_n:]
             return messages

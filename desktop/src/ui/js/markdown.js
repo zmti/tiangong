@@ -94,6 +94,73 @@
     }).join('\n');
   }
 
+  /* ── 未闭合围栏救援(2026-09-20 "内容嵌套格式样式"修复) ──
+   * 现象:模型常把"正文/计划"塞进一个 ``` 围栏里(如 ```text)却忘了写闭合 ```,
+   * 于是围栏之后的所有内容(##、**、反引号等 markdown 语法)被整体丢进代码块,
+   * 用户看到的是一整墙"原始 markdown + 语法高亮"的看不懂的代码。
+   * 处理:若围栏未闭合,判断围栏体到底是"代码"还是"正文/markdown":
+   *   ① 完全没有代码特征(无缩进/运算符/关键字,且以中文散文为主)→ 视为误开栏,
+   *      直接丢弃该围栏标记,整段按 markdown 渲染;
+   *   ② 前段有代码特征、后段(空行 + markdown 结构行,且中文占比够高)是正文
+   *      → 在分界处补一个闭合 ```,前段留代码块、后段按 markdown 渲染;
+   *   ③ 看起来就是代码(流式写代码中的常态)→ 原样不动,交给正常路径。
+   */
+  const MD_STRUCT_RE = /^\s{0,3}(?:#{1,6}\s|[-*+]\s|\d{1,3}[.)、]\s|>\s|\*\*)/;
+
+  function hasCjk(s) { return /[\u4e00-\u9fff]/.test(s); }
+
+  function cjkRatio(s) {
+    const m = s.match(/[\u4e00-\u9fff]/g);
+    return s.length ? (m ? m.length : 0) / s.length : 0;
+  }
+
+  // 是否具备"代码特征":缩进行,或运算符/关键字/标签(含中文的行一律不算,散文优先)
+  function hasCodeSignal(lines) {
+    return lines.some((l) => {
+      const t = l.trim();
+      if (!t || hasCjk(t)) return false;
+      if (/^\s{2,}\S/.test(l)) return true;
+      return /[=;{}]|->|=>|\bdef\b|\bclass\b|\bimport\b|\breturn\b|\bconst\b|\bfunction\b|<\/?[a-z][\w-]*>/.test(t);
+    });
+  }
+
+  // 返回:0=整段是正文(围栏误开) / n>0=从 n 起是正文 / -1=整段当代码
+  function findFenceRescue(body) {
+    const head = body.slice(0, 8); // 开头若干行是否已有代码特征
+    if (!hasCodeSignal(head)) return 0;
+    for (let i = 1; i < body.length; i++) {
+      if (body[i - 1].trim() !== '') continue; // 只在空行后找分界
+      let j = i;
+      while (j < body.length && !body[j].trim()) j++;
+      if (j >= body.length) break;
+      if (!MD_STRUCT_RE.test(body[j])) continue;
+      const rest = body.slice(j);
+      if (rest.filter((l) => MD_STRUCT_RE.test(l)).length < 2) continue;
+      if (cjkRatio(rest.join('\n')) < 0.2) continue; // 尾段几乎无中文 → 更像代码
+      return i;
+    }
+    return -1;
+  }
+
+  function autoCloseStrayFence(text) {
+    const lines = text.split('\n');
+    let open = -1;
+    for (let i = 0; i < lines.length; i++) {
+      if (!lines[i].startsWith('```')) continue;
+      open = open < 0 ? i : -1;
+    }
+    if (open < 0) return text; // 成对 → 不动
+    const body = lines.slice(open + 1);
+    const split = findFenceRescue(body);
+    if (split < 0) return text;
+    if (split === 0) return lines.slice(0, open).concat(body).join('\n'); // 丢弃误开的围栏行
+    const out = lines.slice(0, open + 1).concat(body.slice(0, split));
+    out.push('```');
+    const tail = body.slice(split).join('\n');
+    if (tail.trim()) out.push('', tail);
+    return out.join('\n');
+  }
+
   // highlight.js 入口（优先使用）
   function hljsHighlight(lang, code) {
     const H = window.hljs;
@@ -117,11 +184,21 @@ function renderMarkdown(md) {
     if (!md) return '';
     const text = String(md);
     if (!text.trim()) return '';
-    if (text === _mdCacheKey) { console.log('[renderMarkdown] cache hit, len:', text.length); return _mdCacheHtml; }
-    console.log('[renderMarkdown] start, len:', text.length, 'preview:', text.slice(0, 100));
+    // 日志全部走 App.DEBUG 门控(默认关):流式渲染每帧都会调用本函数,
+    // 常开会把控制台刷爆。排查时执行 App.setDebug(true) 即可恢复。
+    if (text === _mdCacheKey) {
+      if (window.App && App.DEBUG) console.log('[renderMarkdown] cache hit, len:', text.length);
+      return _mdCacheHtml;
+    }
+    if (window.App && App.DEBUG) console.log('[renderMarkdown] start, len:', text.length, 'preview:', text.slice(0, 100));
     try {
     // 严格剥离thinking标签(多行、贪婪匹配)
-    let cleaned = text.replace(/<thinking[\s\S]*?<\/thinking>/gi, '').trim();
+    // 兼容模型私有变体:<thinking>/<ant:thinking>/<antThinking>/<|thinking|> 等,
+    // 变体不被识别时整段思考原文会随答案一起渲染(历史回放无流式过滤,必须在这里兜底)。
+    let cleaned = text
+      .replace(/<(?:\|)?\/?(?:\|)?(?:[a-zA-Z][\w.:-]*)?thinking[\w.:-]*(?:\|)?[^>]*>[\s\S]*?<(?:\|)?\/?(?:\|)?(?:[a-zA-Z][\w.:-]*)?thinking[\w.:-]*(?:\|)?[^>]*>/gi, '')
+      .replace(/<(?:\|)?\/?(?:\|)?(?:[a-zA-Z][\w.:-]*)?thinking[\w.:-]*(?:\|)?[^>]*>/gi, '')
+      .trim();
     // 也剥离无对应关闭标签的残留 open/close tag
     cleaned = cleaned.replace(/<thinking[^>]*>/gi, '').replace(/<\/thinking>/gi, '').trim();
     // 剥离 LLM 内部 XML 标签块(不渲染)
@@ -153,28 +230,71 @@ function renderMarkdown(md) {
     cleaned = cleaned.replace(/\n{3,}/g, '\n\n').trim();
     // 展开 LLM 压缩表格: ||分隔的行展开为独立行(如 | A | B ||| C | D | → 两行)
     cleaned = cleaned.replace(/\|\|(\s*\|)/g, '\n|$1');
+    // 行中标题拆分: "……结论。##解题思路" → 标题独占一行。
+    // LLM 偶尔把标题直接接在句号后(换行丢失),不拆则 ## 永远混在段落正文中。
+    // 仅在 CJK 句读标点后触发,避免误伤英文/代码场景;# 后接字母数字(如 "#1")不算标题。
+    cleaned = cleaned.replace(/([。！？；])(\s*)(#{1,6}(?:\s|[^\s#a-zA-Z0-9]))/g, '$1\n$2$3');
+    // 未闭合围栏救援:见 autoCloseStrayFence 注释(必须在拆行前处理,它只会补/删围栏行)
+    cleaned = autoCloseStrayFence(cleaned);
     const lines = cleaned.replace(/\r\n/g, '\n').split('\n');
     let html = '';
     let inCode = false;
     let codeLang = '';
     let codeBuf = [];
-    let listBuf = [];
-    let listType = 'ul';
+    let listBuf = [];   // [{ indent, ordered, num, text }] —— 由 flushList 组装成嵌套列表
+
+    /* 列表渲染(2026-09-20 "内容嵌套格式样式"修复):
+     * 旧实现把 "1. xxx" 与其下缩进的 "- yyy" 全部平铺进同一个 <ul>,
+     * 且后出现的 "- " 会把整个列表的 listType 改成 ul(有序号丢失) —— 嵌套层级全丢,
+     * 观感是"子项和父项一样平"。这里按缩进递归建树:
+     *   缩进更深 → 作为上一项的嵌套子列表;同级但标记类型变了 → 另起一个列表。 */
+    function buildList(items, start) {
+      const indent = items[start].indent;
+      const ordered = items[start].ordered;
+      const nodes = [];
+      let i = start;
+      while (i < items.length) {
+        const it = items[i];
+        if (it.indent < indent) break;
+        if (it.indent === indent && it.ordered !== ordered) break;
+        if (it.indent > indent) break; // 防御:不该出现
+        const node = { text: it.text, kids: [] };
+        i++;
+        while (i < items.length && items[i].indent > indent) {
+          const sub = buildList(items, i);
+          node.kids.push(sub.html);
+          i = sub.next;
+        }
+        nodes.push(node);
+      }
+      const tag = ordered ? 'ol' : 'ul';
+      const startAttr = (ordered && items[start].num > 1) ? ` start="${items[start].num}"` : '';
+      let h = `<${tag}${startAttr}>`;
+      for (const n of nodes) {
+        h += `<li>${renderInline(n.text)}${n.kids.join('')}</li>`;
+      }
+      h += `</${tag}>`;
+      return { html: h, next: i };
+    }
 
     function flushList() {
       if (!listBuf.length) return;
-      html += `<${listType}>`;
-      for (const item of listBuf) {
-        try {
-          if (typeof item === 'string') html += `<li>${renderInline(item)}</li>`;
-          else html += `<li>${escapeHtml(String(item))}</li>`;
-        } catch (e) {
-          console.warn('[flushList] item error:', e.message);
-          html += `<li>${escapeHtml(String(item || ''))}</li>`;
-        }
-      }
-      html += `</${listType}>`;
+      const items = listBuf;
       listBuf = [];
+      try {
+        let html2 = '';
+        let i = 0;
+        while (i < items.length) {
+          const r = buildList(items, i);
+          html2 += r.html;
+          i = r.next > i ? r.next : i + 1;
+        }
+        html += html2;
+      } catch (e) {
+        console.warn('[flushList] nested build error:', e.message);
+        const tag = items[0] && items[0].ordered ? 'ol' : 'ul';
+        html += `<${tag}>` + items.map((it) => `<li>${renderInline(it.text || '')}</li>`).join('') + `</${tag}>`;
+      }
     }
 
     function flushCodeBlock() {
@@ -198,13 +318,18 @@ function renderMarkdown(md) {
 
     function flushPara() {
       if (!paraBuf.length) return;
-      const text = paraBuf.join(' ');
+      // LLM 输出普遍用"单个换行"分隔块级元素(标题/列表前后无空行)。
+      // 旧实现 join(' ') 把连续行硬合并成一个巨型段落 → "##标题""1.列表"全部挤进正文,
+      // 观感为一整坨密集文字。改为 join('\n')(renderInline 会把 \n 转为 <br>),
+      // 使单换行保留为视觉换行;真正的块级结构仍由下方各分支(标题/列表)接管。
+      const text = paraBuf.join('\n');
       paraBuf = [];
       html += `<p>${renderInline(text)}</p>`;
     }
 
     while (i < lines.length) {
       const line = lines[i].replace(/\s+$/, '');
+      try { // 单行隔离:任何一行渲染异常只降级该行,绝不让整篇答案退化为"原始文本墙"
       if (line.startsWith('```')) {
         flushPara(); flushList();
         if (!inCode) {
@@ -221,18 +346,40 @@ function renderMarkdown(md) {
       }
       if (inCode) { codeBuf.push(line); i++; continue; }
 
-      if (/^\s{0,3}#{1,6}\s/.test(line)) {
+      // 标题解析(容错增强):
+      // ① 崩溃修复: 旧实现 line.match(/^#{1,6}/) 在带缩进标题(如 "  ### 标题")时返回 null,
+      //    随后 [0].length 抛 TypeError → 整篇 markdown 渲染失败,降级为"原始文本墙"
+      //    (字面 ###/##/反引号/** 全部漏出 —— 实时输出"一大坨看不懂"的主要成因)。
+      // ② LLM 容错: 标题被 ** 包裹("**## 标题**")或 # 后漏空格("###标题")时同样按标题渲染。
+      let hLine = line;
+      // ③ "**## 标题**：正文..." 加粗包裹标题且后跟内容:拆成 <hN>标题</hN> + <p>正文</p>
+      //    (旧逻辑只处理整行恰好是 "**## 标题**" 的情况,带尾随内容时 ## 字面漏出)
+      const bmh = hLine.match(/^\s*\*\*(#{1,6})\s*([^*]+?)\s*\*\*([\s\S]*)$/);
+      if (bmh) {
         flushPara(); flushList();
-        const level = line.match(/^#{1,6}/)[0].length;
-        html += `<h${level}>${renderInline(line.replace(/^#{1,6}\s+/, ''))}</h${level}>`;
+        html += `<h${bmh[1].length}>${renderInline(bmh[2])}</h${bmh[1].length}>`;
+        const rest = bmh[3].replace(/^[\s:：]+/, '');
+        if (rest) html += `<p>${renderInline(rest)}</p>`;
+        i++;
+        continue;
+      }
+      const boldWrap = hLine.match(/^\s*\*\*(.+?)\*\*\s*:?\s*$/);
+      if (boldWrap && /^\s{0,3}#{1,6}/.test(boldWrap[1])) hLine = boldWrap[1];
+      const mh = hLine.match(/^\s{0,3}(#{1,6})(?:\s+|[^\s#a-zA-Z0-9])/);
+      if (mh) {
+        flushPara(); flushList();
+        html += `<h${mh[1].length}>${renderInline(hLine.replace(/^\s{0,3}#{1,6}\s*/, ''))}</h${mh[1].length}>`;
       } else if (/^\s*[-*+]\s+/.test(line)) {
         flushPara();
-        listType = 'ul';
-        listBuf.push(line.replace(/^\s*[-*+]\s+/, ''));
-      } else if (/^\s*\d+[.)]\s+/.test(line)) {
+        const indent = (line.match(/^\s*/) || [''])[0].replace(/\t/g, '    ').length;
+        listBuf.push({ indent, ordered: false, num: 0, text: line.replace(/^\s*[-*+]\s+/, '') });
+      } else if (/^\s*\d{1,3}[.)、]\s*(?!\d)/.test(line)) {
+        // LLM 容错: 中文列表常写 "1.先分三类"(点后无空格) 或 "1、xxx",同样按有序列表渲染;
+        // (?!\d) 排除 "3.14 是 pi" 这类小数/版本号被误判为列表
         flushPara();
-        listType = 'ol';
-        listBuf.push(line.replace(/^\s*\d+[.)]\s+/, ''));
+        const indent = (line.match(/^\s*/) || [''])[0].replace(/\t/g, '    ').length;
+        const num = parseInt(line.replace(/^\s*(\d{1,3})[.)、].*$/, '$1'), 10);
+        listBuf.push({ indent, ordered: true, num: isNaN(num) ? 0 : num, text: line.replace(/^\s*\d{1,3}[.)、]\s*/, '') });
       } else if (/^\s*>\s?/.test(line)) {
         flushPara(); flushList();
         html += `<blockquote>${renderInline(line.replace(/^\s*>\s?/, ''))}</blockquote>`;
@@ -277,10 +424,17 @@ function renderMarkdown(md) {
         paraBuf.push(line);
       }
       i++;
+      } catch (lineErr) {
+        console.error('[renderMarkdown] line isolated (render skipped for this line):',
+          lineErr && lineErr.message, '| line_preview:', line.slice(0, 120));
+        paraBuf = []; listBuf = [];
+        html += '<p>' + escapeHtml(line) + '</p>';
+        i++;
+      }
     }
     flushPara(); flushList();
     if (inCode) flushCodeBlock();
-    console.log('[renderMarkdown] done, html_len:', html.length, 'html_preview:', html.slice(0, 200));
+    if (window.App && App.DEBUG) console.log('[renderMarkdown] done, html_len:', html.length, 'html_preview:', html.slice(0, 200));
     _mdCacheKey = text;
     _mdCacheHtml = html;
     return html;

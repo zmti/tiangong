@@ -52,8 +52,8 @@ async def list_tools():
     """
     registry = get_registry()
     tools = []
-    
-    for tool in registry.list(enabled_only=True):
+
+    async for tool in registry.list(enabled_only=True):
         tool_info = {
             "name": tool.name,
             "description": tool.description,
@@ -154,7 +154,7 @@ async def batch_call_tools(calls: list[dict]):
 async def mcp_health():
     """MCP 服务健康检查。"""
     registry = get_registry()
-    tools = registry.list(enabled_only=True)
+    tools = registry.list_sync(enabled_only=True)
     
     return {
         "status": "ok",

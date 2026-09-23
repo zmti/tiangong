@@ -245,24 +245,92 @@ def _run_checks(checks, text: str) -> GuardrailReport:
     return report
 
 
-def run_input_guardrails(text: str, enabled: Optional[bool] = None) -> GuardrailReport:
-    """输入护栏:进入主循环前校验用户消息(同步校验器)。"""
+def _make_term_checker(terms: list[str], name: str):
+    """构造"禁用词"护栏闭包:任一 term 子串命中即拦截。"""
+    terms = [t for t in (terms or []) if t and t.strip()]
+
+    def check(text: str) -> GuardrailResult:
+        if not terms:
+            return GuardrailResult(name=name, ok=True)
+        low = (text or "").lower()
+        hit = [t for t in terms if t.lower() in low]
+        if hit:
+            return GuardrailResult(name=name, ok=False,
+                                   reason=f"命中用户禁用词 {hit[:5]}")
+        return GuardrailResult(name=name, ok=True)
+
+    check.__name__ = name
+    return check
+
+
+def _make_path_checker(paths: list[str], name: str):
+    """构造"禁用路径"护栏闭包:任一 path 子串命中即拦截。"""
+    paths = [p for p in (paths or []) if p and p.strip()]
+
+    def check(text: str) -> GuardrailResult:
+        if not paths:
+            return GuardrailResult(name=name, ok=True)
+        t = text or ""
+        hit = [p for p in paths if p in t]
+        if hit:
+            return GuardrailResult(name=name, ok=False,
+                                   reason=f"试图访问用户禁用路径 {hit[:5]}")
+        return GuardrailResult(name=name, ok=True)
+
+    check.__name__ = name
+    return check
+
+
+def run_input_guardrails(text: str, enabled: Optional[bool] = None, *,
+                         user_terms: Optional[list[str]] = None,
+                         user_paths: Optional[list[str]] = None,
+                         user_terms_action: str = "block") -> GuardrailReport:
+    """输入护栏:进入主循环前校验用户消息(同步校验器)。
+
+    可选 user_terms/user_paths:用户自定义硬规则(来自 /v1/rules)。不传则 checks
+    与现状完全一致(无规则=行为不变)。user_terms_action="warn" 时命中只记录不拦截。
+    """
     if enabled is None:
         enabled = settings.agent_guardrails_enabled
     if not enabled or not text:
         return GuardrailReport()
     checks: list[InputChecker] = [check_injection, check_sensitive_paths]
-    return _run_checks(checks, text)
+    if user_terms:
+        checks.append(_make_term_checker(user_terms, "user_term_block"))
+    if user_paths:
+        checks.append(_make_path_checker(user_paths, "user_path_block"))
+    report = _run_checks(checks, text)
+    # warn 模式:命中禁用词只记录(violation)但不置 blocked
+    if user_terms and user_terms_action == "warn":
+        for v in report.violations:
+            if v.name == "user_term_block":
+                v.reason = f"[仅记录] 命中用户禁用词(未拦截): {v.reason}"
+        report.blocked = any(v.name != "user_term_block" for v in report.violations)
+    return report
 
 
-def run_output_guardrails(text: str, enabled: Optional[bool] = None) -> GuardrailReport:
-    """输出护栏:返回最终答案前校验(同步校验器)。"""
+def run_output_guardrails(text: str, enabled: Optional[bool] = None, *,
+                          user_terms: Optional[list[str]] = None,
+                          user_paths: Optional[list[str]] = None,
+                          user_terms_action: str = "block") -> GuardrailReport:
+    """输出护栏:返回最终答案前校验(同步校验器)。
+
+    可选 user_terms:用户自定义禁用词(输出侧)。不传则 checks 与现状完全一致。
+    """
     if enabled is None:
         enabled = settings.agent_guardrails_enabled
     if not enabled or not text:
         return GuardrailReport()
     checks: list[OutputChecker] = [check_leaked_secrets, check_instruction_leak]
-    return _run_checks(checks, text)
+    if user_terms:
+        checks.append(_make_term_checker(user_terms, "user_term_block"))
+    report = _run_checks(checks, text)
+    if user_terms and user_terms_action == "warn":
+        for v in report.violations:
+            if v.name == "user_term_block":
+                v.reason = f"[仅记录] 输出命中用户禁用词(未拦截): {v.reason}"
+        report.blocked = any(v.name != "user_term_block" for v in report.violations)
+    return report
 
 
 async def run_input_guardrails_async(text: str, enabled: Optional[bool] = None) -> GuardrailReport:

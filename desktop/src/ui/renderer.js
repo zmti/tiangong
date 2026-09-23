@@ -192,6 +192,18 @@
     if (App.Settings && App.Settings.renderProviderAdmin) {
       App.Settings.renderProviderAdmin();
     }
+    // 渲染智能体规则(每次打开刷新数据,并绑定「新建规则集」按钮监听器)
+    if (App.Settings && App.Settings.loadRules) {
+      App.Settings.loadRules();
+    }
+    // 渲染生成模型配置(图片/视频):每次打开刷新,并绑定保存/重新加载按钮
+    if (App.Settings && App.Settings.bindGenModels) {
+      App.Settings.bindGenModels();
+    }
+    // 渲染技能列表(每次打开刷新数据)
+    if (App.Settings && App.Settings.loadSkills) {
+      App.Settings.loadSkills();
+    }
     // 初始化设置导航
     initSettingsNav();
   }

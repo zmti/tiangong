@@ -81,7 +81,34 @@ async def create_task(req: TaskCreateRequest) -> dict:
             "detail": "任务将按 cron 定期触发(可在 /v1/tasks/{id}/events 订阅每次运行)",
         }
 
-    asyncio.create_task(mgr.start(rec.task_id))
+    # 修复: 旧实现 fire-and-forget 的 create_task 无 done_callback —— 若 mgr.start
+    # 因 LLM 配置错误/并发上限等原因抛异常,异常被静默吞掉
+    # ("Task exception was never retrieved"),API 却已返回 200 + task_id,
+    # 用户订阅事件流永远收不到 task_done → 表现为"后台任务会话中断"。
+    # 现在: 加 done_callback 收割异常,并向任务队列补投 error + task_done 收尾,
+    # 保证 SSE 订阅者一定能终止。
+    import logging as _logging
+    start_task = asyncio.create_task(mgr.start(rec.task_id))
+
+    def _on_start_done(t: "asyncio.Task") -> None:
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            _logging.getLogger("tasks").warning(
+                "后台任务启动失败 task=%s: %s", rec.task_id, exc)
+
+            async def _post_mortem():
+                r = mgr.get(rec.task_id)
+                status = r.status if r and r.status in ("failed", "cancelled") else "failed"
+                err = (r.error if r and r.error else str(exc))[:300]
+                await mgr._emit(rec.task_id, {"type": "error", "message": err})  # noqa: SLF001
+                await mgr._emit(rec.task_id, {"type": "task_done", "task_id": rec.task_id,
+                                               "status": status, "answer": ""})  # noqa: SLF001
+
+            asyncio.ensure_future(_post_mortem())
+
+    start_task.add_done_callback(_on_start_done)
     return {"task_id": rec.task_id, "status": rec.status, "session_id": req.session_id}
 
 

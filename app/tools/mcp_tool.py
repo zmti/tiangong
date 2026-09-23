@@ -129,7 +129,7 @@ def unregister_mcp_tools(registry: Optional[ToolRegistry] = None) -> int:
     if registry is None:
         registry = get_registry()
     
-    mcp_tools = [t for t in registry.list(enabled_only=False) if t.name.startswith("mcp_")]
+    mcp_tools = [t for t in registry.list_sync(enabled_only=False) if t.name.startswith("mcp_")]
     
     for tool in mcp_tools:
         registry.unregister(tool.name)

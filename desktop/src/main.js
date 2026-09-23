@@ -349,7 +349,9 @@ function createWindow() {
   // 聊天 UI 优先;UI 不存在时退回加载后端页面
   const uiPath = path.join(__dirname, 'ui', 'index.html');
   if (fs.existsSync(uiPath)) {
-    mainWindow.loadFile(uiPath);
+    // 通过 query 同步传入后端地址:渲染进程在 IPC 返回前就能拿到 App.backendUrl,
+    // 避免首屏渲染历史消息时用空值拼相对路径(/images /videos → file:///... 加载失败)
+    mainWindow.loadFile(uiPath, { query: { backend: BACKEND_URL } });
   } else {
     mainWindow.loadURL(`${BACKEND_URL}/`);
   }

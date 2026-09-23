@@ -13,10 +13,24 @@ from app.tools.registry import tool
 
 
 def _safe_root(root: str) -> str:
-    """校验并解析搜索根目录,防越界。"""
-    if not root or root.strip() in ("~", "."):
+    """校验并解析搜索根目录,防越界。
+
+    空或 "." = 当前项目工作目录(resolve_cwd: 前端选中的项目 > 后端 cwd);
+    显式 "~" = 用户主目录(保留浏览整机的用法,但不再作为默认值)。
+    """
+    r = (root or "").strip()
+    if not r or r == ".":
+        return resolve_cwd()
+    if r == "~":
         return os.path.expanduser("~")
-    root = os.path.abspath(os.path.expanduser(root))
+    # 相对子目录(如 "app"、"src")必须相对**选中项目**解析,而不是后端进程 cwd,
+    # 否则选了 MES-System 却去 E:\dev\TianGong\app 找,工具"没按选择项目来"。
+    base = resolve_cwd()
+    root = (
+        os.path.abspath(os.path.expanduser(r))
+        if os.path.isabs(r)
+        else os.path.abspath(os.path.join(base, os.path.expanduser(r)))
+    )
     if not os.path.isdir(root):
         raise ValueError(f"目录不存在: {root}")
     return root
@@ -38,9 +52,14 @@ def _allowed_write_roots() -> list[str]:
 
 
 def _resolve_write_path(path: str) -> str:
-    """解析写入路径并校验在可写白名单内(防越界写系统文件)。"""
+    """解析写入路径并校验在可写白名单内(防越界写系统文件)。
+
+    两处都必须 abspath 规范化:白名单比较是字符串前缀匹配,
+    resolve_cwd() 若带回正斜杠/尾斜杠(前端 JS 传值),拼接结果会与
+    规范化后的 root 前缀对不上,把"项目目录内的相对路径"误判为越界。
+    """
     if not os.path.isabs(path):
-        full = os.path.join(resolve_cwd(), path)
+        full = os.path.abspath(os.path.join(resolve_cwd(), path))
     else:
         full = os.path.abspath(os.path.expanduser(path))
     for root in _allowed_write_roots():
@@ -54,12 +73,12 @@ def _resolve_write_path(path: str) -> str:
 
 @tool(
     "search_files",
-    "在本地电脑上按文件名(支持 * 通配)或文件内容搜索文件,返回匹配文件路径列表。适合找用户电脑上的文件",
+    "按文件名(支持 * 通配)或文件内容搜索文件,返回匹配文件路径列表。默认在当前项目工作目录内搜索(前端选择的项目);需要全盘找用户文件时可显式传 root='~'",
     timeout=30,
 )
 def search_files(
     query: str = Field(description="搜索关键词(文件名通配如 *.pdf,或内容关键词)"),
-    root: str = Field("~", description="搜索根目录,默认用户主目录"),
+    root: str = Field("", description="搜索根目录,留空=当前项目工作目录(默认,推荐);传 '~' 表示用户主目录"),
     search_content: bool = Field(False, description="True 时在文本文件内容中搜索,否则仅按文件名匹配"),
     max_results: int = Field(30, description="最大返回条数"),
 ) -> str:
@@ -101,11 +120,11 @@ def search_files(
 
 @tool(
     "list_directory",
-    "列出本地目录的内容(文件和子目录),默认用户主目录。用于浏览用户电脑上的文件",
+    "列出目录的内容(文件和子目录)。默认列出当前项目工作目录(前端选择的项目),查看项目结构直接调用即可;需要浏览用户电脑其他位置时显式传 path",
     timeout=20,
 )
 def list_directory(
-    path: str = Field("~", description="要列出的目录路径,默认用户主目录"),
+    path: str = Field("", description="要列出的目录路径,留空=当前项目工作目录(默认,推荐);传 '~' 表示用户主目录"),
     max_items: int = Field(100, description="最大返回条数"),
 ) -> str:
     root = _safe_root(path)
@@ -343,7 +362,12 @@ def edit_file(
 def file_history(
     path: str = Field(description="要查询历史版本的本地文件路径"),
 ) -> str:
-    full = os.path.abspath(os.path.expanduser(path))
+    from app.tools.project_context import resolve_cwd
+    full = (
+        os.path.abspath(os.path.expanduser(path))
+        if os.path.isabs(path)
+        else os.path.abspath(os.path.join(resolve_cwd(), path))
+    )
     from app.core.file_versions import file_version_store
 
     versions = file_version_store.list_versions(full)

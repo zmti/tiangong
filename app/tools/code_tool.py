@@ -5,6 +5,8 @@ Python / JS / TS / Go / Rust / Java / C / C++ / Swift / Kotlin / C# / Zig / V / 
 """
 from __future__ import annotations
 
+import ast
+
 from pydantic import Field
 
 from app.tools.code_sandbox import run_code_sandboxed
@@ -31,12 +33,106 @@ SUPPORTED_LANGUAGES = [
     "shell", "bash", "zsh", "fish",
 ]
 
+# 「代码被输出上限截断」的 SyntaxError 特征。
+# 典型现场(2026-09-23):模型在 run_code 里写一段调 API 的 Python,
+# 输出 token 触顶后流被切断,网关把 JSON 补齐成"合法"参数,于是残缺代码
+# 一路送进沙箱 → `SyntaxError: unterminated string literal (detected at line 4)`。
+# 这种错误模型修不好(它看到的代码就是残的),只会原地重试到 3 连败 giveup。
+# 这里在**执行前**识别它,直接回一条可操作的指引。
+_TRUNCATION_MARKS = (
+    "unterminated string literal",
+    "unterminated triple-quoted",
+    "unterminated f-string",
+    "was never closed",
+    "unexpected eof",
+    "unexpected end of",
+    "eof in multi-line",
+    "incomplete input",
+)
+
+_TRUNCATION_HINT = (
+    "代码看起来没有传完整(大概率是生成到输出长度上限被截断),本次**未执行**。\n"
+    "请改用下面任一方式,不要原样重试:\n"
+    "1. 用 write_file 把代码写成 .py 文件(可分多次追加:先写前半段,再 append 后半段),"
+    "然后用 run_terminal 执行 `python 文件.py`;\n"
+    "2. 把代码拆成几个短片段分别 run_code;\n"
+    "3. 精简代码:去掉长注释/长字符串常量/不必要的 import,控制单次代码在 100 行以内。"
+)
+
+
+def _python_truncation(code: str) -> tuple[bool, str]:
+    """用 ast 预解析 Python 代码,返回 (是否疑似被截断, 证据文本)。"""
+    try:
+        ast.parse(code)
+    except SyntaxError as e:
+        msg = (e.msg or "").lower()
+        if any(m in msg for m in _TRUNCATION_MARKS):
+            where = f"第 {e.lineno} 行" if e.lineno else "文件末尾"
+            return True, f"{where}: {e.msg}"
+        return False, ""
+    except ValueError as e:
+        # 源码内含空字节等 → 同样是传输出了问题
+        return True, f"代码含非法字符: {e}"
+    return False, ""
+
+
+def _bracket_truncation(code: str) -> tuple[bool, str]:
+    """非 Python 语言的轻量检查:括号/引号明显不闭合时判定为被截断。
+
+    只做保守判断——成对计数不平衡且不是写在字符串注释里的常规写法。
+    宁可漏报(交给沙箱报真错),也不要误杀能跑的代码。
+    """
+    pairs = {")": "(", "]": "[", "}": "{"}
+    stack: list[str] = []
+    quote: str = ""
+    i = 0
+    n = len(code)
+    while i < n:
+        ch = code[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in "\"'`":
+            quote = ch
+        elif ch in "([{":
+            stack.append(ch)
+        elif ch in ")]}":
+            if not stack or stack[-1] != pairs[ch]:
+                return True, f"第 {code.count(chr(10), 0, i) + 1} 行出现不匹配的 '{ch}'"
+            stack.pop()
+        i += 1
+    if quote:
+        return True, f"{quote} 引号未闭合"
+    if stack:
+        return True, f"{len(stack)} 个括号未闭合('{stack[-1]}' 缺少收尾)"
+    return False, ""
+
+
+def _check_intact(code: str, language: str) -> tuple[bool, str]:
+    """执行前检查代码是否完整。返回 (是否被截断, 证据)。"""
+    lang = (language or "python").strip().lower()
+    if not code or not code.strip():
+        return False, ""
+    if lang in ("python", "py", "python3"):
+        return _python_truncation(code)
+    if lang in ("javascript", "js", "typescript", "ts", "java", "go", "c", "cpp", "c++",
+                "csharp", "c#", "cs", "php", "rust", "kotlin", "swift", "dart"):
+        return _bracket_truncation(code)
+    return False, ""
+
 
 @tool(
     "run_code",
     f"在安全沙箱中执行代码并返回运行结果。支持 {len(SUPPORTED_LANGUAGES)} 种语言: "
     + ", ".join(SUPPORTED_LANGUAGES[:10])
-    + f"... 可用于计算、数据分析、算法验证、代码调试。",
+    + f"... 可用于计算、数据分析、算法验证、代码调试。"
+    "注意:单次代码请控制在 100 行以内;更长的代码请改用 write_file 写成文件(可分段追加),"
+    "再用 run_terminal 执行,否则容易在生成时被输出长度上限截断。",
     timeout=60,
 )
 def run_code(
@@ -46,5 +142,23 @@ def run_code(
     use_docker: bool | None = Field(None, description="是否强制使用 Docker 沙箱,默认自动检测"),
 ) -> str:
     timeout = max(1, min(timeout, 60))
+
+    # 完整性预检:代码被截断时不执行,直接回可操作的指引。
+    # 否则沙箱只会抛 SyntaxError: unterminated string literal,模型看不出
+    # "是自己的输出被截断",只会拿同一段残代码反复重试。
+    truncated, evidence = _check_intact(code, language)
+    if truncated:
+        return {
+            "success": False,
+            "output": (
+                f"⚠️ 代码疑似不完整,已跳过执行 —— {evidence}\n\n{_TRUNCATION_HINT}"
+            ),
+            "returncode": -1,
+            "mode": "precheck",
+            "duration_s": 0.0,
+            "truncated": True,
+            "error": f"代码被截断: {evidence}",
+        }
+
     result = run_code_sandboxed(code, timeout=timeout, use_docker=use_docker, language=language)
     return result.to_dict()

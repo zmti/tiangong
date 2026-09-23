@@ -69,7 +69,7 @@ class PluginRegistry:
         """加载内置插件(从 app/tools/ 中自动注册)。"""
         from app.tools.registry import get_registry
         registry = get_registry()
-        for tool in registry.list(enabled_only=False):
+        for tool in registry.list_sync(enabled_only=False):
             schema = tool.to_openai_schema()
             existing = self._plugins.get(tool.name)
             if existing is None:

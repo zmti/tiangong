@@ -4,20 +4,50 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sqlite3
 import time
 from contextlib import asynccontextmanager
+from typing import Optional
 
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from app.api import attachments, chat, documents, project, files, mcp, mcp_server, runs, schedule, tasks, telemetry, tools, tts, user_profile, budget, advanced, analytics, assistants, plugins, safety, persistent_memory, planning, search, metrics, sessions, long_running, tenants, system, collaboration, reasoning, memory_cleanup, cross_session, collaboration_ui, artifacts, workflow, multimodal
+from app.api import attachments, chat, documents, project, files, mcp, mcp_server, runs, schedule, tasks, telemetry, tools, tts, user_profile, budget, advanced, analytics, assistants, plugins, safety, persistent_memory, planning, search, metrics, sessions, long_running, tenants, system, collaboration, reasoning, memory_cleanup, cross_session, collaboration_ui, artifacts, workflow, multimodal, rules, config_models
 from app.api.security import require_api_key, require_admin
 from app.config import settings, APP_VERSION
 from app.tools.registry import get_registry
 from app.api.chat import list_models
 
 logger = logging.getLogger(__name__)
+
+
+def _setup_file_logging():
+    """桌面端(Electron 拉起 uvicorn)时 stdout 只进主进程控制台,不可回查。
+    追加一个文件 handler,把 WARNING+ 日志(含异常 traceback)落到 data/logs/backend.log,
+    便于事后定位"LLM 流式调用失败: (空)"这类没有落库细节的错误。"""
+    try:
+        log_dir = os.path.join(settings.resolved_data_dir, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        fh = logging.FileHandler(os.path.join(log_dir, "backend.log"), encoding="utf-8")
+        fh.setLevel(logging.WARNING)
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+        root = logging.getLogger()
+        root.setLevel(logging.WARNING)
+        root.addHandler(fh)
+        # uvicorn 启动时会用 logging.config.dictConfig(..., disable_existing_loggers=True)
+        # 把已经创建好的 app.* logger 置为 disabled,导致 logger.exception 到不了 root handler
+        # (表现为 backend.log 始终为空)。这里显式重新启用并恢复向上传播。
+        for name in list(logging.root.manager.loggerDict):
+            if name.startswith("app."):
+                lg = logging.getLogger(name)
+                lg.disabled = False
+                lg.propagate = True
+        # 启动标记: 既验证文件日志链路可用,也可据此确认进程加载的是哪份代码
+        logger.warning("文件日志已启用 -> %s (pid=%s)", os.path.join(log_dir, "backend.log"), os.getpid())
+    except Exception as e:  # noqa: BLE001
+        logger.warning("文件日志初始化失败(不影响主服务): %s", e)
 
 
 # ===== 初始化函数定义 =====
@@ -258,12 +288,54 @@ def _stop_memory_ttl():
 
 # ===== 统一初始化入口 =====
 
+def _sweep_orphan_runs(db_path: Optional[str] = None):
+    """启动清扫:把上一个进程遗留的 running 孤儿(后端崩溃/重启时被遗弃的 run)
+    标记为 interrupted,避免前端恢复时读到 running 永远 loading。
+
+    仅清扫 updated_at 早于本次启动的 run —— 启动时后端刚拉起,不可能有正在进行的
+    run,因此全部 running 都是上一进程的孤儿,安全改写。
+
+    Args:
+        db_path: 测试可注入临时库;生产留空则使用 settings.resolved_data_dir 下的
+            checkpoints.db。
+    """
+    try:
+        if not db_path:
+            from app.config import settings as _s
+            db_path = os.path.join(getattr(_s, "resolved_data_dir", ""), "checkpoints.db")
+        if not db_path or not os.path.exists(db_path):
+            return
+        con = sqlite3.connect(db_path, timeout=10)
+        try:
+            now = time.time()
+            # 主表:status 列 + state JSON 顶层 status 同步改写,并记录清扫标记
+            cur = con.execute(
+                "UPDATE checkpoints SET "
+                "status='interrupted', updated_at=?, "
+                "state=json_set(json_set(state,'$.status','interrupted'),"
+                "'$.metadata.swept_by_startup',1) "
+                "WHERE status='running' AND updated_at < ?",
+                (now, now - 5.0),
+            )
+            n = cur.rowcount
+            con.commit()
+            if n:
+                logger.warning(
+                    "启动清扫:将 %d 个遗留 running run 标记为 interrupted(后端重启孤儿)", n
+                )
+        finally:
+            con.close()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("启动清扫失败(不影响启动): %s", e)
+
+
 async def _startup():
     """应用启动时统一初始化所有组件"""
     # 同步初始化
     _init_registry()
     _check_embedding_backend()
     _check_multimodal_features()
+    _sweep_orphan_runs()  # 必须在其他组件之前:清扫上一进程崩溃遗留的 running 孤儿
     _init_scheduler()
     _init_webhook_queue()
     _init_session_archiver()
@@ -302,6 +374,7 @@ async def _shutdown():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _setup_file_logging()
     await _startup()
     yield
     await _shutdown()
@@ -345,6 +418,7 @@ app.include_router(documents.router, dependencies=_auth)
 app.include_router(mcp.router, dependencies=_auth)
 app.include_router(mcp_server.router, dependencies=_auth)
 app.include_router(tts.router, dependencies=_auth)
+app.include_router(config_models.router, dependencies=_auth)  # 生成模型配置(读写)
 app.include_router(telemetry.router, dependencies=_auth)
 app.include_router(runs.router, dependencies=_auth)
 app.include_router(tasks.router, dependencies=_auth)
@@ -373,6 +447,7 @@ app.include_router(memory_cleanup.router, dependencies=_auth)
 app.include_router(cross_session.router, dependencies=_auth)
 app.include_router(collaboration_ui.router, dependencies=_auth)
 app.include_router(artifacts.router, dependencies=_auth)  # Artifacts 实时渲染预览
+app.include_router(rules.router, dependencies=_auth)  # 智能体规则
 
 # 本地生成图片的静态目录(data/images),供聊天与历史直接展示
 _images_dir = os.path.join(settings.resolved_data_dir, "images")
@@ -442,7 +517,7 @@ async def root() -> dict:
             "documents": ["/v1/documents/upload", "/v1/documents/stats", "/v1/documents/all"],
             "mcp": ["/mcp/", "/mcp/tools", "/mcp/tools/{name}/call", "/mcp/tools/batch", "/mcp/health"],
         },
-        "tools_count": len(get_registry().list(enabled_only=True)),
+        "tools_count": len(get_registry().list_sync(enabled_only=True)),
     }
 
 
@@ -474,7 +549,14 @@ async def health() -> dict:
 
     # 2. 数据库连通性(Sessions + Checkpoints + Tasks)
     db_status = {}
-    _VALID_TABLE_NAMES = {"sessions", "checkpoints", "tasks", "memory"}
+    _VALID_TABLE_NAMES = {"sessions", "checkpoints", "tasks", "memories", "memory"}
+    # 各库的实际表名:memory.db 建表名为 memories(旧版可能为 memory),逐个候选尝试
+    _TABLE_CANDIDATES = {
+        "sessions": ("sessions",),
+        "checkpoints": ("checkpoints",),
+        "tasks": ("tasks",),
+        "memory": ("memories", "memory"),
+    }
     for db_name, db_path in [
         ("sessions", _os.path.join(settings.resolved_data_dir, "sessions.db")),
         ("checkpoints", _os.path.join(settings.resolved_data_dir, "checkpoints.db")),
@@ -484,12 +566,19 @@ async def health() -> dict:
         try:
             if _os.path.isfile(db_path):
                 with _sqlite3.connect(db_path) as conn:
-                    table_name = "checkpoints" if db_name == "checkpoints" else db_name
-                    if table_name not in _VALID_TABLE_NAMES:
-                        db_status[db_name] = {"connected": False, "error": "非法表名"}
-                        continue
-                    rows = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
-                    count = rows[0] if rows else 0
+                    count = None
+                    last_err = None
+                    for table_name in _TABLE_CANDIDATES.get(db_name, (db_name,)):
+                        if table_name not in _VALID_TABLE_NAMES:
+                            continue
+                        try:
+                            rows = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()
+                            count = rows[0] if rows else 0
+                            break
+                        except Exception as te:  # noqa: BLE001  该候选表不存在,试下一个
+                            last_err = te
+                    if count is None:
+                        raise last_err or RuntimeError("无可用表")
                 db_status[db_name] = {"connected": True, "records": count}
             else:
                 db_status[db_name] = {"connected": True, "records": 0, "note": "未创建(首次写入时自动建表)"}
@@ -502,8 +591,10 @@ async def health() -> dict:
     data_dir = _Path(settings.resolved_data_dir)
     try:
         total_size = sum(f.stat().st_size for f in data_dir.rglob("*") if f.is_file())
-        disk_total = _os.statvfs(settings.resolved_data_dir).f_frsize * _os.statvfs(settings.resolved_data_dir).f_blocks
-        disk_free = _os.statvfs(settings.resolved_data_dir).f_frsize * _os.statvfs(settings.resolved_data_dir).f_bavail
+        # 用 shutil.disk_usage:os.statvfs 在 Windows 上不存在,原实现在此平台必然抛错
+        import shutil as _shutil
+        _usage = _shutil.disk_usage(settings.resolved_data_dir)
+        disk_total, disk_free = _usage.total, _usage.free
         status["disk"] = {
             "data_dir_size_mb": round(total_size / 1024 / 1024, 2),
             "disk_total_gb": round(disk_total / 1024 / 1024 / 1024, 2),

@@ -85,7 +85,7 @@ App.Session.restoreLast = async function (ids) {
 /* 格式化时间显示 */
 App.Session.formatTime = function (ts) {
   if (!ts) return '';
-  const d = new Date(ts * 1000);
+  const d = new Date(App.toMs ? App.toMs(ts) : ts * 1000);
   const now = new Date();
   const sameDay = d.toDateString() === now.toDateString();
   const pad = (n) => String(n).padStart(2, '0');
@@ -331,11 +331,37 @@ App.Session.renderCards = async function () {
         App.Session.enterRename(sorted.find(s => s.id === item.dataset.id), item);
       });
     });
+    // 记录本次列表缓存:供 refreshIfNeeded 判断"当前会话是否已在列表里"
+    // (原本只有遗留的 renderList 会写 _listCards,renderCards 不写 → 缓存永远是 null)
+    App.Session._listCache = { ids: sorted.map(s => s.id), ts: Date.now() };
   } catch (err) {
     listEl.innerHTML = '<div class="session-error">加载失败</div>';
     console.error('[Session] renderCards failed:', err);
   }
   App.Session._rendering = false;
+};
+
+/* 强制刷新会话列表(清缓存 + 重新拉取渲染)。
+   切换会话 / 新建会话 / 删除会话后必须调用,否则侧边栏的"当前会话"高亮与
+   列表内容都是旧的(表现为:切了会话但侧边栏高亮不变、新会话不出现在列表)。 */
+App.Session.refreshList = async function () {
+  if (!App.Session.renderCards) return;
+  App.Session._listCache = { ids: null, ts: 0 };
+  await App.Session.renderCards();
+};
+
+/* 按需刷新:仅当"当前会话不在列表缓存里"时才真正拉取。
+   典型场景:新建会话在发出第一条消息前后端没有记录(列表里没有它),
+   消息落库后需要补进去;而普通会话继续聊天不该每轮都多打一次列表请求。 */
+App.Session.refreshIfNeeded = async function () {
+  const ids = App.Session._listCache && App.Session._listCache.ids;
+  if (!ids || !ids.length) {
+    await App.Session.refreshList();
+    return;
+  }
+  if (App.sessionId && ids.indexOf(App.sessionId) === -1) {
+    await App.Session.refreshList();
+  }
 };
 
 /* 进入重命名模式 */
@@ -449,6 +475,9 @@ App.Session.newSession = async function () {
   App.els.sessionLabel.textContent = '新会话';
   App.els.messages.innerHTML = '';
   // 显示聊天视图，隐藏会话列表
+  // 刷新侧边栏:同步"当前会话"高亮(新会话此刻后端还没记录,需等第一条消息
+  // 落库后由 refreshIfNeeded 补进列表,见 chat.js 流结束的 finally)
+  if (App.Session.refreshList) await App.Session.refreshList();
   App.els.input.focus();
   if (App.refreshWelcomePage) App.refreshWelcomePage();
   if (App.Attach) App.Attach.reset();
@@ -497,14 +526,94 @@ App.Session.select = async function (id) {
     App._sessionLoadStep = 15;
     App._sessionLoadingMore = false;
 
-    function msgText(m) { return m.content || m.kind || ''; }
+    // 修复: 不能用 m.kind 兜底——kind 是消息类型标记(值为 'text'),
+    // 空正文消息会把字面 'text' 渲染到气泡里。空正文交给空回复占位逻辑处理。
+    function msgText(m) {
+      const c = m.content;
+      if (typeof c === 'string') return c;
+      if (c && typeof c === 'object') return String(c.content || c.result || '');
+      return '';
+    }
 
-    // 渲染一组消息为 DOM 元素数组
-    function buildMsgElements(msgs) {
+    // 库里 timestamp 是"秒级"Unix 时间戳(1789821286.59),直接 new Date(ts)
+    // 会得到 1970 年;统一走 App.toMs 做单位归一化。
+    function msgTimeText(ts) {
+      const ms = App.toMs ? App.toMs(ts) : 0;
+      const d = new Date(ms || Date.now());
+      return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+    }
+
+    // 按"轮"切分历史:一轮 = 从一条 user 消息开始,到下一 user 消息之前结束。
+    // 关键原因:库里工具消息(role='tool')通常排在**本轮 assistant 消息之前**
+    // (生成过程中先落库工具调用,最后才写入 assistant)。若按固定条数切片,
+    // 工具行会在其所属 assistant 卡片存在之前就被渲染 → 落单到顶层,
+    // 退化成无序号圈/无缩进/不可折叠的扁平节点(观感:"历史里工具行样式不对")。
+    // 因此分页单位改为"整轮",并在渲染时把工具行缓冲到本轮 assistant 卡片。
+    const roundStarts = [];
+    for (let i = 0; i < allMessages.length; i++) {
+      if (allMessages[i].role === 'user') roundStarts.push(i);
+    }
+    if (!roundStarts.length || roundStarts[0] !== 0) roundStarts.unshift(0);
+
+    // 取 <= idx 的最后一个轮起点
+    function roundStart(idx) {
+      let s = 0;
+      for (const r of roundStarts) { if (r <= idx) s = r; else break; }
+      return s;
+    }
+    // 取 < idx 的上一个轮起点(用于向上滚动加载上一轮)
+    function prevRoundStart(idx) {
+      let s = 0;
+      for (const r of roundStarts) { if (r < idx) s = r; else break; }
+      return s;
+    }
+
+    // 渲染一组消息为 DOM 元素数组;baseIdx = 该批消息在 allMessages 中的起始下标,
+    // 用于给每个顶层节点打 data-idx,支撑滚动时的 DOM 上限裁剪(保留最新、推进加载游标)。
+    function buildMsgElements(msgs, baseIdx) {
       const frags = [];
       let lastPlanContent = '';
-      for (const m of msgs) {
+      let currentStepsFlow = null; // 当前 assistant 卡片的步骤容器,工具步骤嵌套于此
+      const pendingTools = []; // 尚未归属的工具步骤(其 assistant 卡片还没渲染到)
+      let _curAbsIdx = 0; // 当前正在处理的消息的绝对下标(供工具宿主卡打标)
+      // 给顶层消息节点打 data-idx 并压入 frags
+      const pushIdx = (el) => { el.dataset.idx = String(_curAbsIdx); frags.push(el); return el; };
+
+      // 把缓冲的工具步骤灌进目标 steps-flow;target 为空时建独立 bot 卡片承载,
+      // 保证 step-row 的序号圈/缩进/可折叠样式与实时路径一致。
+      function flushPendingTools(target) {
+        if (!pendingTools.length) return;
+        let flow = target;
+        if (!flow) {
+          const host = document.createElement('div');
+          host.className = 'msg bot no-animation';
+          const av = document.createElement('div');
+          av.className = 'avatar';
+          av.textContent = '🤖';
+          const mc = document.createElement('div');
+          mc.className = 'msg-content';
+          flow = document.createElement('div');
+          flow.className = 'steps-flow';
+          mc.appendChild(flow);
+          host.appendChild(av);
+          host.appendChild(mc);
+          pushIdx(host);
+        }
+        for (const te of pendingTools) {
+          App.appendToolEvent(te.name || '工具', te.arguments, te.result || '', flow);
+        }
+        pendingTools.length = 0;
+      }
+      for (let i = 0; i < msgs.length; i++) {
+        const m = msgs[i];
+        _curAbsIdx = (baseIdx || 0) + i;
         if (m.role === 'user') {
+          // 上一轮遗留的工具步骤(该轮没有 assistant 承接,如被中断)先落盘,
+          // 再开始新的一轮
+          flushPendingTools(null);
+          currentStepsFlow = null; // 新的一轮对话:步骤容器归零,避免挂到上一轮 assistant 卡片
+          // 与实时路径(message-renderer.appendUserMessage)对齐:
+          // 多行文本 \n 转 <br>,避免"看着折叠成一行"的观感错位。
           const div = document.createElement('div');
           div.className = 'msg user no-animation';
           const avatar = document.createElement('div');
@@ -514,7 +623,8 @@ App.Session.select = async function (id) {
           content.className = 'msg-content';
           const bubble = document.createElement('div');
           bubble.className = 'answer-doc';
-          bubble.textContent = msgText(m);
+          const rawText = msgText(m);
+          bubble.innerHTML = App.escapeHtml ? App.escapeHtml(rawText).replace(/\n/g, '<br>') : rawText;
           content.appendChild(bubble);
           const footer = document.createElement('div');
           footer.className = 'msg-footer';
@@ -522,7 +632,7 @@ App.Session.select = async function (id) {
           act.className = 'msg-actions';
           const timeEl = document.createElement('div');
           timeEl.className = 'msg-time';
-          timeEl.textContent = new Date(m.timestamp || Date.now()).toLocaleTimeString();
+          timeEl.textContent = msgTimeText(m.timestamp);
           const mkAction = (title, label, fn) => {
             const b = document.createElement('button');
             b.className = 'msg-action';
@@ -543,10 +653,12 @@ App.Session.select = async function (id) {
           content.appendChild(footer);
           div.appendChild(avatar);
           div.appendChild(content);
-          frags.push(div);
+          pushIdx(div);
           continue;
         }
         if (m.role === 'assistant') {
+          // 与实时路径(message-renderer.createBotMessage)对齐:同样带
+          // msg-header/process-rail/step-counter/steps-flow,使历史消息与流式消息样式一致。
           const div = document.createElement('div');
           div.className = 'msg bot no-animation';
           const avatar = document.createElement('div');
@@ -554,41 +666,85 @@ App.Session.select = async function (id) {
           avatar.textContent = '🤖';
           const content = document.createElement('div');
           content.className = 'msg-content';
+
+          // 状态栏(实时路径在答案生成前显示,历史路径渲染为"已完成"终态)
+          const header = document.createElement('div');
+          header.className = 'msg-header';
+          const rail = document.createElement('div');
+          rail.className = 'process-rail';
+          rail.innerHTML = '<span class="rail-summary">✅ 已完成</span>';
+          header.appendChild(rail);
+          const headTime = document.createElement('span');
+          headTime.className = 'msg-time';
+          headTime.textContent = msgTimeText(m.timestamp);
+          header.appendChild(headTime);
+          content.appendChild(header);
+
+          // 思考区域。存量数据兜底:agnes 等模型的思考曾以 <思考要点>/<thinking> 形式
+          // 混在 content 里(后端旧版未提取),这里提取进思考区,正文不再出现原始标签
+          let thinkingText = m.meta?.thinking || m.meta?.thinking_content || '';
+          let raw = msgText(m).replace(
+            /<(?:思考[\u4e00-\u9fa5]{0,4}|thinking)>([\s\S]*?)<\/(?:思考[\u4e00-\u9fa5]{0,4}|thinking)>/g,
+            (_, inner) => { thinkingText += (thinkingText ? '\n\n' : '') + inner.trim(); return ''; }
+          ).trim();
+          if (thinkingText) {
+            const thinkingDiv = document.createElement('div');
+            thinkingDiv.className = 'thinking-section';
+            const tLabel = document.createElement('div');
+            tLabel.className = 'thinking-label';
+            tLabel.textContent = '💭 思考过程';
+            const tBody = document.createElement('div');
+            tBody.className = 'thinking-body';
+            // 思考内容含 Markdown(**加粗**/###/列表),必须走渲染器,
+            // textContent 会把语法符号原样裸露出来
+            if (App.renderMarkdown) {
+              tBody.classList.add('md');
+              try { tBody.innerHTML = App.renderMarkdown(thinkingText); }
+              catch (e) { tBody.textContent = thinkingText; }
+            } else {
+              tBody.textContent = thinkingText;
+            }
+            thinkingDiv.appendChild(tLabel);
+            thinkingDiv.appendChild(tBody);
+            tLabel.addEventListener('click', () => thinkingDiv.classList.toggle('open'));
+            content.appendChild(thinkingDiv);
+          }
+
+          // 与实时路径(message-renderer.createBotMessage)对齐:assistant 卡片内建 steps-flow,
+          // 工具步骤(role==='tool')将嵌套其中,使历史回放与实时输出结构一致。
+          const stepsFlow = document.createElement('div');
+          stepsFlow.className = 'steps-flow';
+          content.appendChild(stepsFlow);
+          currentStepsFlow = stepsFlow;
+          // 库里工具消息常排在 assistant 之前,此时它们暂存在 pendingTools 里,
+          // 现在卡片就绪,灌进 steps-flow(与实时渲染的结构完全一致)
+          flushPendingTools(stepsFlow);
+
+          // 答案区域
           const bubble = document.createElement('div');
           bubble.className = 'answer-doc';
-          const raw = msgText(m);
           if (raw && App.renderMarkdown) {
             try { bubble.innerHTML = App.renderMarkdown(raw); }
             catch (e) {
               console.error('[session] renderMarkdown ERROR:', e);
               bubble.innerHTML = '<p style="white-space:pre-wrap;">' + App.escapeHtml(raw) + '</p>';
             }
-          } else {
-            bubble.innerHTML = raw ? '<p style="white-space:pre-wrap;">' + App.escapeHtml(raw) + '</p>' : '';
+          } else if (raw) {
+            bubble.innerHTML = '<p style="white-space:pre-wrap;">' + App.escapeHtml(raw) + '</p>';
+          } else if (!thinkingText) {
+            // 空回复占位:流被停止/异常中断时会留下 content 为空的消息,
+            // 渲染成完全空白的气泡,看起来像"内容怎么会为空"
+            bubble.innerHTML = '<p style="color:var(--text-tertiary);font-style:italic;">(此轮无回复内容——可能已被停止或中断)</p>';
           }
           content.appendChild(bubble);
-          const thinkingText = m.meta?.thinking || m.meta?.thinking_content;
-          if (thinkingText) {
-            const thinkingDiv = document.createElement('div');
-            thinkingDiv.className = 'thinking-section open';
-            const tLabel = document.createElement('div');
-            tLabel.className = 'thinking-label';
-            tLabel.textContent = '💭 思考过程';
-            const tBody = document.createElement('div');
-            tBody.className = 'thinking-body';
-            tBody.textContent = thinkingText;
-            thinkingDiv.appendChild(tLabel);
-            thinkingDiv.appendChild(tBody);
-            tLabel.addEventListener('click', () => thinkingDiv.classList.toggle('open'));
-            content.insertBefore(thinkingDiv, bubble);
-          }
+
           const footer = document.createElement('div');
           footer.className = 'msg-footer';
           const act = document.createElement('div');
           act.className = 'msg-actions';
           const timeEl = document.createElement('div');
           timeEl.className = 'msg-time';
-          timeEl.textContent = new Date(m.timestamp || Date.now()).toLocaleTimeString();
+          timeEl.textContent = msgTimeText(m.timestamp);
           const mkAction = (title, label, fn) => {
             const b = document.createElement('button');
             b.className = 'msg-action';
@@ -604,23 +760,41 @@ App.Session.select = async function (id) {
           if (App.Chat?.regenerate) {
             mkAction('重新生成', '重新生成', () => App.Chat.regenerate(div));
           }
-          mkAction('朗读该回复', '🔊', () => {
+          const speakBtn = document.createElement('button');
+          speakBtn.className = 'msg-action';
+          speakBtn.title = '朗读该回复';
+          speakBtn.textContent = '🔊';
+          speakBtn.addEventListener('click', () => {
+            if (App.isSpeaking && App.isSpeaking()) {
+              App.stopSpeak();
+              speakBtn.textContent = '🔊'; speakBtn.title = '朗读该回复';
+              return;
+            }
             const txt = (bubble.textContent || '').trim();
-            if (txt) App.speak?.(txt);
+            if (!txt) return;
+            speakBtn.textContent = '⏹'; speakBtn.title = '停止朗读';
+            App.speak?.(txt);
+            const iv = setInterval(() => {
+              if (!(App.isSpeaking && App.isSpeaking())) {
+                clearInterval(iv);
+                speakBtn.textContent = '🔊'; speakBtn.title = '朗读该回复';
+              }
+            }, 200);
           });
+          act.appendChild(speakBtn);
           footer.appendChild(act);
           footer.appendChild(timeEl);
           content.appendChild(footer);
           div.appendChild(avatar);
           div.appendChild(content);
-          frags.push(div);
+          pushIdx(div);
           continue;
         }
         if (m.role === 'error') {
           const div = document.createElement('div');
           div.className = 'msg error';
           div.textContent = msgText(m);
-          frags.push(div);
+          pushIdx(div);
           continue;
         }
         if (m.role === 'plan' && App.appendPlan) {
@@ -629,7 +803,7 @@ App.Session.select = async function (id) {
             if (JSON.stringify(plan) !== lastPlanContent) {
               lastPlanContent = JSON.stringify(plan);
               const p = App.appendPlan({ action: 'create', plan }, frags);
-              if (p) frags.push(p);
+              if (p) pushIdx(p);
             }
           } catch (_) { /* 忽略 */ }
           continue;
@@ -638,21 +812,36 @@ App.Session.select = async function (id) {
           let te = null;
           try { te = JSON.parse(msgText(m)); } catch (_) { te = null; }
           if (te) {
-            const t = App.appendToolEvent(te.name || '工具', te.arguments, te.result || '', frags);
-            if (t) frags.push(t);
+            const isImage = te.name === 'generate_image';
+            if (isImage) {
+              // 图片生成沿用专属卡片(img-gen-bubble),作为兄弟节点
+              App.appendToolEvent(te.name || '工具', te.arguments, te.result || '', frags);
+              const _imgNode = frags[frags.length - 1];
+              if (_imgNode) _imgNode.dataset.idx = String(_curAbsIdx);
+            } else if (currentStepsFlow) {
+              // assistant 卡片已渲染(新数据顺序:assistant 在 tool 之前)→ 直接嵌套
+              App.appendToolEvent(te.name || '工具', te.arguments, te.result || '', currentStepsFlow);
+            } else {
+              // assistant 卡片还没渲染(存量数据顺序:tool 排在 assistant 之前)
+              // → 先缓冲,等本轮 assistant 卡片建好后由 flushPendingTools 灌入
+              pendingTools.push(te);
+            }
           }
           continue;
         }
       }
+      // 收尾:最后一轮若没有 assistant 承接(被中断),遗留工具步骤单独建卡,
+      // 避免它们被丢成无样式的扁平节点
+      flushPendingTools(null);
       return frags;
     }
 
-    // 首次加载:只渲染最后 15 条
-    const initStart = Math.max(0, allMessages.length - App._sessionLoadStep);
+    // 首次加载:从"最后 15 条所在那一轮"的起点开始(整轮加载,不切断一轮对话)
+    const initStart = roundStart(allMessages.length - App._sessionLoadStep);
     const initMsgs = allMessages.slice(initStart);
     App._sessionLoadIdx = initStart;
     const frag = document.createDocumentFragment();
-    for (const el of buildMsgElements(initMsgs)) frag.appendChild(el);
+    for (const el of buildMsgElements(initMsgs, initStart)) frag.appendChild(el);
     msgs.appendChild(frag);
     App.scrollMessagesToBottom(true);
 
@@ -665,20 +854,26 @@ App.Session.select = async function (id) {
       App._sessionLoadingMore = true;
       const oldScrollHeight = msgs.scrollHeight;
       const prevStart = App._sessionLoadIdx;
-      const newStart = Math.max(0, prevStart - App._sessionLoadStep);
+      // 向上加载"上一整轮"(而非固定条数),保证工具步骤与其 assistant 同批渲染
+      const newStart = prevRoundStart(prevStart);
       const olderMsgs = allMessages.slice(newStart, prevStart);
       App._sessionLoadIdx = newStart;
       const moreFrag = document.createDocumentFragment();
-      for (const el of buildMsgElements(olderMsgs)) moreFrag.appendChild(el);
+      for (const el of buildMsgElements(olderMsgs, newStart)) moreFrag.appendChild(el);
       msgs.insertBefore(moreFrag, msgs.firstChild);
       // 保持滚动位置不跳动
       msgs.scrollTop = msgs.scrollHeight - oldScrollHeight + msgs.scrollTop;
-      // DOM 节点上限:超过限制时移除底部(最新)的消息节点(滚动加载往顶部插最旧的,
-      // 尾部是最新交互区, 最旧节点在 DOM 顶部)
+      // DOM 节点上限:超过限制时移除顶部(最旧)的消息节点,始终保留底部(最新)可见;
+      // 并把加载游标推进到剩余最旧节点的真实下标,避免向上滚动时重复加载已被裁掉的消息。
       const msgNodes = Array.from(msgs.querySelectorAll('.msg')); // 静态快照, 移除后不会失效
       const excess = msgNodes.length - MAX_DOM_MSGS;
       if (excess > 0) {
-        for (let k = 0; k < excess; k++) msgNodes[msgNodes.length - 1 - k].remove();
+        for (let k = 0; k < excess; k++) msgNodes[k].remove();
+        const topNode = msgNodes[excess];
+        if (topNode && topNode.dataset && topNode.dataset.idx !== undefined) {
+          const v = parseInt(topNode.dataset.idx, 10);
+          if (!Number.isNaN(v)) App._sessionLoadIdx = v;
+        }
       }
       App._sessionLoadingMore = false;
     }
@@ -702,7 +897,11 @@ App.Session.select = async function (id) {
   } catch (e) {
     if (App.appendMessage) App.appendMessage(`加载会话历史失败: ${e.message}`, 'error');
   }
-  
+
+  // 切换后刷新侧边栏:更新 active 高亮(select 只改了 App.sessionId,
+  // 不重渲染的话侧边栏仍高亮在旧会话上,看上去像"没切过去")
+  if (App.Session.refreshList) await App.Session.refreshList();
+
   if (App.Attach) App.Attach.reset();
   if (App.CtxMeter) App.CtxMeter.refresh();
   App.els.input.focus();

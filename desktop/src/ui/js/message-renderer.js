@@ -309,10 +309,28 @@
     actions.appendChild(createActionBtn('重新生成', '重新生成', () => {
       if (App.Chat) App.Chat.regenerate(wrap);
     }));
-    actions.appendChild(createActionBtn('🔊', '朗读', () => {
-      const txt = (answer.textContent || '').trim();
-      if (txt && App.speak) App.speak(txt);
-    }));
+    actions.appendChild((function () {
+      const btn = createActionBtn('🔊', '朗读', (b) => {
+        // 播放/停止切换:播放中显示 ⏹,点一下停止;否则开始朗读
+        if (App.isSpeaking && App.isSpeaking()) {
+          App.stopSpeak();
+          b.textContent = '🔊'; b.title = '朗读';
+          return;
+        }
+        const txt = (answer.textContent || '').trim();
+        if (!txt) return;
+        b.textContent = '⏹'; b.title = '停止朗读';
+        App.speak(txt);
+        // 轮询:自然播完/出错后还原按钮
+        const iv = setInterval(() => {
+          if (!(App.isSpeaking && App.isSpeaking())) {
+            clearInterval(iv);
+            b.textContent = '🔊'; b.title = '朗读';
+          }
+        }, 200);
+      });
+      return btn;
+    })());
     footer.appendChild(actions);
     footer.appendChild(createTime());
     content.appendChild(footer);
@@ -344,7 +362,15 @@
     if (!wrap || !wrap._stepsFlow) return null;
     // 用 stepId 而非工具名去重:同名工具多次调用各自独立显示
     const uniqueKey = stepId || `__${_nextStepId()}`;
-    const existing = wrap._stepsFlow.querySelector(`.step-row[data-uid="${CSS.escape(uniqueKey)}"]`);
+    let existing = wrap._stepsFlow.querySelector(`.step-row[data-uid="${CSS.escape(uniqueKey)}"]`);
+    // 兜底匹配:tool_call_start 预建的 running 行没有 step_id,done 事件到达时
+    // 按"同名工具的最后一个 running 行"回退匹配,就地更新而不是另起新行,
+    // 修复"同一工具出现 running/done 两行、running 行永远卡在 ⏳"的重复渲染。
+    if (!existing && (status === 'done' || status === 'fail')) {
+      const runningRows = wrap._stepsFlow.querySelectorAll(
+        `.step-row[data-tool="${CSS.escape(name)}"].step-running`);
+      if (runningRows.length > 0) existing = runningRows[runningRows.length - 1];
+    }
     if (existing) {
       // 更新已有步骤状态(不重新计数)
       if (status === 'done' || status === 'fail') {
@@ -362,8 +388,11 @@
         }
         if (resultEl && result) {
           const imgUrl = App.parseImageUrl(result);
+          const videoUrl = App.parseVideoUrl ? App.parseVideoUrl(result) : '';
           if (name === 'generate_image' && imgUrl) {
             resultEl.innerHTML = `<img class="step-img-result" src="${App.escapeHtml(imgUrl)}" alt="生成图片">`;
+          } else if ((name === 'generate_video' || name === 'enhance_video') && videoUrl) {
+            resultEl.innerHTML = App.buildVideoHtml(videoUrl);
           } else {
             const type = detectResultType(result);
             resultEl.innerHTML = renderResultContent(result, type);
@@ -439,8 +468,11 @@
       const resultEl = document.createElement('div');
       resultEl.className = 'step-result';
       const imgUrl = App.parseImageUrl(result);
+      const videoUrl = App.parseVideoUrl ? App.parseVideoUrl(result) : '';
       if (name === 'generate_image' && imgUrl) {
         resultEl.innerHTML = `<img class="step-img-result" src="${App.escapeHtml(imgUrl)}" alt="生成图片">`;
+      } else if ((name === 'generate_video' || name === 'enhance_video') && videoUrl) {
+        resultEl.innerHTML = App.buildVideoHtml(videoUrl);
       } else {
         const type = detectResultType(result);
         resultEl.dataset.resultType = type;
@@ -513,18 +545,51 @@
     wrap._thinkingSection.classList.add('open');
     const body = wrap._thinkingBody;
     let cleanContent = content || '';
-    if (App.stripThinkingTags) {
+    // ⚠️ 流式分块必须用不 trim 的版本:stripThinkingTags 末尾的 .trim() 会把
+    // "独占一个 chunk 的 \n\n"(LLM 段落分隔的常见形态)整块吃掉,
+    // 每个分块的首尾换行全丢 → 思考区挤成一整面没有换行的文字墙。
+    if (App.stripThinkingTagsStream) {
+      cleanContent = App.stripThinkingTagsStream(cleanContent);
+    } else if (App.stripThinkingTags) {
       cleanContent = App.stripThinkingTags(cleanContent);
     } else {
       cleanContent = cleanContent.replace(/<thinking[\s\S]*?<\/thinking>/gi, '')
-        .replace(/<\/?thinking[^>]*>/gi, '').trim();
+        .replace(/<\/?thinking[^>]*>/gi, '');
     }
-    if (!cleanContent.trim()) return;
-    const text = body.textContent;
-    body.textContent = text + (text ? '\n' : '') + cleanContent;
+    // ⚠️ 判空不能用 .trim():后端逐字符发射 token,换行符独占一个 chunk,
+    // '\n'.trim() === '' 会把所有换行 chunk 整块丢掉 → 思考区挤成无换行的文字墙
+    if (!cleanContent) return;
+    // 累积原始文本到 _thinkingRaw,Markdown 渲染节流到每帧一次
+    // (逐 chunk 全量渲染开销大;textContent 会让 **加粗**/###/列表等语法裸露)
+    wrap._thinkingRaw = (wrap._thinkingRaw || '') + cleanContent;
     const MAX_THINKING = 4000;
-    if (body.textContent.length > MAX_THINKING) {
-      body.textContent = body.textContent.slice(-MAX_THINKING);
+    if (wrap._thinkingRaw.length > MAX_THINKING) {
+      wrap._thinkingRaw = wrap._thinkingRaw.slice(-MAX_THINKING);
+    }
+    if (!wrap._thinkingRenderPending) {
+      wrap._thinkingRenderPending = true;
+      // 时间片节流:思考同样逐字符到达,rAF(约 16ms)等于每秒 60 次全量
+      // Markdown 解析 + innerHTML 替换,是长思考卡顿的主因之一。改为 150ms 一次。
+      const nowMs = Date.now();
+      const elapsed = nowMs - (wrap._thinkingLastRenderAt || 0);
+      const delay = Math.max(0, 150 - elapsed);
+      setTimeout(() => {
+        wrap._thinkingRenderPending = false;
+        wrap._thinkingLastRenderAt = Date.now();
+        const body2 = wrap._thinkingBody;
+        if (!body2) return;
+        const raw = wrap._thinkingRaw || '';
+        if (App.renderMarkdown) {
+          try {
+            body2.classList.add('md');
+            body2.innerHTML = App.renderMarkdown(raw);
+            return;
+          } catch (e) {
+            console.warn('[addThinking] markdown render failed, fallback to text:', e);
+          }
+        }
+        body2.textContent = raw;
+      }, delay);
     }
     if (wrap._railSummary) {
       wrap._railSummary.textContent = '💭 思考中...';

@@ -83,8 +83,18 @@ class ConfirmationStore:
             conn.commit()
             conn.close()
             return {"id": conf_id, "status": status, "result": result}
-        
+
         conn.close()
+        # 已处理:重复响应(前端双卡片/重复点击/轮询重入)不再报错,以首次决定为准。
+        # 否则用户点第二次会看到"确认请求不存在或已处理"的错误横幅(实测 2026-09-20)。
+        existing = self.get(conf_id)
+        if existing:
+            return {
+                "id": conf_id,
+                "status": existing["status"],
+                "result": existing.get("result", ""),
+                "already": True,
+            }
         return None
     
     def get(self, conf_id: str) -> Optional[dict]:

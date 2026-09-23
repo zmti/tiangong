@@ -81,14 +81,19 @@ def read_file(
     }
 
 
-@tool("edit_file", "基于原文精确匹配的结构化代码编辑,支持多段替换,返回 unified diff 和风险评级", timeout=30)
+@tool("code_edit_file", "基于原文精确匹配的结构化代码编辑,支持多段替换,返回 unified diff 和风险评级", timeout=30)
 def edit_file(
     path: str = Field(description="文件路径"),
     old_string: str = Field(description="原文片段(必须完全匹配,包含缩进;用于定位目标位置)"),
     new_string: str = Field(description="替换后的新内容"),
     replace_all: bool = Field(False, description="是否替换所有匹配项(默认只替换第一次出现)"),
 ) -> dict:
-    """补丁式编辑:用 old_string 精确定位,替换为 new_string。返回 unified diff 和风险评级。"""
+    """补丁式编辑:用 old_string 精确定位,替换为 new_string。返回 unified diff 和风险评级。
+
+    命名说明: 工具名注册为 code_edit_file 以避免与 file_tool.edit_file(参数: edits JSON 数组)
+    重名冲突 —— 旧实现下后导入的 code_file 会覆盖 file_tool,LLM 按 schema 传参数却拿到
+    另一个 func,导致"执行任务时读写文件失败"。func 内部仍叫 edit_file,仅装饰器名不同。
+    """
     try:
         resolved = _resolve_path(path)
     except Exception as e:

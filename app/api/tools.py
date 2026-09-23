@@ -83,6 +83,8 @@ class ModelUpsert(BaseModel):
     id: str
     name: str = ""
     context: int | None = None
+    # 能力标记:["image"] / ["video"],用于「设置 → 生成模型」下拉候选
+    capabilities: list[str] = []
 
 
 class ModelBatchUpsert(BaseModel):
@@ -148,7 +150,7 @@ async def add_custom_model(pid: str, req: ModelUpsert) -> dict:
     from app.core.provider_registry import add_model
 
     try:
-        entry = add_model(pid, req.id, req.name, req.context)
+        entry = add_model(pid, req.id, req.name, req.context, req.capabilities)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"ok": True, "entry": entry}
@@ -505,4 +507,8 @@ async def respond_confirmation(conf_id: str, req: ConfirmRespond) -> dict:
     conf = store.respond(conf_id, approved=req.approved, result=req.result)
     if conf is None:
         return {"status": "error", "error": f"确认请求不存在或已处理: {conf_id}"}
-    return {"status": "ok", "confirmation": conf}
+    # 幂等:重复响应(双卡片/重复点击)返回 ok 并带上 already 标记,前端不再弹错误横幅
+    resp = {"status": "ok", "confirmation": conf}
+    if conf.get("already"):
+        resp["already"] = True
+    return resp

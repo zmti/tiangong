@@ -366,22 +366,63 @@ class TaskManager:
         except Exception:  # noqa: BLE001
             pass
 
-        # 异步发送 Webhook(不阻塞任务完成)
+        # 异步发送 Webhook(不阻塞任务完成)。
+        # 修复: 旧实现 fire-and-forget 的 create_task 无 done_callback,
+        # webhook 内部异常被静默吞掉("Task exception was never retrieved")。
+        # 现在: 加 done_callback 收割异常并记日志,不再凭空消失。
         try:
             from app.core.webhook import notify_task_done
             import asyncio as _asyncio
 
-            _asyncio.create_task(notify_task_done(task_id=task_id, status=rec.status, answer=rec.answer))
+            async def _hook_safe():
+                try:
+                    await notify_task_done(task_id=task_id, status=rec.status, answer=rec.answer)
+                except Exception as _we:  # noqa: BLE001
+                    import logging
+                    logging.getLogger(__name__).warning("任务 webhook 回调失败 task=%s: %s", task_id, _we)
+
+            _task = _asyncio.create_task(_hook_safe())
+            _task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
         except Exception:  # noqa: BLE001
             pass
 
     async def _emit(self, task_id: str, event: dict) -> None:
+        """把事件写入任务队列。
+
+        修复: 旧实现队列满时所有事件(含 task_done 终结事件)都静默丢弃,
+        导致 SSE 订阅者拿不到 task_done 收尾信号 → 订阅循环永久 0.15s 轮询,
+        "会话中断"。现在:普通事件满时丢最旧腾位,终结事件(task_done/error)
+        不可丢 —— 先排空队列再入队,保证订阅者一定收到收尾。
+        """
         q = self._queues.get(task_id)
-        if q is not None:
+        if q is None:
+            return
+        terminal = event.get("type") in ("task_done", "error")
+        try:
+            q.put_nowait(event)
+            return
+        except asyncio.QueueFull:
+            if not terminal:
+                # 普通事件:丢最旧腾位(中间增量可丢,task_done 已在队尾保留)
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    q.put_nowait(event)
+                except asyncio.QueueFull:
+                    pass
+                return
+            # 终结事件:排空队列腾位,确保 task_done 一定入队(订阅者靠它收尾)
+            while True:
+                try:
+                    q.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
             try:
                 q.put_nowait(event)
             except asyncio.QueueFull:
-                pass  # 退避拥挤:丢弃中间事件,不影响落盘
+                pass
 
     async def _drain(self, task_id: str) -> None:
         """任务结束:把剩余事件清空,供 SSE 订阅者收尾。"""
@@ -394,7 +435,16 @@ class TaskManager:
                     break
 
     async def subscribe(self, task_id: str):
-        """SSE 订阅者:持续产出事件 dict,任务结束后返回。"""
+        """SSE 订阅者:持续产出事件 dict,任务结束后返回。
+
+        修复: 旧实现双重竞态 —— 当任务在两次 0.15s 轮询之间从 running 变成
+        done/failed/cancelled、且期间没有任何事件进队时,轮询判断条件
+        (status 终态 AND q.empty()) 永远为 True 之前会再 sleep 一轮,但若
+        _emit 的 task_done 被队列满丢弃,则此循环将无限轮询。现在:
+        - 队列空时若任务已终态,先补投一个 task_done 收尾事件再 return,
+          确保订阅者一定能收到终结信号。
+        - 每轮 sleep 前重查 rec(避免持有陈旧引用)。
+        """
         q = self._queues.get(task_id)
         rec = self.get(task_id)
         if q is None or rec is None:
@@ -403,7 +453,14 @@ class TaskManager:
             try:
                 event = q.get_nowait()
             except asyncio.QueueEmpty:
+                # 重新查最新状态(任务可能在这 0.15s 内完成并写终态)
+                rec = self.get(task_id)
+                if rec is None:
+                    return
                 if rec.status in ("done", "failed", "cancelled") and q.empty():
+                    # 补投收尾事件:订阅方靠 task_done 终止流,不能因竞态丢失
+                    yield {"type": "task_done", "task_id": task_id,
+                           "status": rec.status, "answer": rec.answer}
                     return
                 await asyncio.sleep(0.15)
                 continue

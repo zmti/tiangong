@@ -29,6 +29,8 @@ _VISION_MARKERS = (
     "claude", "qwen-vl", "glm-4v", "internvl", "minicpm-v",
     "agnes-vl", "grok-vision", "claude-3", "claude-4",
     "agnes",  # agnes 系列模型支持视觉
+    "ocr",    # 带 ocr 的模型具备读图能力
+    "qwen3",  # qwen3 多模态系列(含 ocr/vl 变体)
 )
 _AUDIO_MARKERS = ("whisper", "paraformer", "audio", "speech")
 _VIDEO_MARKERS = ("video", "vlm", "gpt-4o", "gemini-1.5", "claude-3.5")

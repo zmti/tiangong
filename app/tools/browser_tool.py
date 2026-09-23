@@ -52,6 +52,10 @@ class BrowserSession:
         self._browser = None
         self._page = None
         self._context = None
+        # 测试用错误捕获(默认空,不影响既有交互工具)
+        self._console_errors: list[dict] = []
+        self._page_errors: list[str] = []
+        self._failed_requests: list[dict] = []
 
     async def launch(self, headless: bool = True) -> bool:
         try:
@@ -71,6 +75,12 @@ class BrowserSession:
                 ),
             )
             self._page = await self._context.new_page()
+            # 测试用:挂错误捕获监听(对交互工具透明,仅 web_auto_test 读取)
+            self._page.on("console", self._on_console)
+            self._page.on("pageerror", lambda exc: self._page_errors.append(str(exc)))
+            self._page.on("requestfailed", lambda req: self._failed_requests.append(
+                {"url": req.url, "error": str(getattr(req.failure, "error_text", "") or "network error")}))
+            self._page.on("response", self._on_response)
             return True
         except ImportError:
             return False
@@ -94,6 +104,39 @@ class BrowserSession:
     @property
     def is_active(self) -> bool:
         return self._page is not None
+
+    # ---- 测试错误捕获(web_auto_test 使用) ----
+    def _on_console(self, msg) -> None:
+        # 仅记录 error 级(警告不计入失败,避免噪声)
+        if getattr(msg, "type", "") == "error":
+            loc = getattr(msg, "location", None) or {}
+            self._console_errors.append({
+                "text": str(msg.text),
+                "location": f"{loc.get('url', '')}:{loc.get('lineNumber', '')}" if loc else None,
+            })
+
+    def _on_response(self, resp) -> None:
+        # HTTP 4xx/5xx 视为失败请求(favicon 误报忽略)
+        try:
+            status = resp.status
+        except Exception:  # noqa: BLE001
+            return
+        if status >= 400 and not str(resp.url).rstrip("/").endswith("favicon.ico"):
+            self._failed_requests.append({"url": str(resp.url), "status": status})
+
+    def reset_capture(self) -> None:
+        """清空已捕获的错误(每次测试前调用,避免跨页面污染)。"""
+        self._console_errors = []
+        self._page_errors = []
+        self._failed_requests = []
+
+    def get_capture(self) -> dict:
+        """返回本次会话捕获的浏览器错误汇总。"""
+        return {
+            "console_errors": list(self._console_errors),
+            "page_errors": list(self._page_errors),
+            "failed_requests": list(self._failed_requests),
+        }
 
     async def goto(self, url: str, wait_until: str = "load", timeout: int = 30000) -> dict:
         if not self._page:

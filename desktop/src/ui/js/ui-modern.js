@@ -144,8 +144,8 @@ App.UI.Modal = {
     const overlay = document.createElement('div');
     overlay.className = 'modal-mask';
     overlay.innerHTML = `
-      <div class="confirm-dialog">
-        <div class="cd-body">${config.content}</div>
+      <div class="confirm-dialog${config.wide ? ' wide' : ''}">
+        <div class="cd-body"></div>
         ${config.actions ? `
           <div class="cd-actions">
             ${config.actions}
@@ -153,7 +153,11 @@ App.UI.Modal = {
         ` : ''}
       </div>
     `;
-    
+
+    const cdBody = overlay.querySelector('.cd-body');
+    if (config.content instanceof Node) cdBody.appendChild(config.content);
+    else cdBody.innerHTML = config.content || '';
+
     document.body.appendChild(overlay);
     this.instances.push(overlay);
     

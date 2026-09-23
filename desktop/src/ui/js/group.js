@@ -61,12 +61,15 @@
 
   // 设置思考内容
   function setThinking(content) {
-    if (!App._currentGroup) { 
-      App.appendThinking(content); 
-      return; 
+    if (!App._currentGroup) {
+      App.appendThinking(content);
+      return;
     }
-    const text = App.stripThinkingTags(content);
-    if (!text.trim()) return;
+    // 流式安全:不 trim(保住 chunk 边界的 \n\n 段落分隔),直接拼接(不用 '\n' 连接,
+    // 否则 1-2 字/块的分块会变成"一字一行")
+    // ⚠️ 判空不能用 .trim():换行符独占 chunk 时会被整块丢弃
+    const text = App.stripThinkingTagsStream ? App.stripThinkingTagsStream(content) : content;
+    if (!text) return;
     if (!App._currentGroup.thinking) {
       const el = document.createElement('div');
       el.className = 'rg-thinking';
@@ -80,7 +83,7 @@
       }
     } else {
       const prev = App._currentGroup.thinking.textContent;
-      App._currentGroup.thinking.textContent = prev + (prev ? '\n' : '') + text;
+      App._currentGroup.thinking.textContent = prev + text;
       App._currentGroup.thinking.title = App._currentGroup.thinking.textContent;
     }
     const MAX = 2000;

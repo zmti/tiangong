@@ -24,7 +24,7 @@ def _build_tools_list() -> list[dict]:
 
     registry = get_registry()
     tools = []
-    for t in registry.list(enabled_only=True):
+    for t in registry.list_sync(enabled_only=True):
         schema = t.to_openai_schema()
         tools.append({
             "name": t.name,

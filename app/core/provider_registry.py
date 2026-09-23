@@ -73,12 +73,28 @@ def mask_key(key: str) -> str:
     return f"{key[:3]}***{key[-4:]}"
 
 
+def _infer_capabilities(model_id: str) -> list:
+    """按模型 id 推断能力,仅在模型未显式标注 capabilities 时兜底。
+
+    项目里已有一批用户添加的模型(如 agnes-image-2.1-flash / agnes-video-2.5),
+    当初写入时还没有 capabilities 字段。若不推断,它们既进不了「生成模型」候选,
+    又会混进对话模型下拉——两头不讨好。显式标注优先,推断只是兜底。
+    """
+    mid = (model_id or "").lower()
+    caps = []
+    if "image" in mid:
+        caps.append("image")
+    if "video" in mid:
+        caps.append("video")
+    return caps
+
+
 def _norm_model(m: Any) -> Optional[dict]:
     if isinstance(m, str):
         mid = m.strip()
         if not mid:
             return None
-        return {"id": mid, "name": mid, "context": None, "default": False}
+        return {"id": mid, "name": mid, "context": None, "default": False, "capabilities": _infer_capabilities(mid)}
     if isinstance(m, dict):
         mid = (m.get("id") or m.get("model") or "").strip()
         if not mid:
@@ -88,6 +104,8 @@ def _norm_model(m: Any) -> Optional[dict]:
             "name": (m.get("name") or mid).strip(),
             "context": m.get("context"),
             "default": bool(m.get("default")),
+            # 能力标记:["image"] / ["video"] / ["image","video"],用于生成模型下拉候选
+            "capabilities": list(m.get("capabilities") or []) or _infer_capabilities(mid),
         }
     return None
 
@@ -195,7 +213,13 @@ def list_models(pid: str) -> List[dict]:
     return out
 
 
-def add_model(pid: str, model_id: str, name: str = "", context: Optional[int] = None) -> dict:
+def add_model(
+    pid: str,
+    model_id: str,
+    name: str = "",
+    context: Optional[int] = None,
+    capabilities: Optional[list] = None,
+) -> dict:
     entry = get_custom(pid)
     if not entry:
         raise ValueError("提供商不存在")
@@ -209,9 +233,16 @@ def add_model(pid: str, model_id: str, name: str = "", context: Optional[int] = 
                 m["name"] = name.strip()
             if context is not None:
                 m["context"] = context
+            if capabilities is not None:
+                m["capabilities"] = list(capabilities)
             break
     else:
-        models.append(_norm_model({"id": model_id, "name": name or model_id, "context": context}))
+        models.append(_norm_model({
+            "id": model_id,
+            "name": name or model_id,
+            "context": context,
+            "capabilities": capabilities or [],
+        }))
     if not entry.get("default_model") and not entry.get("model"):
         entry["default_model"] = model_id
     entry["default_model"] = _default_model_of(entry)
@@ -290,7 +321,14 @@ def remove_builtin_model(provider: str, model_id: str) -> bool:
 
 
 def list_builtin_ext_models(provider: str) -> List[dict]:
-    return get_builtin_ext().get(provider, []) or []
+    # 过一遍 _norm_model:补齐 capabilities(含按 id 的推断),
+    # 否则历史数据里没有该字段的模型既进不了生成候选,又会混进对话模型列表。
+    out = []
+    for m in get_builtin_ext().get(provider, []) or []:
+        nm = _norm_model(m)
+        if nm:
+            out.append(nm)
+    return out
 
 
 def set_builtin_default_model(provider: str, model_id: str) -> dict:

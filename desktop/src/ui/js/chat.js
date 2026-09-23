@@ -255,6 +255,8 @@ App.Chat.doSend = async function (text, opts = {}) {
 
   // 每次 doSend 前清空 mdBuf，避免多次 abort/resume 累积
   App._mdBuf = '';
+  // 注意:思考流式状态(pendingTextHold / thinkingEmitted)在下方以 let 声明并初始化,
+  // 每次 doSend 都是全新绑定,不存在跨轮残留,切勿在声明之前赋值(TDZ 会抛 ReferenceError)
   // 每轮重置思考卡/答案锚点,避免上一轮残留导致本轮 thinking 错位
   App._thinkingWrap = null;
   App._answerWrap = null;
@@ -278,6 +280,13 @@ App.Chat.doSend = async function (text, opts = {}) {
   // 重置步骤 ID 计数器(每次请求独立)
   App.Chat.resetStepIdCounter();
   let thinkingBuf = '';
+  // 渐进式思考流:已从 thinkingBuf 发出的字符数。
+  // 旧实现要等 </thinking> 闭合才一次性返回整个思考块,长思考期间思考区一直空白,
+  // 用户会以为"思考内容不见了"。现在每个 chunk 到达即吐出思考增量。
+  let thinkingEmitted = 0;
+  // 文本模式尾部扣留:chunk 末尾出现未闭合的 '<'(标签被 chunk 边界劈开,如 "<thi")
+  // 时先扣住,等下一个 chunk 拼齐后再识别,防止思考开启标签漏检导致思考原文泄漏进正文。
+  let pendingTextHold = '';
   App.abortController = new AbortController();
   const signal = App.abortController.signal;
   // 【关键修复】跟踪 streaming 是否已设置,确保 finally 块能正确重置
@@ -298,15 +307,83 @@ App.Chat.doSend = async function (text, opts = {}) {
   let lastErrMsg = null;
   // done 提升到函数作用域,connectTimer 回调和 finally 都需要读取
   let done = false;
+  // 后端 reflect 判定需要重写时置位:保留上一版答案不动,直到新一轮 token 真正到达再替换,
+  // 避免 answer_reset 立刻清空界面造成的"显示→消失→又显示"闪烁
+  let rewritePending = false;
+  // answer_reset 等事件复位思考状态机时,同步复位 system-reminder 吞块状态
+  let inSysReminder = false;
+  let sysRemLen = 0;
   // 建连超时:api() 自带 60s 超时仅在"未传 signal"时生效,而本函数发流必传 signal,
   // 导致连接建立阶段(后端不可达/未就绪/崩溃)无任何超时保护、永久挂起。
   // 单独加建连超时:超时即 abort 本次 fetch,走重试/报错流程。
   /* 从 token 流中提取 <thinking>...</thinking> 块，避免思考原文进入主答案气泡 */
   function processTokenChunk(chunk) {
     if (!chunk) return { text: '', thinking: '' };
+    // 拼回上一轮扣留的未闭合 '<' 片段(标签劈开保护)
+    chunk = pendingTextHold + chunk;
+    pendingTextHold = '';
     // 剥离 LLM 内部 XML 标签
-    chunk = chunk.replace(/<\/?(?:system|plan|phase|analysis|reflection|context|instruction|output|reasoning|tool_call|function|parameter)[^>]*>/gi, '');
+    // 注意:system 分支带负向先行(?![_-]?reminder)——<system-reminder> 整块由下方
+    // 状态机连内容一起吞掉,若在这里只删标签,块内文字(如 "Plan mode: ...")会漏进正文。
+    // 工具名伪标签(git_status/list_directory 等):模型以纯文本回显工具调用骨架,
+    // 后端 _strip_thinking 的通用剥离会删掉它们,前端若不删会造成
+    // "直播流带标签 vs 落库干净"的输出不一致(实测 2026-09-20)。
+    chunk = chunk.replace(/<\/?(?:system(?![_-]?reminder)|plan|phase|analysis|reflection|context|instruction|output|reasoning|tool_call|tool_response|function|function_calls|function_results|parameter|observation|scratchpad|git_status|git_diff|git_log|list_directory|read_file|write_file|edit_file|run_terminal|file_history|search_files|web_search)[^>]*>/gi, '');
+    // 归一化 thinking 变体标签:<ant:thinking>/<antThinking>/<|thinking|> 等 → 标准 <thinking>/</thinking>,
+    // 否则下方 indexOf('<thinking') 识别不到变体,整段思考原文会泄漏进主答案。
+    chunk = chunk
+      .replace(/<(?:\|)?(?:[a-zA-Z][\w.:-]*)?thinking[\w.:-]*(?:\|)?[^>]*>/gi, '<thinking>')
+      .replace(/<(?:\|)?\/(?:\|)?(?:[a-zA-Z][\w.:-]*)?thinking[\w.:-]*(?:\|)?[^>]*>/gi, '</thinking>')
+      // 中文变体:部分模型(如 agnes 系列)用 <思考要点>/<思考过程> 等包裹思考内容,
+      // 不归一化会原样漏进主答案。连同英文 <think> 一起映射到标准 thinking 标签。
+      .replace(/<\s*(\/?)\s*(?:思考[\u4e00-\u9fa5]{0,4}|think\w*)\s*>/g, (_, slash) => slash ? '</thinking>' : '<thinking>')
+      // system-reminder 变体归一化:<system_reminder>/<System-Reminder> 等 → 标准标签
+      .replace(/<\s*(\/?)\s*system[_-]?reminder[^>]*>/gi, (_, slash) => slash ? '</system-reminder>' : '<system-reminder>');
+    // ── 伪 <system-reminder> 指令回显吞块 ──
+    // 模型偶尔把训练语料中的系统提醒原文当正文吐出(实测:
+    // "<system-reminder>\nPlan mode: think carefully before committing to an approach.\n</system-reminder>"),
+    // 整块(含内容)不属于答案,全部吞掉。注意:下方通用标签剥离只删标签本身,
+    // 块内文字会漏进正文,必须像 thinking 一样做跨 chunk 状态机。
+    if (inSysReminder) {
+      sysRemLen += chunk.length;
+      if (sysRemLen > 4000) {
+        // 未闭合兜底:超过 4000 字符强制退出,防止后续内容被永远吞掉
+        console.warn('[processTokenChunk] system-reminder exceeded 4000 chars without closing tag, forcing exit');
+        inSysReminder = false;
+        sysRemLen = 0;
+        return { text: '', thinking: '' };
+      }
+      const srClose = chunk.indexOf('</system-reminder>');
+      if (srClose === -1) {
+        // 闭合标签可能被 chunk 边界劈开:末尾悬空 '<' 先扣住
+        const lt = chunk.lastIndexOf('<');
+        if (lt !== -1 && chunk.indexOf('>', lt) === -1 && (chunk.length - lt) <= 24) {
+          pendingTextHold = chunk.slice(lt);
+        }
+        return { text: '', thinking: '' };
+      }
+      inSysReminder = false;
+      sysRemLen = 0;
+      chunk = chunk.slice(srClose + 18);
+      if (!chunk) return { text: '', thinking: '' };
+      // 闭合后剩余内容继续走下方正常流程
+    }
+    const srOpen = chunk.indexOf('<system-reminder>');
+    if (srOpen !== -1) {
+      const before = chunk.slice(0, srOpen);
+      inSysReminder = true;
+      sysRemLen = 0;
+      const rest = processTokenChunk(chunk.slice(srOpen + 17));
+      return { text: before + rest.text, thinking: rest.thinking };
+    }
     if (!inThinking) {
+      // 文本模式尾部扣留:末尾有未闭合的 '<' 时(可能是被劈开的标签开头),扣住等下一个 chunk
+      const lt = chunk.lastIndexOf('<');
+      if (lt !== -1 && chunk.indexOf('>', lt) === -1) {
+        pendingTextHold = chunk.slice(lt);
+        chunk = chunk.slice(0, lt);
+        if (!chunk) return { text: '', thinking: '' };
+      }
       // 先检查是否有完整的 <thinking>...</thinking> 块在同一 chunk 内
       const openIdx = chunk.indexOf('<thinking');
       if (openIdx !== -1) {
@@ -318,9 +395,11 @@ App.Chat.doSend = async function (text, opts = {}) {
           const after = body.slice(closeIdx + 11);
           return { text: chunk.slice(0, openIdx) + after, thinking };
         }
-        // 只有开启标签: 进入 thinking 模式
+        // 只有开启标签: 进入 thinking 模式(thinkingBuf 跳过开启标签本身,
+        // 后续增量直接是思考正文;闭合时由 thinkingEmitted 保证不重复)
         inThinking = true;
-        thinkingBuf = body;
+        thinkingBuf = body.slice(body.indexOf('>') + 1);
+        thinkingEmitted = 0;
         return { text: chunk.slice(0, openIdx), thinking: '' };
       }
       // 无开启标签: 检查是否有残留闭合标签(跨 chunk 丢失开启的情况)
@@ -333,21 +412,63 @@ App.Chat.doSend = async function (text, opts = {}) {
     }
     // 已在 thinking 模式
     thinkingBuf += chunk;
+    // ── 闭合标签劈开保护 ──
+    // 后端逐字符发射 token:'</思考要点>' 等变体闭合标签永远凑不进单条归一化正则
+    // → 闭合失败,标签原文裸漏进思考正文,且后续答案内容全部被当成思考。
+    // ① 末尾悬空 '<'(可能是被劈开的标签前缀)先扣住不吐;
+    // ② '<...>' 凑齐后对这一小段做变体归一化,让下方 </thinking> 闭合检测命中。
+    const hangLt = thinkingBuf.lastIndexOf('<');
+    if (hangLt !== -1 && thinkingBuf.indexOf('>', hangLt) === -1 && (thinkingBuf.length - hangLt) <= 32) {
+      const heldDelta = thinkingBuf.slice(thinkingEmitted, hangLt);
+      thinkingEmitted = hangLt;
+      return { text: '', thinking: heldDelta };
+    }
+    const lastGt = thinkingBuf.lastIndexOf('>');
+    if (lastGt !== -1) {
+      const lastLt = thinkingBuf.lastIndexOf('<', lastGt);
+      if (lastLt !== -1 && lastGt - lastLt < 32) {
+        const seg = thinkingBuf.slice(lastLt, lastGt + 1);
+        const norm = seg
+          .replace(/<(?:\|)?(?:[a-zA-Z][\w.:-]*)?thinking[\w.:-]*(?:\|)?[^>]*>/gi, '<thinking>')
+          .replace(/<(?:\|)?\/(?:\|)?(?:[a-zA-Z][\w.:-]*)?thinking[\w.:-]*(?:\|)?[^>]*>/gi, '</thinking>')
+          .replace(/<\s*(\/?)\s*(?:思考[\u4e00-\u9fa5]{0,4}|think\w*)\s*>/g, (_, s2) => s2 ? '</thinking>' : '<thinking>');
+        if (norm !== seg) thinkingBuf = thinkingBuf.slice(0, lastLt) + norm + thinkingBuf.slice(lastGt + 1);
+      }
+    }
     // 安全限制:thinkingBuf 超过 8000 字符仍未闭合,强制退出 thinking 模式
     // 防止 </thinking> 丢失导致后续所有 token 被吞
     if (thinkingBuf.length > 8000) {
       console.warn('[processTokenChunk] thinkingBuf exceeded 8000 chars without closing tag, forcing exit');
-      const leftover = thinkingBuf;
+      // 渐进式流已发出 thinkingEmitted 字符,只补发未发出的余量,避免重复
+      const leftover = thinkingBuf.slice(thinkingEmitted);
       inThinking = false;
+      inSysReminder = false; sysRemLen = 0;
       thinkingBuf = '';
-      return { text: leftover, thinking: '' };
+      thinkingEmitted = 0;
+      // 已积累的内容是思考原文,应路由到思考区(而非 text)——否则会整段泄漏进主答案
+      return { text: '', thinking: leftover };
     }
     const endIdx = thinkingBuf.indexOf('</thinking>');
-    if (endIdx === -1) return { text: '', thinking: '' };
-    const thinking = thinkingBuf.slice(0, endIdx + 11);
+    if (endIdx === -1) {
+      // 渐进式思考流:立即吐出本 chunk 带来的思考增量。
+      // 末尾若恰好是 </thinking> 的前缀(闭合标签被 chunk 边界劈开),先扣住不发,
+      // 等下一个 chunk 补齐后再发出,防止标签残片混进思考正文。
+      const CLOSE = '</thinking>';
+      let safeLen = thinkingBuf.length;
+      for (let keep = Math.min(CLOSE.length - 1, thinkingBuf.length); keep > 0; keep--) {
+        if (thinkingBuf.endsWith(CLOSE.slice(0, keep))) { safeLen = thinkingBuf.length - keep; break; }
+      }
+      const delta = thinkingBuf.slice(thinkingEmitted, safeLen);
+      thinkingEmitted = safeLen;
+      return { text: '', thinking: delta };
+    }
+    // 闭合:补发剩余思考增量(不含 </thinking> 标签本身),正文从闭合标签之后继续
+    const thinking = thinkingBuf.slice(thinkingEmitted, endIdx);
     const after = thinkingBuf.slice(endIdx + 11);
     inThinking = false;
+    inSysReminder = false; sysRemLen = 0;
     thinkingBuf = '';
+    thinkingEmitted = 0;
     return { text: after, thinking };
   }
 
@@ -378,8 +499,13 @@ App.Chat.doSend = async function (text, opts = {}) {
     }
   }, CONNECT_TIMEOUT_MS);
 
-  // 节流渲染:多个 token 合并后每帧一次 re-render,避免 O(n²) 全量 DOM 重排
+  // 节流渲染:多个 token 合并后再 re-render。
+  // 注意:原来是 requestAnimationFrame(约 16ms 一次),对长答案而言等于每秒 60 次
+  // 全量 Markdown 解析 + 整块 innerHTML 替换,直接造成输入/滚动卡顿。
+  // 改成 100ms 时间片节流 + 内容未变化直接跳过,重排次数降到 1/6。
   let renderTimer = null;
+  const RENDER_MIN_INTERVAL_MS = 100;
+  let _lastRenderAt = 0;
   // 流读取超时(空闲间隙):后端在 120s 内无任何事件(判定为卡死)时主动断开
   let streamTimeout = null;
   // 绝对上限:即使后端持续产生事件,也不得超过 10 分钟,防止永久挂起
@@ -388,35 +514,174 @@ App.Chat.doSend = async function (text, opts = {}) {
   function cleanupStream() {
     if (streamTimeout !== null) { clearTimeout(streamTimeout); streamTimeout = null; }
     if (hardTimeout !== null) { clearTimeout(hardTimeout); hardTimeout = null; }
-    if (renderTimer !== null) { cancelAnimationFrame(renderTimer); renderTimer = null; }
+    if (renderTimer !== null) { clearTimeout(renderTimer); renderTimer = null; }
   }
 
   let _lastRenderedHtml = '';
-  
+  let _lastRenderedMd = '';
+
+  /* 思考面板收尾:把 "💭 思考中" 标签翻转为终态,防止流结束后面板仍停留在
+   * "思考中" 的进行时观感(转圈/闪烁印象)。done/首段正文到达时调用。
+   * 幂等:dataset.done 已置位则跳过;answer_reset 时清除以支持重写轮复位。 */
+  App.markThinkingDone = function (mode, msg) {
+    const m = msg || App._currentBotMsg;
+    if (!m) return;
+    const sec = m._thinkingSection;
+    if (sec && !sec.dataset.done) {
+      sec.dataset.done = '1';
+      const label = sec.querySelector('.thinking-label');
+      if (label) label.textContent = (mode === 'error') ? '💭 思考中断' : '💭 思考完成';
+    }
+    if (!mode && m._railSummary) m._railSummary.textContent = '✅ 回复完成';
+  };
+  App.resetThinkingState = function () {
+    const m = App._currentBotMsg;
+    const sec = m && m._thinkingSection;
+    if (sec) {
+      delete sec.dataset.done;
+      const label = sec.querySelector('.thinking-label');
+      if (label) label.textContent = '💭 思考中';
+    }
+  };
+
+  /* 流式文本追加(2026-09-20 修复"标识符/数字被拆出空格"):
+   * 旧逻辑在"上一字符是字母数字 && 下一字符是字母数字"时插一个空格,本意是修
+   * "网关连空格一起吞掉"的模型;但 agnes-3.0-flash 这类会把单词/标识符切成子片段
+   * (COMPLETED → COM + PLETED),于是每个片段边界都被插空格:
+   *   "L97-103" → "L 9 7-1 0 3"、"400" → "4 0 0"、"ProductionStatus" → "P reduction Status"
+   * 代码块/行内代码看起来像坏掉了。后端落库文本(与同一路流一致)空格是正常的,
+   * 说明模型本身就带空格 → 默认原样拼接;确有个别模型需要补空格时置
+   * App.STREAM_SPACE_FIX = true 即可恢复旧行为。 */
+  function appendStreamText(cleanText) {
+    if (!cleanText) return;
+    if (App.STREAM_SPACE_FIX && App._mdBuf) {
+      const lastChar = App._mdBuf.charAt(App._mdBuf.length - 1);
+      const firstChar = cleanText.charAt(0);
+      if (/[a-zA-Z0-9]/.test(lastChar) && /[a-zA-Z0-9]/.test(firstChar)) App._mdBuf += ' ';
+    }
+    App._mdBuf += cleanText;
+  }
+
   function scheduleRender() {
-    if (renderTimer !== null) { console.log('[scheduleRender] skipped: renderTimer pending'); return; }
-    if (renderDone) { console.log('[scheduleRender] skipped: renderDone=true'); return; }
-    renderTimer = requestAnimationFrame(() => {
+    if (renderTimer !== null) return;
+    if (renderDone) return;
+    // 重写挂起时,缓冲区已被清空但旧答案仍显示在界面上,不要把它渲染成空白
+    if (rewritePending) return;
+    // 内容无变化则无需重排(后端偶发心跳/重复事件时省掉一次全量渲染)
+    const pending = App._mdBuf || '';
+    if (pending === _lastRenderedMd) return;
+    const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+    const wait = Math.max(0, Math.min(RENDER_MIN_INTERVAL_MS, RENDER_MIN_INTERVAL_MS - (now - _lastRenderAt)));
+    renderTimer = setTimeout(() => {
       renderTimer = null;
-      if (!answerDiv) { console.log('[scheduleRender] skipped: no answerDiv'); return; }
+      _lastRenderAt = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+      if (!answerDiv) return;
       const md = App._mdBuf || '';
-      if (!md) { console.log('[scheduleRender] skipped: empty _mdBuf'); return; }
-      console.log('[scheduleRender] rendering, md_len:', md.length);
-      
+      if (!md) return;
+
       // 始终全量渲染,确保跨 token 的列表/段落/缩进结构正确
       let html = '';
       try {
         html = App.renderMarkdown(md);
-        console.log('[scheduleRender] renderMarkdown ok, html_len:', html.length, 'preview:', html.slice(0, 150));
       } catch (renderErr) {
         console.error('[renderMarkdown] scheduleRender ERROR:', renderErr);
         html = '<p style="white-space:pre-wrap;word-break:break-word;">' + App.escapeHtml(md) + '</p>';
       }
       answerDiv.innerHTML = html;
       _lastRenderedHtml = html;
-      
+      _lastRenderedMd = md;
+
       App.scrollMessagesToBottom();
-    });
+    }, wait);
+  }
+
+  // ── 服务端兜底:用后端已落库的结果补全"前端中断"的流式输出 ──
+  // 后端 agent 是独立后台任务(SSE 断开也会继续跑完并落库),所以前端流中断时
+  // 服务端往往已有完整答案。以前只弹"执行中断"就把这份完整结果丢掉了,
+  // 表现为"实时输出中断、重新打开历史却有完整内容"。
+  async function _fetchServerAnswer() {
+    try {
+      if (!App.sessionId || !App.apiJSON) return '';
+      // 【修复】recover 请求必须带超时,防止后端重启/无响应时永远 pending,
+      // 导致 finally 块和 UI 清理被阻塞。
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(new DOMException('RecoverTimeout', 'TimeoutError')), 5000);
+      try {
+        const res = await App.apiJSON(`/v1/chat/history?session_id=${encodeURIComponent(App.sessionId)}`, {
+          signal: ac.signal,
+        });
+        if (!res || !res.success) return '';
+        const msgs = (res.data && res.data.messages) || [];
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          if (msgs[i] && msgs[i].role === 'assistant') {
+            // 顺带带回 meta.thinking:流在思考阶段被中断时,思考区也要能从服务端恢复
+            const meta = msgs[i].meta || {};
+            App._serverThinking = typeof meta.thinking === 'string' ? meta.thinking : '';
+            return String(msgs[i].content || '');
+          }
+        }
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch (e) {
+      console.warn('[recover] 拉取服务端结果失败:', e && e.message ? e.message : e);
+    }
+    return '';
+  }
+
+  async function _recoverFromServer() {
+    // 本轮尚未产出任何内容时不采用服务端结果,避免误取上一轮的答案补到本轮
+    if (!receivedTokens && !App._mdBuf) return false;
+    const streamedNet = (App._mdBuf || '').replace(/\s/g, '').length;
+    let server = await _fetchServerAnswer();
+    if (!server || !server.trim()) {
+      // 后端可能仍在收尾(最终保存发生在流结束之后),短暂等待后重试一次
+      await new Promise(r => setTimeout(r, 3000));
+      server = await _fetchServerAnswer();
+    }
+    // 思考区恢复(放在正文早退判断之前):流在思考阶段被限流中断时,
+    // 本地思考区只有残段甚至为空,而正文可能为空导致下方直接 return。
+    // 服务端 meta.thinking 存有完整思考(含未闭合标签兜底提取),补渲染一次。
+    const botMsg0 = App._currentBotMsg;
+    if (botMsg0 && App.addThinking) {
+      const localThinkLen = (botMsg0._thinkingRaw || '').replace(/\s/g, '').length;
+      const serverThink = App._serverThinking || '';
+      if (serverThink && serverThink.replace(/\s/g, '').length > localThinkLen + 20) {
+        App.addThinking(botMsg0, '\n\n' + serverThink);
+        console.log('[recover] 已用服务端 meta.thinking 补全思考区, len:', serverThink.length);
+      }
+    }
+    const cleaned = (App.stripThinkingTags ? App.stripThinkingTags(server) : server).trim();
+    const serverNet = cleaned.replace(/\s/g, '').length;
+    // 仅在"确实丢了大量内容"时才整体替换,避免轻微丢字/思考标签差异
+    // 触发整段重渲染(造成"突然膨出全部内容"):
+    //  - 本地已显示内容几乎为空(真实丢内容) → 允许恢复;
+    //  - 本地已有较多内容且服务端仅略长(误差/少量丢字) → 不重渲染。
+    if (!cleaned) return false;
+    if (serverNet <= streamedNet + 20) return false;
+    if (streamedNet >= 200 && serverNet <= streamedNet * 1.05) return false;
+
+    const target = answerDiv || (App._currentBotMsg && App._currentBotMsg._answer);
+    if (!target) return false;
+    let html = '';
+    try { html = App.renderMarkdown(cleaned); }
+    catch (e) { html = '<p style="white-space:pre-wrap;">' + App.escapeHtml(cleaned) + '</p>'; }
+    target.innerHTML = html;
+    App._mdBuf = cleaned;
+    renderDone = true;
+    done = true;
+    // 终态样式与正常完成保持一致:隐藏过程栏与步骤计数
+    const botMsg = App._currentBotMsg;
+    if (botMsg) {
+      botMsg.classList.add('no-animation');
+      const rail = botMsg.querySelector('.process-rail');
+      if (rail) rail.classList.remove('visible');
+      botMsg.querySelectorAll('.step-counter').forEach(el => { el.style.display = 'none'; });
+    }
+    if (typingShown) App.removeTyping();
+    App.scrollMessagesToBottom(true);
+    console.log('[recover] 已用服务端结果补全本轮输出, len:', cleaned.length);
+    return true;
   }
 
   try {
@@ -503,10 +768,16 @@ App.Chat.doSend = async function (text, opts = {}) {
           if (App.abortController) App.abortController.abort(new DOMException('StreamTimeout', 'TimeoutError'));
           App.clearImageGenerating();
           if (typingShown) App.removeTyping();
-          App.appendMessage('响应超时,请稍后重试', 'error');
-          _finishGroup();
+          // 后端是后台任务,超时断开时它可能已跑完并落库 → 先尝试补全,再决定是否报错
+          _recoverFromServer().then(recovered => {
+            if (!recovered) App.appendMessage('响应超时,请稍后重试', 'error');
+            _finishGroup();
+          }).catch(() => {
+            App.appendMessage('响应超时,请稍后重试', 'error');
+            _finishGroup();
+          });
         }
-      }, 180000); // 180s 空闲间隙 (原 120s，搜索等耗时操作需要更多时间)
+      }, 300000); // 300s 空闲间隙 (原 120s→180s→300s；后端断点续写/限流重试期间可能 90s+5s+90s 无 token，180s 会误杀)
     }
     resetStreamTimeout();
     // 绝对上限:即使后端持续发事件/心跳续期空闲计时器,10 分钟仍未结束则强制断开,
@@ -521,8 +792,14 @@ App.Chat.doSend = async function (text, opts = {}) {
         if (App.abortController) App.abortController.abort(new DOMException('HardTimeout', 'TimeoutError'));
         App.clearImageGenerating();
         if (typingShown) App.removeTyping();
-        App.appendMessage('会话超时(超过 10 分钟未完成),已中止。可重试。', 'error');
-        _finishGroup();
+        // 同上:先用服务端已落库的结果补全,补不到再报错
+        _recoverFromServer().then(recovered => {
+          if (!recovered) App.appendMessage('会话超时(超过 10 分钟未完成),已中止。可重试。', 'error');
+          _finishGroup();
+        }).catch(() => {
+          App.appendMessage('会话超时(超过 10 分钟未完成),已中止。可重试。', 'error');
+          _finishGroup();
+        });
       }
     }, 600000);
 
@@ -615,7 +892,9 @@ App.Chat.doSend = async function (text, opts = {}) {
                        !String(evt.result || '').includes('failed');
             const toolName = evt.name || evt.tool || _toolName;
             const toolArgs = evt.arguments || '';
-            App.addToolStepIfNew(App._currentBotMsg, toolName, toolArgs, ok ? 'done' : 'fail', evt.result);
+            // 携带后端 step_id:与 tool_call_start 预建的 running 行去重同一行,
+            // 避免"同一工具出现 running/done 两行、running 行永不更新"的重复渲染。
+            App.addToolStepIfNew(App._currentBotMsg, toolName, toolArgs, ok ? 'done' : 'fail', evt.result, evt.step_id);
 
             // 图片生成完成:立即展示图片到进度卡片
             if (toolName === 'generate_image' && App.finishImageGenerating) {
@@ -646,19 +925,42 @@ App.Chat.doSend = async function (text, opts = {}) {
               }
             }
             if (!lastToolMsg) {
-              // 没有重复记录,才显示结果
-              App.ExecTrace.updateStep(doneToolName, 'done', '');
-              const imgUrl = App.parseImageUrl(evt.result);
-              if (doneToolName === 'generate_image' && imgUrl) {
-                const toolEl = document.createElement('div');
-                toolEl.className = 'tool-inline';
-                toolEl.innerHTML = `<img class="tool-result-img" src="${App.escapeHtml(imgUrl)}" alt="生成图片">`;
-                _insertBeforeAnswer(toolEl);
-              } else if (evt.result) {
-                // 统一使用 addStep 渲染,保持与历史消息一致
-                App.addToolStepIfNew(App._currentBotMsg, doneToolName, evt.arguments || '', 'done', evt.result);
+              // 卡片内 step-row 去重:`tool` 事件(带 step_id)通常已把该工具渲染为
+              // done/fail 行;tool_done 无 step_id,若盲目 addStep 会再建一行重复记录。
+              // 规则:当前卡片最后一条 step-row 与本工具同名且已结束 → 已渲染过,跳过;
+              // 同名但仍在 running → 交给 addToolStepIfNew 兜底更新该行。
+              let alreadyRendered = false;
+              if (App._currentBotMsg && App._currentBotMsg._stepsFlow) {
+                const lastRow = App._currentBotMsg._stepsFlow.querySelector('.step-row:last-of-type');
+                if (lastRow && lastRow.dataset.tool === doneToolName &&
+                    !lastRow.classList.contains('step-running')) {
+                  alreadyRendered = true;
+                }
               }
-              _showRail();
+              if (alreadyRendered) {
+                // 已由 tool 事件渲染,仅更新轨迹状态
+                App.ExecTrace.updateStep(doneToolName, 'done', '');
+              } else {
+                // 没有重复记录,才显示结果
+                App.ExecTrace.updateStep(doneToolName, 'done', '');
+                const imgUrl = App.parseImageUrl(evt.result);
+                const videoUrl = App.parseVideoUrl ? App.parseVideoUrl(evt.result) : '';
+                if (doneToolName === 'generate_image' && imgUrl) {
+                  const toolEl = document.createElement('div');
+                  toolEl.className = 'tool-inline';
+                  toolEl.innerHTML = `<img class="tool-result-img" src="${App.escapeHtml(imgUrl)}" alt="生成图片">`;
+                  _insertBeforeAnswer(toolEl);
+                } else if ((doneToolName === 'generate_video' || doneToolName === 'enhance_video') && videoUrl) {
+                  const toolEl = document.createElement('div');
+                  toolEl.className = 'tool-inline';
+                  toolEl.innerHTML = App.buildVideoHtml(videoUrl, 'tool-result-video');
+                  _insertBeforeAnswer(toolEl);
+                } else if (evt.result) {
+                  // 统一使用 addStep 渲染,保持与历史消息一致(带 step_id 供去重)
+                  App.addToolStepIfNew(App._currentBotMsg, doneToolName, evt.arguments || '', 'done', evt.result, evt.step_id);
+                }
+                _showRail();
+              }
             } else {
               // 已有记录,仅更新轨迹状态
               App.ExecTrace.updateStep(doneToolName, 'done', '');
@@ -716,10 +1018,15 @@ App.Chat.doSend = async function (text, opts = {}) {
             App.removeTyping();
             _showRail();
             // ⚠️ 后端可能把 <thinking>...</thinking> 整块放在 content 里一起返回,
-            // 也可能只返回纯思考文本。统一 strip 掉标签, 防止 </thinking> 残留到渲染层。
+            // 也可能只返回纯思考文本。用流式版 strip:只剥标签壳、不 trim(保住换行),
+            // 且不做成对剥离——整块 <thinking>...</thinking> 会被成对正则连内容一起删掉。
             const rawContent = evt.content || '';
-            const thinkText = App.stripThinkingTags ? App.stripThinkingTags(rawContent) : rawContent;
-            if (!thinkText.trim()) {
+            // prepare 阶段的状态行(如"准备中: 模型 xxx")是进度提示不是思考内容,
+            // 混进思考区会顶在开头且与后续思考无分隔
+            if (evt.phase === 'prepare') continue;
+            const thinkText = App.stripThinkingTagsStream ? App.stripThinkingTagsStream(rawContent) : rawContent;
+            // ⚠️ 判空不能用 .trim():换行符独占 chunk 时 '\n'.trim()==='' 会把换行丢掉
+            if (!thinkText) {
               // 思考为空:确保 bot 消息已创建, 否则后续 token 无法附着
               if (!App._currentBotMsg) {
                 const botMsg = App.createBotMessage();
@@ -739,11 +1046,48 @@ App.Chat.doSend = async function (text, opts = {}) {
               if (answerDiv) answerDiv.style.display = '';
               App._answerWrap = answerDiv ? { _answer: answerDiv, _rail: botMsg?._rail } : null;
             }
-            // 使用规范渲染器
+            // 使用规范渲染器;独立的整块思考(reasoning)与已有内容之间补段落分隔
             if (App._currentBotMsg && App.addThinking) {
-              App.addThinking(App._currentBotMsg, thinkText);
+              const sep = (evt.reasoning && App._currentBotMsg._thinkingRaw) ? '\n\n' : '';
+              App.addThinking(App._currentBotMsg, sep + thinkText);
             }
             App.updateRailStatus(App._currentBotMsg, 'thinking', '思考中...');
+          } else if (evt.type === 'answer_reset') {
+            // 后端 reflect 判定截断/严重不合格,准备重写。
+            // 关键修复:不要立刻清空界面——直接 answerDiv.innerHTML='' 会造成
+            // "答案显示→突然消失→新答案到达后再次出现"的闪烁观感。
+            // 改为保留上一版答案在屏幕上,清空内部缓冲区并置 rewritePending,
+            // 等新 token 真正开始到达时(见 token 分支)再整体替换。
+            App._mdBuf = '';
+            _lastRenderedHtml = '';
+            rewritePending = true;
+            pendingTextHold = '';
+            // 思考状态机一并复位:重试轮会重新生成思考,不能拼在被丢弃的旧思考后面
+            inThinking = false;
+            inSysReminder = false; sysRemLen = 0;
+            thinkingBuf = '';
+            thinkingEmitted = 0;
+            if (App._currentBotMsg) {
+              App._currentBotMsg._thinkingRaw = '';
+              if (App._currentBotMsg._thinkingBody) App._currentBotMsg._thinkingBody.innerHTML = '';
+              // 思考面板复位:重写轮会重新思考,标签从"思考完成"回到"思考中"
+              App.resetThinkingState();
+            }
+            // 取消待执行的渲染帧,避免把已清空的缓冲区渲染成空白
+            if (renderTimer !== null) { clearTimeout(renderTimer); renderTimer = null; }
+            // 过程栏给出"正在优化回复"提示,让用户知道这是有意为之而非卡死
+            if (App._currentBotMsg) {
+              App.updateRailStatus(App._currentBotMsg, 'thinking', '正在优化回复…');
+            }
+            if (App.DEBUG) console.log('[answer_reset] 标记重写,保留旧答案直至新 token 到达');
+          } else if (evt.type === 'status') {
+            // 后端过程状态(如"模型限流,正在重试…"):更新过程栏,让用户知道没卡死
+            if (App._currentBotMsg) {
+              App.updateRailStatus(App._currentBotMsg, 'thinking', evt.content || '处理中...');
+              const rail = App._currentBotMsg.querySelector('.process-rail');
+              if (rail) rail.classList.add('visible');
+            }
+            if (App.DEBUG) console.log('[status]', evt.content || '');
           } else if (evt.type === 'token') {
             // 第一次 token 到达:显示并移除打字指示器,创建答案容器
             if (!typingShown) {
@@ -776,46 +1120,59 @@ App.Chat.doSend = async function (text, opts = {}) {
             receivedTokens = true;
             const { text, thinking } = processTokenChunk(evt.content || '');
             if (thinking) {
-              const thinkText = App.stripThinkingTags ? App.stripThinkingTags(thinking) : thinking;
+              // 流式版本: 不 trim(否则独占 chunk 的 \n\n 段落换行被清空), 只剥标签壳,
+              // 保留思考正文(旧 stripThinkingTags 的成对正则会连内容一起删掉)
+              const thinkText = App.stripThinkingTagsStream ? App.stripThinkingTagsStream(thinking) : thinking;
               if (App._currentBotMsg && App.addThinking) {
                 App.addThinking(App._currentBotMsg, thinkText);
               }
             }
             if (text) {
-              // 防护: 即使 processTokenChunk 未捕获, 也剥离残留 thinking 标签
-              const cleanText = App.stripThinkingTags ? App.stripThinkingTags(text) : text;
-              // 英文 token 间距修复:LLM token 之间可能无空格,在拼接时自动补空格
-              if (cleanText && App._mdBuf) {
-                const lastChar = App._mdBuf.charAt(App._mdBuf.length - 1);
-                const firstChar = cleanText.charAt(0);
-                const isLetterOrDigit = c => /[a-zA-Z0-9]/.test(c);
-                if (isLetterOrDigit(lastChar) && isLetterOrDigit(firstChar)) {
-                  App._mdBuf += ' ';
-                }
+              // 重写挂起:新的一轮答案从此刻开始,现在才把上一版答案从界面上替换掉。
+              // 此前的 answer_reset 只清空了缓冲区,屏幕上一直保留旧答案,避免空白闪烁。
+              if (rewritePending) {
+                rewritePending = false;
+                App._mdBuf = '';
+                if (answerDiv) answerDiv.innerHTML = '';
               }
-              App._mdBuf += cleanText;
+              // 首段正文到达:思考阶段结束,面板标签从"思考中"翻转为"思考完成"
+              App.markThinkingDone();
+              // 防护: 即使 processTokenChunk 未捕获, 也剥离残留 thinking 标签。
+              // 必须用流式版本: stripThinkingTags 末尾 .trim() 会吃掉每个 chunk 首尾换行,
+              // 独占一个 chunk 的 "\n\n" 段落分隔被整块丢弃 → 全文挤成一个密集段落。
+              const cleanText = App.stripThinkingTagsStream ? App.stripThinkingTagsStream(text) : text;
+              appendStreamText(cleanText);
               // 防止 _mdBuf 无限增长:超过 200KB 时截断头部(保留最近内容)
               const MAX_MD_BUF = 200000;
               if (App._mdBuf.length > MAX_MD_BUF) {
                 App._mdBuf = App._mdBuf.slice(App._mdBuf.length - MAX_MD_BUF);
               }
-              console.log('[token] text_len:', cleanText.length, 'buf_len:', App._mdBuf.length, 'calling scheduleRender');
+              if (App.DEBUG) console.log('[token] text_len:', cleanText.length, 'buf_len:', App._mdBuf.length);
               scheduleRender();
             }
           } else if (evt.type === 'error') {
             done = true;
             isError = true;
+            rewritePending = false;
             inThinking = false;
+            inSysReminder = false; sysRemLen = 0;
             thinkingBuf = '';
+            thinkingEmitted = 0;
             App.clearImageGenerating();
             cleanupStream();
             if (typingShown) App.removeTyping();
             const errBotMsg = App._currentBotMsg || (App.els && App.els.messages && App.els.messages.querySelector('.msg.bot:last-child, .msg.msg-bot:last-child'));
             if (errBotMsg) {
               errBotMsg.classList.add('no-animation');
-              errBotMsg.querySelectorAll('.process-rail, .step-counter, .steps-flow').forEach(el => { el.style.display = 'none'; });
+              // 保留 steps-flow(工具步骤可见,与历史一致);仅隐藏过程栏与 step-counter
+              const rail = errBotMsg.querySelector('.process-rail');
+              if (rail) rail.classList.remove('visible');
+              errBotMsg.querySelectorAll('.step-counter').forEach(el => { el.style.display = 'none'; });
+              App.markThinkingDone('error', errBotMsg);
             }
             if (answerDiv) {
+              // 冲刷扣留的未闭合 '<' 片段(流结束不会再有后续 chunk 拼接)
+              if (pendingTextHold) { App._mdBuf += pendingTextHold; pendingTextHold = ''; }
               const md = App._mdBuf || '';
               let h = '';
               try { h = App.renderMarkdown(md); }
@@ -835,32 +1192,60 @@ App.Chat.doSend = async function (text, opts = {}) {
             }
             _finishGroup();
             break; // 流已结束,退出事件处理循环
+          } else if (evt.type === 'answer') {
+            // verify 节点内联重写:后端一次性下发完整(新)答案,而非逐 token 流。
+            // 直接以该内容替换当前缓冲并渲染,避免在 done 之后再走 _recoverFromServer
+            // 全量重渲染,造成"突然膨出全部内容"。
+            const raw = typeof evt.content === 'string' ? evt.content : '';
+            if (raw) {
+              receivedTokens = true;
+              rewritePending = false;
+              App._mdBuf = raw;
+              if (answerDiv) {
+                const md = (App.stripThinkingTags ? App.stripThinkingTags(raw) : raw)
+                  .replace(/\n{3,}/g, '\n\n').trim();
+                let html = '';
+                try { html = App.renderMarkdown(md); }
+                catch (e) { html = '<p style="white-space:pre-wrap;">' + App.escapeHtml(md) + '</p>'; }
+                answerDiv.innerHTML = html;
+              }
+            }
+            // 不 break:verify 之后仍会发 done,继续处理以收尾。
           } else if (evt.type === 'done') {
             done = true;
+            rewritePending = false;
             // 注意:renderDone 延迟到最终渲染之后设置,避免跳过待处理的 scheduleRender
             // 强制退出 thinking 模式:防止 </thinking> 丢失导致内容被吞
             inThinking = false;
+            inSysReminder = false; sysRemLen = 0;
             thinkingBuf = '';
+            thinkingEmitted = 0;
             App.clearImageGenerating();
             cleanupStream();
             if (typingShown) App.removeTyping();
-            // 无条件隐藏流式专属元素,与历史消息样式统一
+            // 与历史回放统一:终态隐藏 process-rail(历史卡片的 rail 无 .visible,默认 display:none),
+            // 保留 steps-flow(工具步骤可见)——仅隐藏纯流式态的 step-counter。
             const botMsg = App._currentBotMsg || (App.els && App.els.messages && App.els.messages.querySelector('.msg.bot:last-child, .msg.msg-bot:last-child'));
             if (botMsg) {
               botMsg.classList.add('no-animation');
-              botMsg.querySelectorAll('.process-rail, .step-counter, .steps-flow').forEach(el => { el.style.display = 'none'; });
+              const rail = botMsg.querySelector('.process-rail');
+              if (rail) rail.classList.remove('visible'); // 取消流式期添加的 .visible,回到历史同款隐藏态
+              botMsg.querySelectorAll('.step-counter').forEach(el => { el.style.display = 'none'; });
               const think = botMsg.querySelector('.thinking-section');
               if (think && !think.classList.contains('open')) think.style.display = 'none';
             }
+            // 思考面板收尾:标签翻转为"思考完成",过程栏置为完成态
+            App.markThinkingDone(null, botMsg);
             // 流式完成后整段重渲染,确保最终内容(含跨切片块级结构)正确
             if (answerDiv) {
+              // 冲刷扣留的未闭合 '<' 片段(流结束不会再有后续 chunk 拼接)
+              if (pendingTextHold) { App._mdBuf += pendingTextHold; pendingTextHold = ''; }
               const rawMd = App._mdBuf || '';
               const finalMd = (App.stripThinkingTags ? App.stripThinkingTags(rawMd) : rawMd)
                 .replace(/\n{3,}/g, '\n\n').trim();
               let finalHtml = '';
               try {
                 finalHtml = App.renderMarkdown(finalMd);
-                console.log('[done] renderMarkdown ok, html_len:', finalHtml.length, 'preview:', finalHtml.slice(0, 150));
               } catch (renderErr) {
                 console.error('[renderMarkdown] done handler ERROR:', renderErr);
                 finalHtml = '<p>' + App.escapeHtml(finalMd) + '</p>';
@@ -916,11 +1301,16 @@ App.Chat.doSend = async function (text, opts = {}) {
               App.refreshWelcomePage();
               App.appendMessage('未收到响应,请重试', 'error');
             }
+            // 兜底对齐:流式过程中若丢过内容(标签状态机吞掉/事件丢失),
+            // 服务端落库的是完整结果,用它与界面对齐一次(内容不明显更长时不会改动界面)
+            _recoverFromServer().catch(() => {});
             break; // 流已完成,退出事件处理循环
           } else if (evt.type === 'cancelled') {
             done = true;
             inThinking = false;
+            inSysReminder = false; sysRemLen = 0;
             thinkingBuf = '';
+            thinkingEmitted = 0;
             App.clearImageGenerating();
             cleanupStream();
             if (typingShown) App.removeTyping();
@@ -973,11 +1363,14 @@ App.Chat.doSend = async function (text, opts = {}) {
             done = true;
             renderDone = true; // 必须在 cleanupStream 之前设置
             inThinking = false;
+            inSysReminder = false; sysRemLen = 0;
             thinkingBuf = '';
+            thinkingEmitted = 0;
             App.clearImageGenerating();
             cleanupStream();
             if (typingShown) App.removeTyping();
             if (answerDiv) {
+              if (pendingTextHold) { App._mdBuf += pendingTextHold; pendingTextHold = ''; }
               const rawMd = App._mdBuf || '';
               const finalMd = (App.stripThinkingTags ? App.stripThinkingTags(rawMd) : rawMd)
                 .replace(/\n{3,}/g, '\n\n').trim();
@@ -1027,10 +1420,13 @@ App.Chat.doSend = async function (text, opts = {}) {
           } else if (evt.type === 'error' && !done && !isError) {
             done = true; isError = true;
             inThinking = false;
+            inSysReminder = false; sysRemLen = 0;
             thinkingBuf = '';
+            thinkingEmitted = 0;
             App.clearImageGenerating(); cleanupStream();
             if (typingShown) App.removeTyping();
             if (answerDiv) {
+              if (pendingTextHold) { App._mdBuf += pendingTextHold; pendingTextHold = ''; }
               const md = App._mdBuf || '';
               let h = '';
               try { h = App.renderMarkdown(md); }
@@ -1052,10 +1448,10 @@ App.Chat.doSend = async function (text, opts = {}) {
               receivedTokens = true;
               const { text, thinking } = processTokenChunk(evt.content || '');
               if (thinking) {
-                const thinkText = App.stripThinkingTags ? App.stripThinkingTags(thinking) : thinking;
+                const thinkText = App.stripThinkingTagsStream ? App.stripThinkingTagsStream(thinking) : thinking;
                 App.appendThinking(thinkText);
               }
-              if (text) { const cleanText = App.stripThinkingTags ? App.stripThinkingTags(text) : text; if (cleanText && App._mdBuf) { const lastChar = App._mdBuf.charAt(App._mdBuf.length - 1); const firstChar = cleanText.charAt(0); if (/[a-zA-Z0-9]/.test(lastChar) && /[a-zA-Z0-9]/.test(firstChar)) { App._mdBuf += ' '; } } App._mdBuf += cleanText; if (App._mdBuf.length > 200000) { App._mdBuf = App._mdBuf.slice(-200000); } scheduleRender(); }
+              if (text) { const cleanText = App.stripThinkingTagsStream ? App.stripThinkingTagsStream(text) : text; appendStreamText(cleanText); if (App._mdBuf.length > 200000) { App._mdBuf = App._mdBuf.slice(-200000); } scheduleRender(); }
             }
           } else if (evt.type === 'heartbeat') {
             // no-op
@@ -1110,25 +1506,37 @@ App.Chat.doSend = async function (text, opts = {}) {
     // 流被异常中断:直接显示错误,不再回退非流式接口
     // 场景1: 从未收到任何事件 → "响应中断"
     // 场景2: 收到过事件(工具执行等)但流未正常完成(连接中断/后端异常) → "执行中断"
+    // 【关键修复】recover 可能因后端重启/网络抖动而长时间挂起,必须**先清理 UI**
+    // 再异步尝试服务端补全,否则 typing 指示器和 streaming 状态会永远卡住。
     if (!done && !isError) {
       App.removeTyping();
-      if (renderTimer !== null) { cancelAnimationFrame(renderTimer); renderTimer = null; }
-      if (receivedAnyEvent) {
-        App.appendMessage('执行中断,结果可能不完整。请检查上下文长度后重试', 'error');
-      } else {
-        App.appendMessage('响应中断,请稍后重试', 'error');
-      }
-      _finishGroup();
+      if (App._currentGroup) _finishGroup();
+      if (renderTimer !== null) { clearTimeout(renderTimer); renderTimer = null; }
+      // 异步 recover:不阻塞 finally 的后续清理
+      _recoverFromServer().then(recovered => {
+        if (!recovered) {
+          if (receivedAnyEvent) {
+            App.appendMessage('执行中断,结果可能不完整。请检查上下文长度后重试', 'error');
+          } else {
+            App.appendMessage('响应中断,请稍后重试', 'error');
+          }
+        }
+      }).catch(recErr => {
+        console.warn('[recover] 补全失败:', recErr && recErr.message ? recErr.message : recErr);
+        if (receivedAnyEvent) {
+          App.appendMessage('执行中断,结果可能不完整。请检查上下文长度后重试', 'error');
+        } else {
+          App.appendMessage('响应中断,请稍后重试', 'error');
+        }
+      });
     }
   } catch (e) {
     // AbortError 由 stop() 处理(已追加提示),这里仅做静默清理
     cleanupStream();
-    if (typingShown) App.removeTyping();
+    App.removeTyping();
+    if (App._currentGroup) _finishGroup();
     if (e.name !== 'AbortError') {
       App.appendMessage(`请求失败: ${e.message}`, 'error');
-      _finishGroup();
-    } else {
-      _finishGroup();
     }
   } finally {
     /* 代次保护: 仅当本轮仍是"最新发送"时才重置全局 streaming 状态。
@@ -1148,7 +1556,11 @@ App.Chat.doSend = async function (text, opts = {}) {
     renderDone = false;
     _lastRenderedHtml = '';
     inThinking = false;
+    inSysReminder = false; sysRemLen = 0;
     thinkingBuf = '';
+    thinkingEmitted = 0;
+    pendingTextHold = '';
+    thinkingEmitted = 0;
     /* 代次保护: 旧流不得强制复位 sendBtn/streaming, 否则新流刚显示的 stopBtn
        会被 setStreaming(false) 隐藏。仅最新代次才启用按钮 + 同步 streaming。 */
     if (!isStale) {
@@ -1164,12 +1576,28 @@ App.Chat.doSend = async function (text, opts = {}) {
     if (!isStale) App.abortController = null;
     if (App.Attach) App.Attach.reset();
     if (App.CtxMeter) App.CtxMeter.refresh();
+    // 新建的会话在发出第一条消息前后端没有记录(侧边栏列表里不存在),
+    // 消息落库后把它补进列表;已存在的会话不会触发额外请求。
+    if (!isStale && App.Session && App.Session.refreshIfNeeded) {
+      try { await App.Session.refreshIfNeeded(); } catch (_) {}
+    }
     if (!isStale) App.els.input.focus();
   }
 };
 
 App.Chat.stop = function (silent) {
   App.Chat._streamingStart = null;
+  // 显式通知后端取消后台 agent:仅断连(abort)不会被后端当作取消,
+  // agent 会继续跑完并落库,以便前端从服务端补全结果。
+  try {
+    if (App.sessionId && App.apiJSON) {
+      App.apiJSON('/v1/chat/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: App.sessionId }),
+      }).catch(() => {});
+    }
+  } catch (_) { /* 忽略:取消失败不影响前端停止 */ }
   if (App.abortController) {
     try { App.abortController.abort(); } catch (_) { /* 忽略 */ }
   }

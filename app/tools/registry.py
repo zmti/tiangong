@@ -121,6 +121,17 @@ class ToolRegistry:
 
     def register(self, tool: Tool) -> None:
         with self._lock:
+            # 同名工具重复注册处理:
+            # 旧实现直接覆盖(self._tools[name] = tool),导致后导入的模块"抢占"同名工具,
+            # LLM 按 OpenAI schema 看到的参数签名可能是先注册版本的,实际执行的却是
+            # 后注册版本的 func → 参数对不上 → 工具报 "edits 不是合法 JSON" 这类失败。
+            # 现改为:已存在同名工具时保留先注册的(稳定优先),并记 warning,避免静默覆盖。
+            if tool.name in self._tools:
+                import logging
+                logging.getLogger("tools.registry").warning(
+                    "工具 %s 重复注册,保留先注册的实现(新实现来自 %s 被忽略)",
+                    tool.name, getattr(tool.func, "__module__", "?"))
+                return
             self._tools[tool.name] = tool
 
     def get(self, name: str) -> Optional[Tool]:
@@ -196,7 +207,7 @@ def tool(name: Optional[str] = None, description: str = "", timeout: float = 30.
             terminal=terminal,
         )
         # 使用同步注册，因为装饰器在模块导入时调用
-        default_registry._tools[t.name] = t
+        default_registry.register(t)
         return t
 
     # 用法一: @tool
@@ -218,6 +229,7 @@ def get_registry() -> ToolRegistry:
         from app.tools import code_tool  # noqa: F401  # 注册 run_code 工具
         from app.tools import image_tool  # noqa: F401  # 注册 generate_image 工具
         from app.tools import video_tool  # noqa: F401  # 注册 generate_video 工具
+        from app.tools import video_enhance_tool  # noqa: F401  # 注册 enhance_video 工具(配音/字幕/水印)
         from app.tools import web_tool  # noqa: F401  # 注册网页抓取工具
         from app.tools import db_tool  # noqa: F401  # 注册数据库查询工具
         from app.tools import mcp_tool  # noqa: F401  # MCP 工具支持
@@ -245,7 +257,11 @@ def get_registry() -> ToolRegistry:
         from app.tools import debug_assist_tool  # noqa: F401  # 注册调试辅助工具
         from app.tools import dependency_tool  # noqa: F401  # 注册依赖管理工具
         from app.tools import project_tool  # noqa: F401  # 注册项目管理工具(scaffold/analyze/testgen/docs/build)
-        from app.tools import code_file  # noqa: F401  # 注册结构化代码编辑工具(read_file/edit_file/apply_patch/check_syntax)
+        from app.tools import code_file  # noqa: F401  # 注册结构化代码编辑工具
+        # 说明: code_file 的 edit_file 与 file_tool 同名但带独立前缀(code_edit_file),
+        # 避免"后注册者覆盖先注册者"导致 LLM 实际调用时拿到参数签名不一致的实现,
+        # 表现为"执行任务时读写文件失败: edits 不是合法 JSON"。
+        # 详见 ToolRegistry._register 的重复名处理逻辑。
         from app.tools import cost_tool  # noqa: F401  # 注册成本追踪工具(cost_summary/cost_report)
         from app.tools import image_ocr  # noqa: F401  # 注册图片 OCR 工具(image_ocr/screenshot_ocr)
         from app.tools import search_tool  # noqa: F401  # 注册实时搜索工具(web_search/news_search)
@@ -253,6 +269,7 @@ def get_registry() -> ToolRegistry:
         from app.tools import document_tool  # noqa: F401  # 注册文档深度解析工具(parse_document/document_summary)
         from app.tools import computer_use  # noqa: F401  # 注册 Computer Use 视觉驾驶工具
         from app.tools import workflow_tool  # noqa: F401  # 注册工作流工具(run_workflow/list_workflows/get_workflow)
+        from app.tools import web_test_tool  # noqa: F401  # 注册 H5/网页自动测试工具(web_auto_test)
         from app.agents import handoff_tool  # noqa: F401  # 注册角色委派/团队工具(list_roles/handoff_to_role)
         from app.rag import documents  # noqa: F401  # 注册 rag_search 工具
 

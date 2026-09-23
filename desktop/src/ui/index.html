@@ -6,7 +6,9 @@
   <!-- CSP: Electron 桌面应用本地加载 + 内联 style + 后端 127.0.0.1 -->
   <!-- eval 兼容层已拆为 5 个独立模块(exec-trace/toast/lightbox/tts/confirm-dialog), 故无需 unsafe-eval -->
   <!-- unsafe-inline 仅为兼容 17 处内联 style, 后续收敛后应改为 nonce/hash -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:* blob: data:; media-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none';">
+  <!-- img-src / media-src 必须放行 http://127.0.0.1: 生成的图片/视频由本地后端提供,
+       页面本身是 file:// 加载,'self' 只等于 file:,不放行会导致 img/video 静默被拦截(不报错、显示空白) -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http://127.0.0.1:* http://localhost:*; font-src 'self' data:; connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:* blob: data:; media-src 'self' blob: data: http://127.0.0.1:* http://localhost:*; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none';">
   <title>天工</title>
   <link rel="stylesheet" href="style.css">
   <link rel="stylesheet" href="style-command.css">
@@ -630,8 +632,11 @@
         <!-- 左侧导航 -->
         <div class="settings-nav">
           <div class="settings-nav-item active" data-section="model">模型设置</div>
+          <div class="settings-nav-item" data-section="genmodel">生成模型</div>
           <div class="settings-nav-item" data-section="appearance">外观</div>
           <div class="settings-nav-item" data-section="prompt">提示词</div>
+          <div class="settings-nav-item" data-section="rules">智能体规则</div>
+          <div class="settings-nav-item" data-section="skills">技能</div>
           <div class="settings-nav-item" data-section="backend">后端</div>
           <div class="settings-nav-item" data-section="about">关于</div>
         </div>
@@ -662,6 +667,55 @@
             </div>
           </div>
 
+          <!-- 生成模型设置(图片/视频):覆盖 .env 与代码默认值,保存后立即生效 -->
+          <div class="settings-section" data-section="genmodel">
+            <div class="settings-section-title">生成模型</div>
+            <p class="gen-lead">
+              图片 / 视频生成调用哪个模型。候选来自「模型设置」里带对应能力的模型,
+              选择即覆盖 <code>.env</code> 配置,保存后立即生效、无需重启。
+            </p>
+
+            <div class="gen-card">
+              <div class="gen-card-head">
+                <span class="gen-card-icon" aria-hidden="true">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"></rect><circle cx="8.5" cy="8.5" r="1.5"></circle><polyline points="21 15 16 10 5 21"></polyline></svg>
+                </span>
+                <span class="gen-card-name">图片生成模型</span>
+                <span class="gen-badge" id="genImageModelBadge" data-source="default">加载中</span>
+              </div>
+              <select id="genImageModelSelect" class="gen-select"></select>
+              <div class="gen-meta">
+                <span class="gen-meta-key">当前生效</span>
+                <code class="gen-meta-val" id="genImageModelValue">-</code>
+                <span class="gen-warn" id="genImageModelWarn" hidden>⚠ 端点不匹配</span>
+              </div>
+            </div>
+
+            <div class="gen-card">
+              <div class="gen-card-head">
+                <span class="gen-card-icon" aria-hidden="true">
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="2.2"></rect><line x1="7" y1="2" x2="7" y2="22"></line><line x1="17" y1="2" x2="17" y2="22"></line><line x1="2" y1="12" x2="22" y2="12"></line><line x1="2" y1="7" x2="7" y2="7"></line><line x1="2" y1="17" x2="7" y2="17"></line><line x1="17" y1="7" x2="22" y2="7"></line><line x1="17" y1="17" x2="22" y2="17"></line></svg>
+                </span>
+                <span class="gen-card-name">视频生成模型</span>
+                <span class="gen-badge" id="genVideoModelBadge" data-source="default">加载中</span>
+              </div>
+              <select id="genVideoModelSelect" class="gen-select"></select>
+              <div class="gen-meta">
+                <span class="gen-meta-key">当前生效</span>
+                <code class="gen-meta-val" id="genVideoModelValue">-</code>
+                <span class="gen-warn" id="genVideoModelWarn" hidden>⚠ 端点不匹配</span>
+              </div>
+            </div>
+
+            <div class="gen-actions">
+              <button class="mini-btn primary" id="saveGenModelsBtn">保存</button>
+              <button class="mini-btn" id="reloadGenModelsBtn">重新加载</button>
+              <span class="gen-status" id="genModelsStatus"></span>
+            </div>
+
+            <p class="gen-note" id="genEndpointNote"></p>
+          </div>
+
           <!-- 提示词设置 -->
           <div class="settings-section" data-section="prompt">
             <div class="settings-section-title">提示词</div>
@@ -669,6 +723,26 @@
               <span class="setting-label">自定义 System Prompt</span>
               <textarea id="sidebarSystemPrompt" class="setting-textarea" placeholder="输入自定义 System Prompt..." rows="5"></textarea>
             </div>
+          </div>
+
+          <!-- 智能体规则设置 -->
+          <div class="settings-section" data-section="rules">
+            <div class="settings-section-title">智能体规则</div>
+            <div class="setting-row">
+              <button class="lb-btn" id="addRuleSetBtn">＋ 新建规则集</button>
+              <span class="muted" id="rulesHint" style="margin-left:10px;">软规则注入提示,硬规则运行时拦截</span>
+            </div>
+            <div id="ruleSetsAdmin" class="prov-admin"></div>
+          </div>
+
+          <!-- 技能管理 -->
+          <div class="settings-section" data-section="skills">
+            <div class="settings-section-title">技能</div>
+            <div class="setting-row">
+              <span class="muted" id="skillsHint">内置多步技能编排,启用后可在对话中用 run_skill 触发</span>
+              <button class="lb-btn" id="refreshSkillsBtn" style="margin-left:auto;">刷新</button>
+            </div>
+            <div id="skillsAdmin" class="prov-admin"></div>
           </div>
 
           <!-- 后端设置 -->
@@ -705,6 +779,7 @@
   <script src="js/lightbox.js"></script>
   <script src="js/tts.js"></script>
   <script src="js/confirm-dialog.js"></script>
+  <script src="js/confirmation.js"></script>
   <script src="js/attachments.js"></script>
   <script src="js/session.js"></script>
   <script src="js/kb.js"></script>

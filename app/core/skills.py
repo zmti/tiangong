@@ -151,6 +151,40 @@ class SkillResult:
         }
 
 
+def _is_tool_error(result_str: str, executor=None) -> bool:
+    """判断工具返回结果是否为错误(与 ToolExecutor.is_tool_error 口径一致)。
+
+    executor 提供 is_tool_error 方法时优先复用,否则按 dict 内 error/success/blocked 兜底。
+    """
+    fn = getattr(executor, "is_tool_error", None)
+    if callable(fn):
+        try:
+            return bool(fn(result_str))
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        data = json.loads(result_str)
+        if isinstance(data, dict):
+            if data.get("error"):
+                return True
+            if data.get("success") is False or data.get("blocked") is True:
+                return True
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return False
+
+
+def _extract_error(result_str: str) -> str:
+    """从工具错误结果中提取可读错误信息。"""
+    try:
+        data = json.loads(result_str)
+        if isinstance(data, dict):
+            return str(data.get("error") or data.get("message") or result_str)[:300]
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return (result_str or "")[:300]
+
+
 class SkillExecutor:
     """技能执行引擎:按步骤依次调用工具,支持错误处理和条件跳过。
 
@@ -191,6 +225,17 @@ class SkillExecutor:
                 result_str = await executor.execute_tool(
                     step.tool, _json.dumps(args, ensure_ascii=False),
                 )
+                # 工具返回错误 JSON(未抛异常)也应判为失败,与 ToolExecutor.is_tool_error 口径一致
+                if _is_tool_error(result_str, executor):
+                    err_text = _extract_error(result_str)
+                    step_results.append(StepResult(
+                        step_index=i, tool=step.tool, label=label,
+                        success=False, result=result_str, error=err_text,
+                        duration=time.time() - st0,
+                    ))
+                    if stop_on_error:
+                        break
+                    continue
                 step_results.append(StepResult(
                     step_index=i, tool=step.tool, label=label,
                     success=True, result=result_str,
@@ -337,6 +382,20 @@ _builtin_skills: list[Skill] = [
         params=[
             SkillParam(name="fix_low_severity", type_="boolean",
                        description="尝试修复低风险项", default=False),
+        ],
+    ),
+    Skill(
+        name="web_e2e_test",
+        description="自动测试当前 H5/网页项目:启动 dev server,用浏览器打开,捕获 console 错误/"
+                    "页面异常/失败请求并截图,返回冒烟测试报告。适合:完成前端改动后验证页面能正常加载、无报错。",
+        steps=[
+            SkillStep(tool="web_auto_test", args={}, label="自动冒烟测试"),
+        ],
+        params=[
+            SkillParam(name="url", type_="string",
+                       description="已运行的 dev server 地址;留空则自动检测并拉起", default="", required=False),
+            SkillParam(name="smoke_selectors", type_="string",
+                       description="可选,JSON 数组的 CSS 选择器,要求全部存在才算通过", default="", required=False),
         ],
     ),
 ]

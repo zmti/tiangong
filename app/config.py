@@ -35,7 +35,13 @@ class Settings(BaseSettings):
 
     # ---- 图片 ----
     image_provider: str = ""  # 图片生成 provider;留空表示跟随 openai_compat
-    image_model: str = "agnes-image-2.0-flash"  # 图片生成模型
+    image_model: str = "agnes-image-2.0-flash"  # 图片生成模型(可用 IMAGE_MODEL 覆盖)
+
+    # ---- 视频 ----
+    video_model: str = "agnes-video-v2.0"  # 视频生成模型(可用 VIDEO_MODEL 覆盖)
+
+    # 说明:以上模型均可在 .env 里配置(字段名转大写即环境变量名,无 env_prefix);
+    # 桌面端设置面板的覆盖值优先级更高,见 app/core/config_runtime.py。
 
     # ---- Embedding ----
     # local: 本地哈希嵌入(默认,无外部依赖) / api: 使用 OpenAI 兼容 Embeddings API
@@ -153,7 +159,12 @@ class Settings(BaseSettings):
     agent_code_heal_rounds: int = 2
 
     # ---- Agent ----
-    agent_max_steps: int = 10
+    agent_max_steps: int = 0
+    # 0 = 不设步骤上限(由 agent_replan_max_times 收敛控制:重新规划耗尽后,
+    # 同一工具连续失败 3 次仍 giveup;配合 _tool_failure 的"同参 3 连败"兜底,
+    # 不会死循环)。设 >0(如 10)则按旧行为在第 N 轮强制 giveup。
+    # 旧实现默认 10:复杂任务(计划 >5 步 / 多轮工具探索)经常在 10 轮内打不完,
+    # 前端看到"无法完成任务:已尝试 10 步,仍未能得到正确结果"。现默认放开。
     # 同一 Agent 实例最大并发运行数(0=不限制);防止大量并发请求耗尽 LLM 配额和服务器资源
     agent_max_concurrent_runs: int = 5
     agent_temperature: float = 0.7
@@ -185,6 +196,13 @@ class Settings(BaseSettings):
     agent_llm_stream_idle_timeout: int = 90
     # 流式调用总时长上限(秒): 从建连到流结束的整体硬超时,0 = 不限制
     agent_llm_stream_total_timeout: int = 600
+    # 底层 HTTP 读超时(秒): 0 = 自动派生(max(空闲超时+30, 120))。
+    # 必须大于 agent_llm_stream_idle_timeout,否则 httpx 会先于应用层空闲守卫
+    # 抛原始 ReadTimeout 杀掉仍在正常输出的流(实测 2026-09-20 read=60 < idle=90)
+    agent_llm_http_read_timeout: int = 0
+    # 答案"没写完"时自动续写的最大次数(0 = 关闭)。网关常把 max_tokens 截断
+    # 归一化成 finish_reason=stop,没有这层守卫时用户会看到半截答案
+    agent_answer_continue_max: int = 2
     # 故障转移:主 provider 连续失败耗尽重试后,自动切换到备用 provider(留空 = 不切换)
     agent_llm_failover_provider: str = ""
     # 备用 provider 使用的模型(留空 = 该 provider 默认模型)
@@ -284,7 +302,9 @@ class Settings(BaseSettings):
     # ---- 反思循环(生成→自评→重写,Reflexion 式) ----
     # 关闭时保留现有"工具失败反思"(失败提示注入);开启后最终回答前先用 LLM
     # 按结构化 schema 自评,不合格且有预算则回灌评语要求模型重写(最多 agent_reflect_max_rounds 轮)
-    agent_reflect: bool = True
+    # 默认关闭:每条实质性回答额外多 1~3 次 LLM 调用,在上游限流(agnes)环境下
+    # 显著放大"限流杀流/答案重写闪烁"等不稳定现象。需要质量优先时可手动开启。
+    agent_reflect: bool = False
     # 自评→重写最多轮数(每轮多一次 LLM 调用),增加到2轮以提高成功率
     agent_reflect_max_rounds: int = 2
     # critic/executor 双角色:开启后评审用独立模型(区别于执行模型),避免自评偏袒。

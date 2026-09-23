@@ -49,7 +49,19 @@
       App._thinkingWrap = div;
     }
     const body = App._thinkingWrap.querySelector('.think-body');
-    body.textContent = App.stripThinkingTags(content).slice(0, 2000);
+    // 流式安全:追加而非替换,不 trim(保住 chunk 边界的换行/段落分隔)
+    const clean = App.stripThinkingTagsStream ? App.stripThinkingTagsStream(content) : content;
+    // ⚠️ 判空不能用 .trim():换行符独占 chunk 时会被整块丢弃
+    if (!clean) { App.scrollMessagesToBottom(); return App._thinkingWrap; }
+    App._thinkingRawAlt = ((App._thinkingRawAlt || '') + clean).slice(0, 2000);
+    // Markdown 渲染:**加粗**/###/列表等语法不能裸露(textContent 会原样显示)
+    if (App.renderMarkdown) {
+      body.classList.add('md');
+      try { body.innerHTML = App.renderMarkdown(App._thinkingRawAlt); }
+      catch (e) { body.textContent = App._thinkingRawAlt; }
+    } else {
+      body.textContent = App._thinkingRawAlt;
+    }
     App.scrollMessagesToBottom();
     return App._thinkingWrap;
   }

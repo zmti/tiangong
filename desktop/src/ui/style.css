@@ -915,6 +915,26 @@ body.has-messages #welcome { display: none; }
 .msg .answer-doc h1 { font-size: 18px; }
 .msg .answer-doc h2 { font-size: 16px; }
 .msg .answer-doc h3 { font-size: 15px; } /* P1-5: 14.5 → 15 */
+.msg .answer-doc h4, .msg .answer-doc h5, .msg .answer-doc h6 {
+  margin: 10px 0 5px;
+  font-weight: 600;
+  line-height: 1.35;
+  font-size: 14px;
+}
+/* ---- 列表(含嵌套):2026-09-20 修复"子项与父项一样平、有序号丢失" ----
+ * 旧版完全没有 ul/ol/li 规则,嵌套层级与间距全靠 UA 默认值,深色下标记色也不统一。
+ * 现在每层显式缩进 + 间距,嵌套列表紧贴父项文本(不再多出一整行空档)。 */
+.msg .answer-doc ul, .msg .answer-doc ol {
+  margin: 6px 0;
+  padding-left: 22px;
+}
+.msg .answer-doc ol { padding-left: 26px; }
+.msg .answer-doc li { margin: 3px 0; }
+.msg .answer-doc li::marker { color: var(--muted); }
+.msg .answer-doc li > ul, .msg .answer-doc li > ol {
+  margin: 3px 0;
+  padding-left: 20px;
+}
 .msg .answer-doc pre {
   background: var(--bg-elev);
   border: 1px solid var(--border);
@@ -1407,7 +1427,8 @@ body.has-messages #welcome { display: none; }
   animation: cdPop 0.2s var(--ease-spring);
 }
 @keyframes cdPop { from { transform: scale(0.94) translateY(8px); opacity: 0; } to { transform: scale(1) translateY(0); opacity: 1; } }
-.cd-body { font-size: 14px; line-height: 1.65; color: var(--text); white-space: pre-wrap; word-break: break-word; } /* P1-5/6 */
+.cd-body { font-size: 14px; line-height: 1.65; color: var(--text); white-space: pre-wrap; word-break: break-word; max-height: 68vh; overflow-y: auto; } /* P1-5/6 */
+.confirm-dialog.wide { max-width: 560px; }
 .cd-actions { display: flex; justify-content: flex-end; gap: 8px; }
 .cd-actions .cd-ok {
   background: var(--primary);
@@ -3626,6 +3647,8 @@ body.exec-panel-open .exec-panel {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;   /* 极窄容器下让按钮区换行,而不是把标题挤成 0 宽 */
+  gap: 8px;
   padding: 12px 16px;
   background: var(--bg);
   border-bottom: 1px solid var(--border);
@@ -3634,17 +3657,27 @@ body.exec-panel-open .exec-panel {
   display: flex;
   align-items: center;
   gap: 8px;
+  /* 必须 min-width:0:否则 flex 子项按 min-content 兜底,而中文的 min-content
+     只有 1 个字 → 标题会被逐字换行压成竖排(2026-09-20 设置面板问题) */
+  flex: 1 1 auto;
+  min-width: 0;
 }
 .prov-card-name {
   font-size: 14px;
   font-weight: 600;
   color: var(--text);
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 .prov-card-tag {
   font-size: 11px;
   padding: 2px 8px;
   border-radius: 4px;
   font-weight: 500;
+  flex: 0 0 auto;      /* 标签不参与收缩,避免"内置"竖排 */
+  white-space: nowrap;
 }
 .prov-card-tag.builtin {
   background: var(--primary-soft);
@@ -3656,6 +3689,7 @@ body.exec-panel-open .exec-panel {
 }
 .prov-card-actions {
   display: flex;
+  flex: 0 0 auto;      /* 按钮区不参与收缩,按钮文字保持单行 */
   gap: 8px;
 }
 .prov-action {
@@ -3671,6 +3705,8 @@ body.exec-panel-open .exec-panel {
   color: var(--text-secondary);
   cursor: pointer;
   transition: all 0.15s;
+  flex: 0 0 auto;
+  white-space: nowrap;
 }
 .prov-action:hover {
   border-color: var(--primary);
@@ -3702,6 +3738,8 @@ body.exec-panel-open .exec-panel {
   border-radius: 4px;
   background: var(--bg);
   color: var(--text-secondary);
+  max-width: 100%;
+  min-width: 0;
 }
 .prov-model-item.active {
   border-color: var(--primary);
@@ -3712,6 +3750,8 @@ body.exec-panel-open .exec-panel {
   display: flex;
   align-items: center;
   gap: 4px;
+  min-width: 0;
+  overflow: hidden;
 }
 .prov-model-badge {
   font-size: 9px;
@@ -3747,6 +3787,74 @@ body.exec-panel-open .exec-panel {
   font-size: 12px;
   color: var(--muted);
   text-align: center;
+}
+.prov-card-desc {
+  padding: 10px 16px 14px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.prov-form-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 10px;
+}
+.prov-form-title button {
+  padding: 4px 10px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.prov-form-title button:hover { border-color: var(--primary); color: var(--primary); }
+.prov-form-subtitle {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  margin: 14px 0 6px;
+}
+.prov-step-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px 8px;
+  border-radius: 6px;
+  background: var(--bg);
+  margin-bottom: 4px;
+}
+.prov-step-idx { color: var(--muted); font-size: 12px; flex: 0 0 auto; }
+.prov-step-tool {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--primary);
+  flex: 0 0 auto;
+}
+.prov-step-args {
+  font-size: 11px;
+  color: var(--text-secondary);
+  background: var(--bg-elev);
+  border-radius: 4px;
+  padding: 2px 6px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.prov-step-label {
+  font-size: 11px;
+  color: var(--muted);
+  flex: 0 0 auto;
 }
 .prov-add-btn {
   display: flex;
@@ -3789,10 +3897,52 @@ body.exec-panel-open .exec-panel {
 .tool-btn-sm { width: 24px; height: 24px; padding: 0; }
 .picker-btn-icon { color: var(--primary); }
 .mode-select-hidden { display: none; }
-.settings-box-lg { width: 720px; max-height: 80vh; }
-.setting-row-col { flex-direction: column; align-items: stretch; gap: 4px; }
+/* 设置弹窗大尺寸 / 纵向设置行:统一收敛到文件末尾 .modal-box / .setting-row 之后,
+   原地写法会被靠后的 .modal-box、.setting-row 覆盖 —— 同优先级、靠后者胜 */
 .setting-textarea { width: 100%; font-family: inherit; font-size: 13px; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg); color: var(--text); outline: none; resize: vertical; }
 .setting-textarea:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-soft); }
+
+/* ── 规则 / 技能:启用开关(自定义 toggle,替代裸 checkbox) ── */
+.rule-toggle { position: relative; display: inline-flex; flex: 0 0 auto; width: 38px; height: 22px; }
+.rule-toggle input { position: absolute; opacity: 0; width: 0; height: 0; margin: 0; }
+.rule-toggle .track {
+  position: absolute; inset: 0; background: var(--border-strong, var(--border));
+  border-radius: 999px; cursor: pointer; transition: background .15s;
+}
+.rule-toggle .track::before {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px;
+  background: #fff; border-radius: 50%; box-shadow: 0 1px 3px rgba(0,0,0,.25); transition: transform .15s;
+}
+.rule-toggle input:checked + .track { background: var(--primary); }
+.rule-toggle input:checked + .track::before { transform: translateX(16px); }
+.rule-toggle input:focus-visible + .track { outline: 2px solid var(--primary-soft); outline-offset: 1px; }
+
+/* ── 规则行:从挤在一起的小标签改为正式行 ── */
+.rule-row { display: flex; align-items: flex-start; gap: 12px; padding: 12px 16px; border-top: 1px solid var(--border); }
+.rule-row:first-child { border-top: none; }
+.rule-row.active { background: var(--primary-soft, transparent); }
+.rule-main { flex: 1 1 auto; min-width: 0; }
+.rule-name-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.rule-name { font-size: 13px; font-weight: 600; color: var(--text); min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rule-type { font-size: 10px; padding: 1px 7px; border-radius: 4px; background: var(--bg-hover);
+  color: var(--muted); white-space: nowrap; flex: 0 0 auto; }
+.rule-row.active .rule-type { background: var(--primary); color: #fff; }
+.rule-content { margin-top: 5px; font-size: 12px; color: var(--text-secondary); line-height: 1.5;
+  max-height: 3em; overflow: hidden; text-overflow: ellipsis;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.rule-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+.rule-act { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px;
+  border: 1px solid var(--border); border-radius: 7px; background: var(--bg); color: var(--text-secondary);
+  cursor: pointer; transition: all .15s; }
+.rule-act:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-soft); }
+.rule-act.danger:hover { border-color: var(--err); color: var(--err); background: var(--err-soft); }
+
+/* 技能描述与卡片微调 */
+.prov-card-desc { cursor: default; }
+.skill-meta { display: flex; gap: 8px; align-items: center; margin-top: 6px; font-size: 11px; color: var(--muted); flex-wrap: wrap; }
+.skill-meta .dot { width: 4px; height: 4px; border-radius: 50%; background: var(--border-strong, var(--border)); }
+
 /* 启动完成前 sidebar/main 用类控制隐藏(原内联 display:none) */
 .init-hidden { display: none !important; }
 
@@ -3884,10 +4034,8 @@ body.exec-panel-open .exec-panel {
 .tool-btn-sm { width: 24px; height: 24px; padding: 0; }
 .picker-btn-icon { color: var(--primary); }
 .mode-select-hidden { display: none; }
-/* 设置弹窗大尺寸(原内联 width:720px; max-height:80vh) */
-.settings-box-lg { width: 720px; max-height: 80vh; }
-/* 设置行纵向排列 + 全宽 textarea(原内联) */
-.setting-row-col { flex-direction: column; align-items: stretch; gap: 4px; }
+/* 设置弹窗大尺寸 / 纵向设置行规则见下方 "设置弹窗尺寸" 与 "设置弹窗:纵向设置行" 段
+   (原内联 width:720px; max-height:80vh / flex-direction:column) */
 .setting-textarea { width: 100%; font-family: inherit; font-size: 13px; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg); color: var(--text); outline: none; resize: vertical; }
 .setting-textarea:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-soft); }
 /* 启动完成前 sidebar/main 用类控制隐藏(保留), 旧内联写法已废 */
@@ -4089,6 +4237,18 @@ body.sidebar-collapsed .status-bar {
   padding: 4px 0;
   font-size: 12px;
 }
+/* ---------- 设置弹窗:纵向设置行(自定义 System Prompt 那一行) ----------
+   同一个"同优先级、靠后者胜"陷阱:.setting-row-col 原本写成单类选择器并放在
+   .setting-row 之前,于是 align-items/gap 被 .setting-row 静默覆盖 ——
+   标签从"占满一行、左对齐"变成"水平居中",间距也从 4px 变 8px。
+   改用双类选择器,并把 justify-content 归零(纵向时 space-between 会把
+   标签和输入框撑到两端)。 */
+.setting-row.setting-row-col {
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 4px;
+}
 
 .setting-label {
   color: var(--muted);
@@ -4190,6 +4350,17 @@ body.sidebar-collapsed .status-bar {
   box-shadow: var(--shadow-lg);
   max-height: 85vh;
   overflow: hidden;
+}
+/* ---------- 设置弹窗尺寸(统一设置弹窗,index.html#settingsModal) ----------
+   必须写在 .modal-box 之后:两者都是单类选择器、优先级相同(0,1,0),
+   源码靠后者胜 —— 之前 .settings-box-lg 写在文件中部(第 3812/3908 行),
+   被这里的 .modal-box{width:380px} 覆盖,导致设置弹窗只有 380px 宽,
+   140px 侧栏占掉后内容区仅剩 ~238px,供应商卡片头部的中文标题被压成竖排
+   ("阿里云"/"本地模型" 逐字换行)、"获取/添加" 按钮文字也断成两行。
+   这里用双类选择器(0,2,0)提升优先级,顺带不再依赖书写顺序。 */
+.modal-box.settings-box-lg {
+  width: 720px;
+  max-height: 80vh;
 }
 .modal-header {
   display: flex;
@@ -5198,3 +5369,173 @@ body.sidebar-collapsed .status-bar {
 .project-card .pj-name { font-size: 14px; font-weight: 500; color: var(--text); margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .project-card .pj-desc { font-size: 12px; color: var(--text-secondary); margin-bottom: 8px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .project-card .pj-meta { font-size: 11px; color: var(--muted); }
+.setting-input { width: 100%; font-family: inherit; font-size: 13px; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg); color: var(--text); outline: none; }
+.setting-input:focus { border-color: var(--primary); box-shadow: 0 0 0 2px var(--primary-soft); }
+/* 原生下拉弹层跟随主题渲染:深色主题下分组标题/选项文字才不会白底白字 */
+[data-theme="dark"] select.setting-input { color-scheme: dark; }
+[data-theme="dark"] select.setting-input optgroup { color: var(--text-secondary); font-weight: 600; }
+[data-theme="dark"] select.setting-input option { color: var(--text); background: var(--bg-elev); }
+
+/* =============================================
+   设置 › 生成模型:卡片式布局
+   (index.html#settingsModal [data-section="genmodel"])
+   ============================================= */
+.gen-lead {
+  margin: 0 0 10px;
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--muted);
+}
+.gen-lead code,
+.gen-note code {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 1px 4px;
+  border-radius: var(--radius-xs);
+  background: var(--bg-hover);
+  color: var(--text-secondary);
+}
+
+.gen-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-hover);
+  padding: 11px 12px 10px;
+  margin-bottom: 10px;
+  transition: border-color 0.15s;
+}
+.gen-card:hover { border-color: var(--border-strong); }
+
+.gen-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.gen-card-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  border-radius: var(--radius-md);
+  background: var(--primary-soft);
+  color: var(--primary);
+}
+.gen-card-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* 来源徽章:override / env / default 三态配色 */
+.gen-badge {
+  flex-shrink: 0;
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 11px;
+  line-height: 1;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.gen-badge[data-source="override"] {
+  color: var(--primary);
+  border-color: var(--primary-border);
+  background: var(--primary-soft);
+}
+.gen-badge[data-source="env"] {
+  color: var(--info);
+  border-color: rgba(96, 165, 250, 0.35);
+  background: var(--info-soft);
+}
+
+/* 选择框:appearance:none + 自绘箭头,避免 Windows 原生 select 的"老气"外观 */
+.gen-select {
+  width: 100%;
+  appearance: none;
+  -webkit-appearance: none;
+  font-family: inherit;
+  font-size: 13px;
+  padding: 9px 32px 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background-color: var(--bg);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238b90a5' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 11px center;
+  background-size: 13px 13px;
+  color: var(--text);
+  outline: none;
+  cursor: pointer;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+.gen-select:hover { border-color: var(--border-strong); }
+.gen-select:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px var(--primary-soft);
+}
+[data-theme="dark"] .gen-select {
+  color-scheme: dark;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%236b7094' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'/%3E%3C/svg%3E");
+}
+[data-theme="dark"] .gen-select optgroup {
+  color: var(--text-secondary);
+  font-weight: 600;
+  background: var(--bg-elev);
+}
+[data-theme="dark"] .gen-select option { color: var(--text); background: var(--bg-elev); }
+
+.gen-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 7px;
+  min-width: 0;
+  font-size: 11px;
+}
+.gen-meta-key { flex-shrink: 0; color: var(--muted); }
+.gen-meta-val {
+  min-width: 0;
+  padding: 2px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-xs);
+  background: var(--bg);
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.gen-warn {
+  display: inline-block;
+  flex-shrink: 0;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(245, 158, 11, 0.30);
+  background: var(--warn-soft);
+  font-size: 11px;
+  color: var(--warn);
+  white-space: nowrap;
+}
+.gen-warn[hidden] { display: none; }
+
+.gen-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0 2px;
+}
+.gen-status { font-size: 12px; color: var(--muted); }
+
+.gen-note {
+  margin: 6px 0 0;
+  font-size: 11.5px;
+  line-height: 1.7;
+  color: var(--muted);
+}
+.gen-note:empty { display: none; }

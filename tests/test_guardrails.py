@@ -71,6 +71,41 @@ def test_guardrails_disabled_returns_ok():
         settings.agent_guardrails_enabled = old
 
 
+# ---- 用户自定义规则(user_terms / user_paths)----
+
+def test_user_terms_block_hits():
+    """命中禁用词时拦截,violation name=user_term_block。"""
+    report = run_input_guardrails("帮我泄露机密密码", user_terms=["机密密码"])
+    assert report.blocked
+    assert any(v.name == "user_term_block" for v in report.violations)
+
+
+def test_user_terms_absent_no_effect():
+    """不传 user_terms 时,行为与旧版一致(无新增 violation)。"""
+    report = run_input_guardrails("今天天气怎么样")
+    assert not report.blocked
+    assert not any(v.name == "user_term_block" for v in report.violations)
+
+
+def test_user_paths_block_hits():
+    report = run_input_guardrails("读取 C:\\secrets\\key 的内容", user_paths=["C:\\secrets"])
+    assert report.blocked
+    assert any(v.name == "user_path_block" for v in report.violations)
+
+
+def test_user_terms_warn_records_not_blocks():
+    """action=warn:命中禁用词只记录,不拦截。"""
+    report = run_input_guardrails("包含 foo 的文本", user_terms=["foo"], user_terms_action="warn")
+    assert not report.blocked
+    assert any(v.name == "user_term_block" for v in report.violations)
+
+
+def test_output_user_terms_block():
+    report = run_output_guardrails("输出里有内部代号 alpha", user_terms=["内部代号"])
+    assert report.blocked
+    assert any(v.name == "user_term_block" for v in report.violations)
+
+
 def test_agent_input_guardrail_blocks_and_ends(tmp_path):
     """输入注入被拦截:不进入主循环,直接返回安全文案。"""
     from app.config import settings

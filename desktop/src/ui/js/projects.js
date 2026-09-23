@@ -78,7 +78,8 @@
 
   function formatTime(ts) {
     if (!ts) return '';
-    const d = new Date(ts);
+    // 后端返回秒级时间戳,统一归一化后再构造 Date
+    const d = new Date(App.toMs ? App.toMs(ts) : ts);
     return d.toLocaleDateString('zh-CN');
   }
 

@@ -54,7 +54,7 @@
           b.className = 'msg-action';
           b.title = title;
           b.textContent = label;
-          b.addEventListener('click', fn);
+          b.addEventListener('click', () => fn(b));
           act.appendChild(b);
         };
         mk('复制回复', '复制', () => {
@@ -62,9 +62,17 @@
           if (txt) navigator.clipboard.writeText(txt).catch(() => {});
         });
         mk('重新生成', '重新生成', () => { if (App.Chat) App.Chat.regenerate(wrap); });
-        mk('朗读该回复', '🔊', () => {
+        mk('朗读该回复', '🔊', function (b) {
+          // 播放中 → 停止;否则开始朗读。图标/提示同步切换。
+          if (App.isSpeaking && App.isSpeaking()) {
+            App.stopSpeak();
+            b.textContent = '🔊'; b.title = '朗读该回复';
+            return;
+          }
           const txt = (answer.textContent || answer.innerText || '').trim();
-          if (txt) App.speak(txt);
+          if (!txt) return;
+          b.textContent = '⏹'; b.title = '停止朗读';
+          App.speak(txt).then(() => { b.textContent = '🔊'; b.title = '朗读该回复'; });
         });
       } else {
         const mk = (title, label, fn) => {
@@ -167,13 +175,41 @@
       }
     }
 
+    // 视频生成特殊处理(generate_video / enhance_video):渲染内联播放器
+    if ((name === 'generate_video' || name === 'enhance_video') && App.parseVideoUrl) {
+      const vurl = App.parseVideoUrl(result);
+      if (vurl) {
+        const wrap = document.createElement('div');
+        wrap.className = 'msg bot';
+        const avatar = makeAvatar('bot');
+        const body = document.createElement('div');
+        body.className = 'msg-content';
+        body.innerHTML = `<div class="img-gen-bubble img-gen-history">${App.buildVideoHtml(vurl, 'img-gen-video')}</div>`;
+        wrap.appendChild(avatar);
+        wrap.appendChild(body);
+        if (appendTo) {
+          if (Array.isArray(appendTo)) appendTo.push(wrap);
+          else appendTo.appendChild(wrap);
+        } else {
+          App.els.messages.appendChild(wrap);
+          App.scrollMessagesToBottom();
+        }
+        return wrap;
+      }
+    }
+
     const ok = !String(result || '').includes('Error') && !String(result || '').includes('failed');
+    // 默认收起,与实时路径(message-renderer.addStep)一致:
+    // 强制 step-open 会让每行都展开 detail,挤压行内标签并撑出行间大段内容。
     const row = document.createElement('div');
-    row.className = `step-row step-done step-open`;
+    row.className = `step-row step-done`;
 
     const num = document.createElement('span');
     num.className = 'step-num';
-    num.textContent = '✓';
+    // 与实时路径一致:圈内显示步骤序号(能确定容器时),否则退化为 ✓
+    num.textContent = (!appendTo || Array.isArray(appendTo))
+      ? '✓'
+      : String(appendTo.querySelectorAll('.step-row').length + 1);
     row.appendChild(num);
 
     const icon = document.createElement('span');
