@@ -6,6 +6,7 @@ Python / JS / TS / Go / Rust / Java / C / C++ / Swift / Kotlin / C# / Zig / V / 
 from __future__ import annotations
 
 import ast
+import re
 
 from pydantic import Field
 
@@ -113,6 +114,36 @@ def _bracket_truncation(code: str) -> tuple[bool, str]:
     return False, ""
 
 
+def _error_summary(output: str, cap: int = 800) -> str:
+    """从沙箱合并输出里摘出「异常摘要」(traceback 最后一行 + 少量上文)。
+
+    run_code 原本只回 success/output/returncode,失败时没有 error 字段:
+    - 模型要在一大段 output 里自己找 traceback,容易看漏;
+    - 下游(自愈/反思)只能靠 output 兜底。
+    这里把 `TypeError: 'NoneType' object is not subscriptable` 这类
+    决定性的一行单独拎出来放进 error,让失败原因一眼可见。
+    """
+    if not output:
+        return ""
+    lines = [ln for ln in output.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    # 优先取最后一条 "...Error: ..." 行(traceback 的结论行)
+    tail = ""
+    for ln in reversed(lines):
+        s = ln.strip()
+        if re.search(r"^\w*(Error|Exception|Exit)\b", s) or ": " in s and "Error" in s:
+            tail = s
+            break
+    # 再补上 traceback 里最靠近异常的 2 行源码上下文
+    ctx: list[str] = []
+    for ln in lines:
+        if ln.strip().startswith("File ") or ln.strip().startswith("    "):
+            ctx.append(ln.rstrip())
+    body = "\n".join(ctx[-2:])
+    return ((body + "\n" if body else "") + (tail or lines[-1]))[-cap:]
+
+
 def _check_intact(code: str, language: str) -> tuple[bool, str]:
     """执行前检查代码是否完整。返回 (是否被截断, 证据)。"""
     lang = (language or "python").strip().lower()
@@ -133,7 +164,11 @@ def _check_intact(code: str, language: str) -> tuple[bool, str]:
     + f"... 可用于计算、数据分析、算法验证、代码调试。"
     "注意:单次代码请控制在 100 行以内;更长的代码请改用 write_file 写成文件(可分段追加),"
     "再用 run_terminal 执行,否则容易在生成时被输出长度上限截断。",
-    timeout=60,
+    # registry 超时必须【严格大于】下面的内部钳位上限(60s),否则两者同时到点,
+    # registry 的 asyncio.wait_for 会抢先判死 → 模型只看到「工具执行超时(60s)」,
+    # 而沙箱自己那句更有用的「[沙箱] 执行超时(60s)」永远来不及返回。
+    # 75 = 60(内部上限) + 15(解释器启动/临时目录 IO 的余量)
+    timeout=75,
 )
 def run_code(
     code: str = Field(description="要执行的代码"),
@@ -161,4 +196,9 @@ def run_code(
         }
 
     result = run_code_sandboxed(code, timeout=timeout, use_docker=use_docker, language=language)
-    return result.to_dict()
+    data = result.to_dict()
+    # 失败时补一个 error 摘要字段:让模型/自愈一眼看到决定性异常行,
+    # 而不是在一整段 output 里自己找 traceback。
+    if not data.get("success"):
+        data["error"] = _error_summary(data.get("output", ""))
+    return data

@@ -185,7 +185,11 @@ def _run_command(command: str, cwd: str, timeout: int) -> dict:
     "run_terminal",
     "在本地终端执行 shell 命令(Windows 默认 cmd),用于运行构建/测试、安装依赖(npm/pip)、执行 git、查询系统信息。"
     "命令在当前用户环境运行,破坏性操作(格式化/删除注册表/关机等)会被拦截。返回 stdout/stderr/退出码",
-    timeout=180,
+    # 同 run_code 的道理:内部钳位上限是 300s,registry 上限必须更大。
+    # 否则请求 timeout=300 时 registry 在 180s 就硬杀 asyncio.to_thread 的 await,
+    # 而底层 Popen 子进程仍在后台跑 → 命令没停、工具却报「执行超时(180s)」。
+    # 330 = 300(内部上限) + 30(_kill_tree 收尾与 communicate 的余量)
+    timeout=330,
 )
 def run_terminal(
     command: str = Field(description="要执行的命令,如 'npm test' 或 'python -m pytest'"),

@@ -119,8 +119,12 @@ class TestMissingInterpreters:
     def test_dart_not_found(self):
         from app.tools.code_sandbox import run_code_sandboxed
         result = run_code_sandboxed('void main() => print("hi");', language="dart")
-        assert not result.success
-        assert "dart" in result.output.lower() or "未找到" in result.output
+        # 同 test_go_not_found:本机可能装了 Flutter/Dart SDK(dart 直接跑通),
+        # 也可能没装(报"未找到")。两种都算正常,别把装了 dart 的机器判红。
+        if result.success:
+            assert "hi" in (result.output or "")
+        else:
+            assert "dart" in result.output.lower() or "未找到" in result.output
 
     def test_julia_not_found(self):
         from app.tools.code_sandbox import run_code_sandboxed

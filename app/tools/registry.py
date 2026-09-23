@@ -44,6 +44,48 @@ class Tool:
         self.terminal = terminal
         self.is_async = asyncio.iscoroutinefunction(func)
 
+    # 部分模型/网关会把真实参数再包一层信封,形如:
+    #   {"arguments": "{\"code\": \"print(1)\"}"}   或   {"input": {...}}
+    # 直接送去 pydantic 校验会变成「参数校验失败: xxx Field required」,
+    # 模型看不出是自己包错了,只会原样重试到连续失败保护触发。
+    _ENVELOPE_KEYS = ("arguments", "input", "parameters", "args")
+    # 信封旁边的"元数据"键(形如 {"name": "run_code", "arguments": "{...}"})
+    _ENVELOPE_META_KEYS = frozenset({"name", "id", "index", "type", "function", "tool", "tool_name"})
+
+    def _unwrap_envelope(self, args: dict) -> dict:
+        """摊平 {"arguments": <真实参数对象>} 这类嵌套信封(最多 3 层)。
+
+        只在这两个条件同时成立时才解:
+          1. 存在信封键,且该名字**不是**本工具声明的形参(已确认无工具用这些名字);
+          2. 除信封键外的其余键都是元数据(name/id/index/type/function...)。
+        这样既覆盖 {"arguments": "..."} 和 {"arguments": {...}},
+        也覆盖 {"name": ..., "arguments": ...},且不会误伤正常参数。
+        """
+        for _ in range(3):
+            if not isinstance(args, dict):
+                return args
+            props = (self.json_schema or {}).get("properties") or {}
+            env_keys = [k for k in args if k in self._ENVELOPE_KEYS and k not in props]
+            if len(env_keys) != 1:
+                return args
+            key = env_keys[0]
+            rest = set(args) - {key}
+            if not rest <= self._ENVELOPE_META_KEYS:
+                return args
+            inner = args[key]
+            if isinstance(inner, str):
+                s = inner.strip()
+                if not (s.startswith("{") and s.endswith("}")):
+                    return args
+                try:
+                    inner = json.loads(s)
+                except json.JSONDecodeError:
+                    return args
+            if not isinstance(inner, dict):
+                return args
+            args = inner
+        return args
+
     def to_openai_schema(self) -> dict:
         """转换为 OpenAI function calling 格式的 schema。"""
         return {
@@ -75,6 +117,9 @@ class Tool:
                 f"工具 {self.name} 参数格式错误: 应为 JSON 对象(如 {self.json_schema.get('required', [])}),"
                 f"收到 {type(args).__name__}"
             )
+
+        # 摊平可能的嵌套信封(如 {"arguments": "{\"code\": ...}"} 之类)
+        args = self._unwrap_envelope(args)
 
         # 参数校验
         if self.params_model is not None:

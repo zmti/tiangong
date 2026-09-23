@@ -15,7 +15,14 @@ import json
 
 
 def extract_error_text(result_str: str, cap: int = 2500) -> str:
-    """从工具结果 JSON 字符串中提取失败输出文本(stderr/stdout/error)。"""
+    """从工具结果 JSON 字符串中提取失败输出文本(error/stderr/stdout/output)。
+
+    ★ `output` 不能漏:run_code 的沙箱结果把 stdout+stderr 合并进 `output`
+    (见 code_sandbox.SandboxResult.to_dict,只有 success/output/returncode/mode/
+    duration_s 五个字段,压根没有 stderr/stdout)。漏掉它 → run_code 失败时
+    永远提取不到 traceback → 自愈拿不到任何错误信息而静默失效,
+    表现为「run_code 报错后反复重试同一段代码」。
+    """
     if not result_str:
         return ""
     try:
@@ -24,7 +31,13 @@ def extract_error_text(result_str: str, cap: int = 2500) -> str:
             err = str(data.get("error", "") or "")
             stderr = str(data.get("stderr", "") or "")
             stdout = str(data.get("stdout", "") or "")
-            out = (err or stderr or stdout).strip()
+            # run_code 专用:合并输出字段(里面含 [stderr] traceback)
+            combined = str(data.get("output", "") or "")
+            out = (err or stderr or stdout or combined).strip()
+            # output 里 stdout 在前、[stderr] 在后;失败信息在尾部更有价值,
+            # 超长时优先保留尾部(cap 内),避免把 traceback 截掉。
+            if not (err or stderr or stdout) and len(combined) > cap:
+                out = combined[-cap:]
             return out[:cap]
     except (json.JSONDecodeError, TypeError):
         pass

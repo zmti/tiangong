@@ -107,8 +107,25 @@ def docker_available() -> bool:
         return False
 
 
-def run_in_docker(code: str, timeout: int = DEFAULT_TIMEOUT) -> SandboxResult:
-    """在一次性 Docker 容器中执行代码(强隔离)。"""
+# Docker 沙箱目前只准备了 Python 镜像;其他语言走 subprocess 执行器。
+# (旧代码 run_in_docker 只收 2 个参数, 调用处却传 3 个 → 一旦 docker 可用就
+#  TypeError: run_in_docker() takes 2 positional arguments but 3 were given)
+DOCKER_LANGUAGES = {"python", "py", "python3"}
+
+
+def run_in_docker(code: str, timeout: int = DEFAULT_TIMEOUT, language: str = "python") -> SandboxResult:
+    """在一次性 Docker 容器中执行代码(强隔离)。
+
+    目前仅支持 Python(镜像 python:3.12-slim);其他语言由调用方走 subprocess。
+    """
+    if (language or "python").strip().lower() not in DOCKER_LANGUAGES:
+        return SandboxResult(
+            success=False,
+            output=f"[沙箱] Docker 模式当前仅支持 Python,已跳过容器执行(语言={language})",
+            returncode=-1,
+            mode="docker",
+            duration=0,
+        )
     # 检查镜像是否存在
     check = subprocess.run(
         ["docker", "image", "inspect", SANDBOX_IMAGE],
@@ -627,7 +644,10 @@ def _run_csharp(code: str, timeout: int, workdir: str) -> SandboxResult:
         except Exception as e:
             return SandboxResult(False, f"[沙箱] 执行异常: {e}", -1, "subprocess", time.time() - start)
 
-    # 方案2: dotnet fsi (F# interactive, 也可跑 C# 脚本)
+    # 方案2: dotnet fsi (F# interactive)。
+    # 旧代码这里写的是 [dotnet, script] —— `dotnet main.fsx` 不是合法命令
+    # (dotnet 只认 sdk 子命令),必然报 "无法执行,因为找不到指定的命令或文件";
+    # 正确写法是 `dotnet fsi main.fsx`。
     fsi = shutil.which("dotnet")
     if fsi:
         script = os.path.join(workdir, "main.fsx")
@@ -635,7 +655,7 @@ def _run_csharp(code: str, timeout: int, workdir: str) -> SandboxResult:
             f.write(textwrap.dedent(code))
         start = time.time()
         try:
-            r = subprocess.run([fsi, script], capture_output=True, text=True, timeout=timeout,
+            r = subprocess.run([fsi, "fsi", script], capture_output=True, text=True, timeout=timeout,
                                cwd=workdir, env=_safe_env(),
                                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
             out = r.stdout
@@ -659,8 +679,10 @@ def _run_dart(code: str, timeout: int, workdir: str) -> SandboxResult:
         f.write(textwrap.dedent(code))
     start = time.time()
     try:
+        # env=_safe_env():不继承宿主机全量环境(含 DEEPSEEK_API_KEY 等密钥)
         r = subprocess.run([dart, script], capture_output=True, text=True, timeout=timeout,
-                           cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                           cwd=workdir, env=_safe_env(),
+                           creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         out = r.stdout
         if r.stderr.strip():
             out += "\n[stderr]\n" + r.stderr
@@ -682,9 +704,11 @@ def _run_haskell(code: str, timeout: int, workdir: str) -> SandboxResult:
     start = time.time()
     try:
         subprocess.run([ghc, src, "-o", exe], capture_output=True, timeout=120,
+                       env=_safe_env(),
                        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         r = subprocess.run([exe], capture_output=True, text=True, timeout=timeout,
-                           cwd=workdir, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+                           cwd=workdir, env=_safe_env(),
+                           creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
         out = r.stdout
         if r.stderr.strip():
             out += "\n[stderr]\n" + r.stderr
@@ -760,11 +784,16 @@ def _run_zig(code: str, timeout: int, workdir: str) -> SandboxResult:
         f.write(textwrap.dedent(code))
     start = time.time()
     try:
-        subprocess.run([zig, "run", src], capture_output=True, text=True, timeout=timeout,
-                       cwd=workdir, env=_safe_env(),
-                       creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
-        # zig run 直接执行，不需要单独编译
-        return SandboxResult(True, "(Zig 使用 zig run 直接执行，请检查上方输出)", 0, "subprocess", time.time() - start)
+        # zig run 直接编译并执行,必须取回 r 的真实 stdout/stderr/returncode。
+        # 旧实现丢弃返回值、硬编码 success=True + "请检查上方输出" → 模型拿到的是
+        # 一句占位符,既看不到程序输出,编译失败也会被谎报为成功。
+        r = subprocess.run([zig, "run", src], capture_output=True, text=True, timeout=timeout,
+                           cwd=workdir, env=_safe_env(),
+                           creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        out = r.stdout
+        if r.stderr.strip():
+            out += "\n[stderr]\n" + r.stderr
+        return SandboxResult(r.returncode == 0, out[:6000] or "(无输出)", r.returncode, "subprocess", time.time() - start)
     except subprocess.TimeoutExpired:
         return SandboxResult(False, f"[沙箱] 执行超时({timeout}s)", -1, "subprocess", time.time() - start)
     except Exception as e:
@@ -781,10 +810,14 @@ def _run_v(code: str, timeout: int, workdir: str) -> SandboxResult:
         f.write(textwrap.dedent(code))
     start = time.time()
     try:
-        subprocess.run([v, "run", src], capture_output=True, text=True, timeout=timeout,
-                       cwd=workdir, env=_safe_env(),
-                       creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
-        return SandboxResult(True, "(V 使用 v run 直接执行，请检查上方输出)", 0, "subprocess", time.time() - start)
+        # 同 zig:v run 会编译并运行,必须取回真实输出而不是返回占位符
+        r = subprocess.run([v, "run", src], capture_output=True, text=True, timeout=timeout,
+                           cwd=workdir, env=_safe_env(),
+                           creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
+        out = r.stdout
+        if r.stderr.strip():
+            out += "\n[stderr]\n" + r.stderr
+        return SandboxResult(r.returncode == 0, out[:6000] or "(无输出)", r.returncode, "subprocess", time.time() - start)
     except subprocess.TimeoutExpired:
         return SandboxResult(False, f"[沙箱] 执行超时({timeout}s)", -1, "subprocess", time.time() - start)
     except Exception as e:
@@ -826,6 +859,9 @@ def run_code_sandboxed(
     if use_docker is None:
         use_docker = docker_available()
 
-    if use_docker:
+    lang_key = (language or "python").strip().lower()
+    # 只有 Docker 真的支持该语言时才进容器;否则直接走 subprocess,
+    # 避免把 Node/Go 代码塞进 python 镜像里跑出莫名其妙的错误。
+    if use_docker and lang_key in DOCKER_LANGUAGES:
         return run_in_docker(code, timeout, language)
     return run_in_subprocess(code, timeout, language)
