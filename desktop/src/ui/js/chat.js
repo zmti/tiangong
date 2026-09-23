@@ -780,8 +780,11 @@ App.Chat.doSend = async function (text, opts = {}) {
       }, 300000); // 300s 空闲间隙 (原 120s→180s→300s；后端断点续写/限流重试期间可能 90s+5s+90s 无 token，180s 会误杀)
     }
     resetStreamTimeout();
-    // 绝对上限:即使后端持续发事件/心跳续期空闲计时器,10 分钟仍未结束则强制断开,
+    // 绝对上限:即使后端持续发事件/心跳续期空闲计时器,超时仍未结束则强制断开,
     // 防止永久挂住(配合后端 SSE 哨兵修复,双保险)。收到任何事件时不清此计时器。
+    // ⚠ 2026-09-23:原值 10 分钟会掐死长耗时生成(视频生成后端预算已放宽到 900s,
+    // 加上轮询/重试可逼近 15 分钟),导致"视频还在生成,前端却先断开"。现抬到 30 分钟,
+    // 仍高于后端最长工具预算,只作为真·卡死的兜底。
     if (hardTimeout !== null) clearTimeout(hardTimeout);
     hardTimeout = setTimeout(() => {
       hardTimeout = null;
@@ -794,14 +797,14 @@ App.Chat.doSend = async function (text, opts = {}) {
         if (typingShown) App.removeTyping();
         // 同上:先用服务端已落库的结果补全,补不到再报错
         _recoverFromServer().then(recovered => {
-          if (!recovered) App.appendMessage('会话超时(超过 10 分钟未完成),已中止。可重试。', 'error');
+          if (!recovered) App.appendMessage('会话超时(超过 30 分钟未完成),已中止。可重试。', 'error');
           _finishGroup();
         }).catch(() => {
-          App.appendMessage('会话超时(超过 10 分钟未完成),已中止。可重试。', 'error');
+          App.appendMessage('会话超时(超过 30 分钟未完成),已中止。可重试。', 'error');
           _finishGroup();
         });
       }
-    }, 600000);
+    }, 1800000);
 
     while (true) {
       let isDone;

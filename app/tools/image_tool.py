@@ -169,7 +169,10 @@ def _generate_image_data_url(prompt: str, size: str = "512x512") -> tuple[str, b
     "generate_image",
     "根据文字描述生成图片。支持真人照片、插画、示意图、图标、艺术图等任何类型。"
     "可指定尺寸:横版16:9(1792x1024)、竖版9:16(1024x1792)、正方形(1024x1024)等。",
-    timeout=360,
+    # 预算覆盖「两次 300s 生成请求 + 下载重试」的最坏路径(内部 requests 各自带超时,
+    # 不会无限挂住);此前 360 会被 agent 外层 300s 批处理上限压死,导致已出图却
+    # 被判超时。现外层不再设限(agent_tool_timeout=0),由本预算兜底。
+    timeout=660,
     enabled=_image_enabled(),
     terminal=True,
 )

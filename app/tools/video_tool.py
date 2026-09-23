@@ -96,8 +96,12 @@ ASPECT_RATIOS = ("21:9", "16:9", "4:3", "1:1", "3:4", "9:16")
 
 # 上游"忙"的状态码:重试有意义(429 限流 / 503 video_queue_full 等)
 _RETRY_CODES = frozenset({429, 500, 502, 503, 504})
-_CREATE_ROUNDS = 4        # 创建任务最多整体重试几轮
-_CREATE_RETRY_WAIT = 20   # 每轮之间等待秒数(工具 timeout=700,留足出片时间)
+_CREATE_ROUNDS = 6        # 创建任务最多整体重试几轮
+_CREATE_RETRY_WAIT = 25   # 每轮之间等待秒数
+# 预算校核(工具 timeout=900 / _poll_video=600):
+#   创建等待上限 (6-1)*25 = 125s,叠加轮询 600s = 725s < 900s —— 既给上游
+#   video_queue_full 更长的排空时间,又保证整体落在工具预算内、能优雅收尾。
+#   此前 4 轮×20s 只等 60~80s,队列稍满就报"创建失败",用户白等一场。
 
 
 def _is_flash_contract(model: str) -> bool:
@@ -388,7 +392,7 @@ async def _poll_video(task_id: str, model: str = "", timeout: float = 600) -> di
     "根据文字描述生成一段短视频,支持文生视频与图生视频。"
     "传入 image 即以该图片为首帧/参考图生成视频(图片续写);不传则为纯文生视频。"
     "注意:视频生成需要几分钟,请耐心等待结果",
-    timeout=700,
+    timeout=900,
     enabled=_video_enabled(),
     terminal=True,
 )

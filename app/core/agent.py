@@ -2650,23 +2650,37 @@ class Agent:
 
         d_token = set_delegate_context(self.llm, self.session_id, self._active_tools)
         try:
-            batch_timeout = settings.agent_tool_timeout or 300
+            batch_timeout = int(getattr(settings, "agent_tool_timeout", 0) or 0)
             # 每个工具独立计时:某一路卡死/超时不再连坐整批。
             # 旧实现用单个 wait_for 包整个 gather,超时后所有未完成任务被一并取消,
             # 已完成工具的真实结果也被丢弃,统一记成"工具执行超时"——用户看到的
             # 现象是"一个慢工具拖垮整批,会话卡住后报错"。
-            # 现在:各路 wait_for 独立超时,已完成的保留结果,超时的记成该工具的
-            # 超时错误(带工具名),未超时路径行为不变。
-            results = await asyncio.gather(
-                *[
-                    asyncio.wait_for(
-                        self._execute_tool(tc.name, tc.arguments),
-                        timeout=batch_timeout,
-                    )
-                    for tc in tool_calls
-                ],
-                return_exceptions=True,
-            )
+            # 现在:各路独立计时,已完成的保留结果,超时的记成该工具的超时错误。
+            #
+            # ⚠ 语义修正(2026-09-23):agent_tool_timeout 的文档语义是「0=不限制」
+            # (见 config.py),旧实现却写成 `or 300` —— 0 被当成 300s,而且这个
+            # 外层上限会盖过工具自身声明的 timeout(generate_video=900 /
+            # generate_image=660),长耗时生成(视频动辄 300s+)因此在 300s 被判死。
+            # 更关键的是:被取消的只是 asyncio.to_thread 的 await,底层线程仍在后台
+            # 跑 —— 用户看到的现象正是「生成还在后台跑,但工具不等结果就结束了」。
+            # 现改为:0/负数 = 不套外层超时,由 registry.Tool.run 里各工具自身的
+            # timeout 兜底(工具内部超时能优雅返回,不会被硬取消);>0 才设上限。
+            if batch_timeout > 0:
+                results = await asyncio.gather(
+                    *[
+                        asyncio.wait_for(
+                            self._execute_tool(tc.name, tc.arguments),
+                            timeout=batch_timeout,
+                        )
+                        for tc in tool_calls
+                    ],
+                    return_exceptions=True,
+                )
+            else:
+                results = await asyncio.gather(
+                    *[self._execute_tool(tc.name, tc.arguments) for tc in tool_calls],
+                    return_exceptions=True,
+                )
             normalized = []
             for tc, r in zip(tool_calls, results):
                 if isinstance(r, asyncio.TimeoutError):
