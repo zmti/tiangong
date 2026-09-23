@@ -351,26 +351,47 @@ def check_syntax(
     if not os.path.exists(resolved):
         return {"error": f"文件不存在: {path}"}
 
+    # 命令里统一用 resolved(绝对路径):调用方可能传相对路径,而子进程 cwd 是文件
+    # 所在目录,再用相对路径会指向"文件所在目录下的同名文件",直接找不到。
     ext_map = {
-        ".py": ("python", ["python", "-m", "py_compile", path]),
-        ".js": ("javascript", ["node", "--check", path]),
-        ".ts": ("typescript", ["tsc", "--noEmit", path]),
-        ".go": ("go", ["go", "vet", path]),
-        ".rs": ("rust", ["rustc", "--crate-type", "lib", "--emit=metadata", "-o", "/dev/null", path]),
+        ".py": ("python", ["python", "-m", "py_compile", resolved]),
+        ".js": ("javascript", ["node", "--check", resolved]),
+        ".mjs": ("javascript", ["node", "--check", resolved]),
+        ".ts": ("typescript", ["tsc", "--noEmit", resolved]),
+        ".go": ("go", ["go", "vet", resolved]),
+        ".rs": ("rust", ["rustc", "--crate-type", "lib", "--emit=metadata", "-o", os.devnull, resolved]),
+    }
+    # 语言别名 → 扩展名 key。原先代码用 f".{lang}" 去查 ext_map(lang='python'
+    # 查 '.python'),必然 miss 而退化成 `[lang, '--syntax-only', path]` —— 例如
+    # 'python --syntax-only' 这种解释器根本不认识的命令。
+    _ALIAS = {
+        "python": ".py", "py": ".py", "python3": ".py",
+        "javascript": ".js", "js": ".js", "node": ".js",
+        "typescript": ".ts", "ts": ".ts",
+        "go": ".go", "golang": ".go",
+        "rust": ".rs", "rs": ".rs",
     }
 
-    lang = language or ext_map.get(os.path.splitext(resolved)[1], "").strip()
-    if not lang:
-        return {"error": "无法自动检测语言,请指定 language 参数"}
+    ext = os.path.splitext(resolved)[1].lower()
+    lang_in = str(language or "").strip()
+    key = _ALIAS.get(lang_in.lower()) if lang_in else (ext if ext in ext_map else "")
+    entry = ext_map.get(key)
+    if not entry:
+        if lang_in:
+            return {"error": f"暂不支持的语言: {lang_in}(支持: {', '.join(sorted(_ALIAS))})"}
+        return {"error": f"无法根据扩展名 '{ext or '(无)'}' 自动检测语言,请显式指定 language 参数"}
+    lang, cmd = entry[0], entry[1]
 
-    cmd = ext_map.get(f".{lang}", (lang, [lang, "--syntax-only", path]))[1]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, cwd=os.path.dirname(resolved) or None)
         output = (result.stdout or "") + "\n" + (result.stderr or "")
         errors = []
+        _base = os.path.basename(resolved)
         for line in output.split("\n"):
             line = line.strip()
-            if line and ("error" in line.lower() or line.startswith(path) or ":", "Error" in line):
+            # 注意原实现最后是 ("...", "Error" in line) —— 非空 tuple 恒为真,
+            # 会把编译器的整段输出(含正常提示)全部当成错误行塞进 errors。
+            if line and ("error" in line.lower() or line.startswith(_base) or "Error" in line):
                 errors.append(line)
         return {
             "path": path,

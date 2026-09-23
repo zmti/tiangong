@@ -37,7 +37,10 @@ DEFAULT_LSP_SERVERS: dict[str, dict] = {
 
 def _resolve_lsp_config(language: str) -> Optional[dict]:
     """解析指定语言的 LSP 服务器配置。"""
-    raw = (settings.agent_lsp_servers or "").strip()
+    # getattr 兜底: app/config.py 里并未定义 agent_lsp_servers,直接取值会抛
+    # AttributeError,导致所有 lsp_* 工具 100% 失败(tests/test_lsp_tool.py 稳定复现)。
+    # 没有该配置时应回退到内置的 DEFAULT_LSP_SERVERS,而不是让工具整体不可用。
+    raw = (getattr(settings, "agent_lsp_servers", "") or "").strip()
     if not raw:
         return DEFAULT_LSP_SERVERS.get(language)
     try:

@@ -44,6 +44,16 @@ class Tool:
         self.terminal = terminal
         self.is_async = asyncio.iscoroutinefunction(func)
 
+    def __call__(self, *args, **kwargs):
+        """让 Tool 实例能像原函数一样被直接调用(转发到 self.func)。
+
+        @tool 装饰器会把模块里的函数替换成 Tool 实例。若另一个工具在函数体里
+        `from app.tools import x` 后像普通函数一样调用 x(...),会得到
+        "'Tool' object is not callable" —— read_url / fetch_page 正是这样
+        100% 失败的(2026-09-23 真实 trace)。
+        """
+        return self.func(*args, **kwargs)
+
     # 部分模型/网关会把真实参数再包一层信封,形如:
     #   {"arguments": "{\"code\": \"print(1)\"}"}   或   {"input": {...}}
     # 直接送去 pydantic 校验会变成「参数校验失败: xxx Field required」,

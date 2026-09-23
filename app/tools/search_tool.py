@@ -388,8 +388,11 @@ def fetch_page(
     max_chars: int = Field(8000, description="最大返回字符数"),
 ) -> dict:
     """增强版网页抓取:返回标题、正文、链接、meta 信息。"""
+    # fetch_webpage 是 @tool 装饰后的 Tool 实例;Tool 现已实现 __call__(转发到
+    # self.func),因此可以直接调用。历史上这里拿 Tool 当函数用,报
+    # "'Tool' object is not callable",本工具 100% 失败。
     from app.tools.web_tool import fetch_webpage
-    return fetch_webpage(url, max_chars=max_chars, extract_links=extract_links)
+    return fetch_webpage(url=url, max_chars=max_chars, extract_links=extract_links)
 
 
 @tool("read_url", "读取网页文本内容(不抓链接)", timeout=15)
@@ -399,5 +402,4 @@ def read_url(
 ) -> dict:
     """轻量版网页读取。"""
     from app.tools.web_tool import fetch_webpage
-    result = fetch_webpage(url, max_chars=max_chars, extract_links=False)
-    return result
+    return fetch_webpage(url=url, max_chars=max_chars, extract_links=False)

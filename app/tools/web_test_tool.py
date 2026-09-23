@@ -142,6 +142,26 @@ def _assemble_report(
     }
 
 
+def _run_async(coro):
+    """在 worker 线程里执行协程并返回结果。
+
+    同步工具由 registry 经 `asyncio.to_thread` 放到 worker 线程执行(thread 名
+    'asyncio_N'),该线程**没有**事件循环,直接 `asyncio.get_event_loop()`
+    会抛 "There is no current event loop in thread 'asyncio_0'" —— web_auto_test
+    因此 100% 失败(2026-09-21 真实 trace)。
+    这里每次调用自建 loop、结束即关闭并还原全局 loop,避免串扰与泄漏。
+    """
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coro)
+    finally:
+        try:
+            loop.close()
+        finally:
+            asyncio.set_event_loop(None)
+
+
 @tool(
     "web_auto_test",
     "自动测试当前 H5/网页项目:检测框架→后台拉起 dev server→浏览器打开→冒烟检查"
@@ -206,18 +226,18 @@ def web_auto_test(
         # 3) 浏览器打开 + 冒烟检查
         from app.tools.browser_tool import BrowserSession
         session = BrowserSession()
-        if not asyncio.get_event_loop().run_until_complete(session.launch(headless=True)):
+        if not _run_async(session.launch(headless=True)):
             return _assemble_report(project, target, steps, {}, "", False, None,
                                     error="无法启动浏览器(请确认已安装 playwright: pip install playwright && playwright install chromium)")
         try:
             session.reset_capture()
-            nav = asyncio.get_event_loop().run_until_complete(session.goto(target, wait_until="networkidle", timeout=30000))
+            nav = _run_async(session.goto(target, wait_until="networkidle", timeout=30000))
             if "error" in nav:
                 return _assemble_report(project, target, steps, session.get_capture(), nav.get("title", ""), False, None,
                                         error=f"打开页面失败: {nav['error']}")
             title = nav.get("title", "")
             # 内容检查
-            text = asyncio.get_event_loop().run_until_complete(session.get_text())
+            text = _run_async(session.get_text())
             has_content = bool(text.get("text", "").strip()) if isinstance(text, dict) else False
             steps.append(f"页面已加载: title={title!r}, 有内容={has_content}")
             # 关键元素检查
@@ -229,11 +249,11 @@ def web_auto_test(
                     sels = []
                 selectors_present = []
                 for sel in (sels or []):
-                    w = asyncio.get_event_loop().run_until_complete(session.wait_for(sel, timeout=5000))
+                    w = _run_async(session.wait_for(sel, timeout=5000))
                     selectors_present.append("error" not in w)
                 steps.append(f"关键元素检查: {selectors_present}")
             # 截图留证
-            shot = asyncio.get_event_loop().run_until_complete(session.screenshot(full_page=False))
+            shot = _run_async(session.screenshot(full_page=False))
             screenshot_path = ""
             if isinstance(shot, dict) and "image_base64" in shot:
                 import base64
@@ -245,7 +265,7 @@ def web_auto_test(
             project["screenshot"] = screenshot_path
             return _assemble_report(project, target, steps, capture, title, has_content, selectors_present)
         finally:
-            asyncio.get_event_loop().run_until_complete(session.close())
+            _run_async(session.close())
     finally:
         if proc is not None and not keep_server:
             try:
