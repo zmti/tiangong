@@ -1,7 +1,7 @@
 """检索器:接收查询,返回相关文档片段。
 
 混合检索策略:
-1. 向量召回(store,faiss 加速)
+1. 向量召回(store,faiss/Milvus/pgvector 加速)
 2. 向量分 + 关键词覆盖分加权混合,得到候选排序
 3. 可选重排(settings.rerank_mode,默认 RRF 融合向量/关键词排序位置)
 
@@ -22,6 +22,7 @@ from app.config import settings
 from app.rag.embeddings import _keyword_tokens, get_embedder, run_embed
 from app.rag.multi_retriever import MultiPathRetriever, bm25_score, expand_query
 from app.rag.reranker import get_reranker
+from app.rag.vector_store_backend import get_vector_store_backend
 
 _lock = threading.Lock()
 _instance = None
@@ -29,20 +30,8 @@ _multi_instance = None
 
 
 def _build_store():
-    """选择向量存储后端:pgvector 可用时用 PGVectorStore,否则 SQLite+faiss。"""
-    try:  # noqa: PLW0129
-        from app.core.storage import get_vector_backend
-
-        backend, dsn = get_vector_backend()
-        if backend == "pgvector":
-            from app.rag.store_pg import PGVectorStore
-
-            return PGVectorStore(dsn=dsn, table=settings.pgvector_client_table)
-    except Exception:  # noqa: BLE001  # pgvector 不可用回退 SQLite+faiss
-        pass
-    from app.rag.store import VectorStore
-
-    return VectorStore()
+    """使用新的向量存储后端抽象层,自动选择 faiss/Milvus/pgvector/SQLite"""
+    return get_vector_store_backend(settings.vector_store_backend)
 
 
 _store = _build_store()
