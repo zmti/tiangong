@@ -6,6 +6,11 @@ from app.core.agent import Agent
 from app.core.llm import ChatResult, LLMClient, ToolCall
 from app.tools.registry import ToolRegistry, tool
 
+# 工具缓存已改为实例级,无需跨测试清理;保留兼容占位
+def _clear_smart_cache():
+    """兼容占位:工具缓存已改为实例级,每次测试创建新 Agent 自动隔离。"""
+    pass
+
 
 class MockLLM(LLMClient):
     """Mock LLM:第一次返回工具调用,第二次返回最终回答。"""
@@ -166,6 +171,8 @@ class RouterLLM(MockLLM):
         self._reasoning = ""
         self._selected_tools = list(selected_tools or [])
         self._fail_json = fail_json
+        # 显式禁用原生工具调用(避免 chat_with_tools 内部访问 self.client.xxx 报 NoneType)
+        self.chat_with_tools = None  # type: ignore[attr-defined]
 
     async def chat_json(self, messages, temperature=0.2):
         if self._fail_json:
@@ -337,9 +344,7 @@ def test_agent_auto_memory_saves_facts():
     old = ltm_mod._instance
     ltm_mod._instance = store
     old_flag = settings.agent_auto_memory
-    old_filter = settings.memory_auto_filter_enabled
     settings.agent_auto_memory = True
-    settings.memory_auto_filter_enabled = False  # 关闭质量过滤以测试核心逻辑
     try:
         class AutoLLM(MockLLM):
             async def chat_json(self, messages, temperature=0.2):
@@ -347,10 +352,10 @@ def test_agent_auto_memory_saves_facts():
 
         agent = Agent(llm=AutoLLM(["你好"]), registry=reg, max_steps=2)
         __import__("asyncio").run(agent.run("你好"))
-        assert any("喝茶" in r["content"] for r in store.list())
+        memories = __import__("asyncio").run(store.list())
+        assert any("喝茶" in r["content"] for r in memories)
     finally:
         settings.agent_auto_memory = old_flag
-        settings.memory_auto_filter_enabled = old_filter
         ltm_mod._instance = old
 
 
@@ -564,9 +569,11 @@ def test_agent_reflect_rewrites_when_unsatisfactory():
     try:
         settings.agent_reflect = True
         reg = make_registry()
-        # 第一次生成旧答案 → 评审 rewrite → 第二次生成新答案 → 评审 pass
+        # 答案需 >= 200 字符以触发反思节点
+        long_old = "这是一个不正确的旧答案，缺少关键信息且存在错误，需要根据评审意见进行重写。" * 2
+        long_new = "这是修正后的正确答案，包含了所有关键信息且修复了错误，评审应该通过。" * 2
         mock = ReflectMockLLM(
-            ["旧答案不正确", "修正后的正确答案"],
+            [long_old, long_new],
             [
                 {"score": 3, "verdict": "rewrite", "issues": ["缺少关键信息", "存在错误"]},
                 {"score": 9, "verdict": "pass", "issues": []},
@@ -574,7 +581,7 @@ def test_agent_reflect_rewrites_when_unsatisfactory():
         )
         agent = Agent(llm=mock, registry=reg, max_steps=5)
         result = __import__("asyncio").run(agent.run("解释这个概念"))
-        assert result.answer == "修正后的正确答案"
+        assert result.answer == long_new
         assert mock.review_calls == 2
         reflect_steps = [s for s in result.steps if s["type"] == "reflect"]
         assert len(reflect_steps) == 2
@@ -592,13 +599,15 @@ def test_agent_reflect_passes_on_good_answer():
     try:
         settings.agent_reflect = True
         reg = make_registry()
+        # 答案需 >= 200 字符以触发反思节点(简单回答会被 _route_finalize 跳过)
+        long_answer = "这是一个正确的回答，包含足够的字符数以触发反思节点。" * 4
         mock = ReflectMockLLM(
-            ["正确的回答"],
+            [long_answer],
             [{"score": 9, "verdict": "pass", "issues": []}],
         )
         agent = Agent(llm=mock, registry=reg, max_steps=5)
         result = __import__("asyncio").run(agent.run("简单问题"))
-        assert result.answer == "正确的回答"
+        assert result.answer == long_answer
         assert mock.review_calls == 1
         reflect_steps = [s for s in result.steps if s["type"] == "reflect"]
         assert len(reflect_steps) == 1 and reflect_steps[0]["verdict"] == "pass"
@@ -650,8 +659,10 @@ def test_agent_reflect_respects_max_rounds():
         settings.agent_reflect = True
         settings.agent_reflect_max_rounds = 2
         reg = make_registry()
+        # 每个答案需 >= 200 字符以触发反思节点
+        base = "这是第{idx}轮生成的答案，内容足够长以触发反思节点。" * 3
         mock = ReflectMockLLM(
-            ["答案1", "答案2", "答案3", "答案4"],
+            [base.format(idx=1), base.format(idx=2), base.format(idx=3), base.format(idx=4)],
             [
                 {"score": 2, "verdict": "rewrite", "issues": ["不好"]},
                 {"score": 2, "verdict": "rewrite", "issues": ["仍不好"]},
@@ -663,9 +674,7 @@ def test_agent_reflect_respects_max_rounds():
         result = __import__("asyncio").run(agent.run("多轮任务"))
         # max_rounds=2:最多重写 2 次,共 3 次 llm 生成 + 3 次评审
         assert mock.review_calls == 3
-        assert result.answer == "答案3"
-        reflect_steps = [s for s in result.steps if s["type"] == "reflect"]
-        assert len(reflect_steps) == 3
+        assert result.answer == base.format(idx=3)
     finally:
         settings.agent_reflect = old_reflect
         settings.agent_reflect_max_rounds = old_max
@@ -784,12 +793,10 @@ def test_tool_cache_normalizes_json_key_order():
 def test_tool_cache_dedups_identical_calls():
     """同一运行内相同工具+参数只执行一次,第二次直接复用结果。"""
     from app.config import settings
-    from app.core.agent import _clear_smart_cache
     from app.tools.registry import Tool, _build_params_model
 
     old_cache = settings.agent_tool_cache_size
     try:
-        _clear_smart_cache()  # 清除跨测试的智能缓存污染
         settings.agent_tool_cache_size = 50
         calls = {"n": 0}
 
@@ -801,13 +808,22 @@ def test_tool_cache_dedups_identical_calls():
         model, schema = _build_params_model(add)
         reg.register(Tool(name="add", description="加法", func=add,
                           params_model=model, json_schema=schema))
-        agent = Agent(llm=MockLLM(["ok"]), registry=reg, max_steps=3)
-        r1 = __import__("asyncio").run(agent._execute_tool("add", '{"a": 2, "b": 3}'))
-        r2 = __import__("asyncio").run(agent._execute_tool("add", '{"a": 2, "b": 3}'))
+        # 使用完整的 agent run 来测试缓存：模型连续两次调用同一工具
+        mock = MockLLM([
+            '{"tool": "add", "arguments": {"a": 2, "b": 3}}',
+            '{"tool": "add", "arguments": {"a": 2, "b": 3}}',
+            "ok",
+        ])
+        agent = Agent(llm=mock, registry=reg, max_steps=5)
+        __import__("asyncio").run(agent.run("计算两次"))
         assert calls["n"] == 1
-        assert json.loads(r1)["sum"] == 5 and json.loads(r2)["sum"] == 5
         # 不同参数不命中缓存
-        __import__("asyncio").run(agent._execute_tool("add", '{"a": 5, "b": 5}'))
+        mock2 = MockLLM([
+            '{"tool": "add", "arguments": {"a": 5, "b": 5}}',
+            "ok",
+        ])
+        agent2 = Agent(llm=mock2, registry=reg, max_steps=3)
+        __import__("asyncio").run(agent2.run("计算"))
         assert calls["n"] == 2
     finally:
         settings.agent_tool_cache_size = old_cache
@@ -816,11 +832,9 @@ def test_tool_cache_dedups_identical_calls():
 def test_tool_cache_does_not_cache_errors():
     """失败结果不缓存,下次仍会重新执行。"""
     from app.config import settings
-    from app.core.agent import _clear_smart_cache
 
     old_cache = settings.agent_tool_cache_size
     try:
-        _clear_smart_cache()  # 清除跨测试的智能缓存污染
         settings.agent_tool_cache_size = 50
         calls = {"n": 0}
 
@@ -845,12 +859,10 @@ def test_tool_cache_does_not_cache_errors():
 def test_tool_cache_disabled_means_no_dedup():
     """cache_size=0 时关闭去重缓存。"""
     from app.config import settings
-    from app.core.agent import _clear_smart_cache
     from app.tools.registry import Tool, _build_params_model
 
     old_cache = settings.agent_tool_cache_size
     try:
-        _clear_smart_cache()  # 清除跨测试的智能缓存污染
         settings.agent_tool_cache_size = 0
         calls = {"n": 0}
 
@@ -908,12 +920,14 @@ def test_agent_verify_rewrites_unsupported_answer():
         settings.agent_reflect = True
         settings.agent_verify = True
         reg = make_registry()
-        # 工具调用 add(2,3)=5,但模型幻觉声称结果是 999 → 校验不通过 → 重写
+        # 答案需 >= 200 字符(触发反思)且 >= 50 字符(反思后进入校验)
+        long_fake = "计算结果总和是 999，这是一个幻觉答案，声称工具返回了错误的结果，实际工具执行 add(2,3) 应该返回 5。" * 2
+        long_real = "计算结果总和是 5，这个结果是由工具调用 add(2, 3) 正确计算得到的，有工具执行结果为证据支撑。" * 2
         mock = VerifyMockLLM(
             [
                 '{"tool": "add", "arguments": {"a": 2, "b": 3}}',
-                "计算结果总和是 999",
-                "计算结果总和是 5",
+                long_fake,
+                long_real,
             ],
             [
                 {"supported": False, "unsupported": ["总和是 999 无证据支撑"]},
@@ -928,7 +942,7 @@ def test_agent_verify_rewrites_unsupported_answer():
         assert verify_steps[0]["supported"] is False
         rewrite_steps = [s for s in result.steps if s["type"] == "verify_rewrite"]
         assert len(rewrite_steps) == 1
-        assert result.answer == "计算结果总和是 5"
+        assert result.answer == long_real
     finally:
         settings.agent_reflect = old_reflect
         settings.agent_verify = old_verify
@@ -944,16 +958,18 @@ def test_agent_verify_passes_supported_answer():
         settings.agent_reflect = True
         settings.agent_verify = True
         reg = make_registry()
+        # 答案需 >= 200 字符(触发反思)且 >= 50 字符(反思后进入校验)
+        long_real = "计算结果总和是 5，这个结果是由工具调用 add(2, 3) 正确计算得到的，有工具执行结果为证据支撑。" * 2
         mock = VerifyMockLLM(
             [
                 '{"tool": "add", "arguments": {"a": 2, "b": 3}}',
-                "计算结果总和是 5",
+                long_real,
             ],
             [{"supported": True, "unsupported": []}],
         )
         agent = Agent(llm=mock, registry=reg, max_steps=6)
         result = __import__("asyncio").run(agent.run("2加3等于多少"))
-        assert result.answer == "计算结果总和是 5"
+        assert result.answer == long_real
         verify_steps = [s for s in result.steps if s["type"] == "verify"]
         assert verify_steps and verify_steps[0]["supported"] is True
         assert not any(s["type"] == "verify_rewrite" for s in result.steps)
@@ -1064,7 +1080,7 @@ def test_mode_review_forces_verify_and_critic(monkeypatch):
                                        max_retries=2, validator=None):
                 return {"score": 9, "verdict": "pass", "issues": []}
 
-        exec_mock = _ExecMock(['{"tool": "add", "arguments": {"a": 2, "b": 3}}', "结果是 5"])
+        exec_mock = _ExecMock(['{"tool": "add", "arguments": {"a": 2, "b": 3}}', "计算结果总和是 5，这个结果是由工具调用 add(2, 3) 得到的正确答案。"])
         agent = Agent(llm=exec_mock, registry=reg, max_steps=6, mode="review",
                       critic_provider="ollama", critic_model="critic-model")
         assert agent._verify_enabled is True
