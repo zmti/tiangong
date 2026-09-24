@@ -18,7 +18,7 @@
       if (el.classList && el.classList.contains('answer-doc')) return el;
       const doc = el.querySelector ? el.querySelector('.answer-doc') : null;
       if (doc) return doc;
-      if (el.parentNode === App.els.messages) return el;
+      if (el.parentNode === App.Chat.pane()) return el;
     }
     return null;
   }
@@ -44,7 +44,7 @@
       if (insertTarget) {
         insertTarget.parentNode.insertBefore(div, insertTarget);
       } else {
-        App.els.messages.appendChild(div);
+        App.Chat.pane().appendChild(div);
       }
       App._thinkingWrap = div;
     }
@@ -82,7 +82,7 @@
         if (Array.isArray(appendTo)) appendTo.push(div);
         else appendTo.appendChild(div);
       } else {
-        App.els.messages.appendChild(div);
+        App.Chat.pane().appendChild(div);
       }
       App._planCard = div;
     } else {
@@ -95,7 +95,7 @@
       if (insertTarget) {
         insertTarget.parentNode.insertBefore(div, insertTarget);
       } else {
-        App.els.messages.appendChild(div);
+        App.Chat.pane().appendChild(div);
       }
     }
     App.scrollMessagesToBottom();

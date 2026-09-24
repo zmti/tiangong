@@ -856,8 +856,20 @@ def run_code_sandboxed(
       PowerShell: powershell / ps1
       Shell    : shell / bash / zsh / fish
     """
+    from app.config import settings
+    
     if use_docker is None:
         use_docker = docker_available()
+    
+    # 生产强制 Docker 模式:不可用时直接报错,不降级 subprocess
+    if settings.sandbox_force_docker and not use_docker:
+        return SandboxResult(
+            success=False,
+            output="[沙箱] 生产模式强制要求 Docker,但 Docker daemon 不可用。请启动 Docker Desktop 或设置 sandbox_force_docker=false 允许降级。",
+            returncode=-1,
+            mode="docker",
+            duration=0,
+        )
 
     lang_key = (language or "python").strip().lower()
     # 只有 Docker 真的支持该语言时才进容器;否则直接走 subprocess,

@@ -105,9 +105,11 @@ class BatchCheckpointManager:
         run_id = state.run_id
         now = time.time()
         need_flush = False
+        need_evict = False
 
-        # 只在写缓冲区时持锁;flush 单独持锁(asyncio.Lock 不可重入,
-        # 若在 save 的锁内再调 flush 会自锁死,导致整轮 agent.run 挂起无输出)
+        # 只在写缓冲区时持锁;flush/evict 一律在锁外执行。
+        # asyncio.Lock 不可重入: 若在持锁期间再 await 一个会获取同一把锁的协程
+        # (flush/_evict_oldest), 该协程永远拿不到锁 -> 整轮 agent.run 挂起无输出。
         async with self._lock:
             if run_id in self._buffer:
                 # 更新已有缓冲
@@ -118,8 +120,8 @@ class BatchCheckpointManager:
             else:
                 # 新建缓冲
                 if len(self._buffer) >= self._max_buffer_size:
-                    # 缓冲区满，强制刷新最旧的一个(锁外执行,避免自锁)
-                    await self._evict_oldest()
+                    # 缓冲区满，标记待淘汰，稍后在锁外执行
+                    need_evict = True
                 self._buffer[run_id] = BufferedState(
                     state=state,
                     last_modified=now,
@@ -131,6 +133,10 @@ class BatchCheckpointManager:
 
             # 终态(done/failed/interrupted/cancelled)需立即落盘, 在释放锁后执行
             need_flush = state.status in ("done", "failed", "interrupted", "cancelled")
+
+        # --- 以下均在锁外, 避免 asyncio.Lock 不可重入导致的自锁死 ---
+        if need_evict:
+            await self._evict_oldest()
 
         if need_flush:
             await self.flush(run_id)

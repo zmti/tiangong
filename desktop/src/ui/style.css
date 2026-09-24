@@ -492,6 +492,21 @@ body.sidebar-collapsed .nav-group { padding: 0 4px; }
   line-height: 1.4;
 }
 /* 置顶标识统一由 .s-meta 里的 .s-pin 按钮承担, 标题前不再重复渲染图标 */
+/* 后台仍在生成的会话:标题前一个小呼吸点,表示该会话切走后任务没停 */
+.session-item .s-running-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: var(--accent, #4c8dff);
+  vertical-align: middle;
+  animation: gen-pulse 1.2s ease-in-out infinite;
+}
+@keyframes gen-pulse {
+  0%, 100% { opacity: 0.35; transform: scale(0.85); }
+  50%      { opacity: 1;    transform: scale(1.15); }
+}
 .session-item .s-meta {
   font-size: 11px; /* P1-5 */
   color: var(--muted);
@@ -3781,6 +3796,26 @@ body.exec-panel-open .exec-panel {
 .prov-model-del:hover {
   background: var(--err-soft);
   color: var(--err);
+}
+.prov-model-item[hidden] {
+  display: none;
+}
+.prov-models-toggle {
+  display: block;
+  margin: 0 16px 12px;
+  padding: 4px 10px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.prov-models-toggle:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+  background: var(--primary-soft);
 }
 .prov-card-empty {
   padding: 12px 16px;

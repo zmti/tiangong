@@ -325,6 +325,20 @@ async def remove_builtin_ext_model(pid: str, mid: str) -> dict:
     return {"ok": remove_builtin_model(pid, mid)}
 
 
+@router.delete("/providers/builtin/{pid}/models")
+async def clear_builtin_ext_models(pid: str) -> dict:
+    """一键清空该内置厂商的扩展模型(获取/添加来的)。内置模型不受影响。"""
+    from app.core.provider_registry import clear_builtin_models, BUILTIN_PROVIDERS
+
+    if pid not in BUILTIN_PROVIDERS:
+        raise HTTPException(status_code=400, detail=f"未知内置厂商: {pid}")
+    try:
+        removed = clear_builtin_models(pid)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"ok": True, "removed": removed}
+
+
 @router.post("/providers/fetch_models")
 async def fetch_models(req: ProviderTest) -> dict:
     """拉取内置厂商模型列表并追加到扩展模型。"""

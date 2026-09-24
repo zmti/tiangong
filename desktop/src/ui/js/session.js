@@ -1,6 +1,129 @@
 /* 会话模块:列表加载 / 搜索 / 切换 / 新建 / 折叠 */
 App.Session = {};
 
+/* ═══════════════════════════════════════════════════════════════════════
+   多会话并行
+   ───────────────────────────────────────────────────────────────────────
+   旧行为:切换会话时 `App.Chat.stop()` + `App.abortController.abort()`。
+   stop() 会 POST /v1/chat/cancel,后端据此真正 cancel 掉后台 agent ——
+   用户看到的就是「切走了,上一个会话就停了」。
+
+   现状:后端本来就支持并行(_RUNNING_TASKS 按 session_id 存各自的 asyncio.Task,
+   且 SSE 断连也不会取消 agent)。所以只要前端不再主动掐就行。
+
+   难点在于渲染:多个任务同时往同一个 `App.els.messages` 写会串台。
+   解决办法是给每个会话一个离屏容器(pane):
+     - 切走时把该会话的消息节点整批移进 pane(live 容器清空);
+     - 后台会话的流式输出继续写进它自己的 pane,完全不与前台交错;
+     - 切回来时把 pane 的子节点整批搬回 live,内容连续无缺失。
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* sid -> { streaming, abort, pane, handles } */
+App.Session._runs = new Map();
+
+App.Session.runOf = function (sid) {
+  let r = App.Session._runs.get(sid);
+  if (!r) {
+    r = { streaming: false, abort: null, pane: null, handles: null };
+    App.Session._runs.set(sid, r);
+  }
+  return r;
+};
+
+/* 会话是否在后台继续生成(供侧边栏打标记) */
+App.Session.isRunning = function (sid) {
+  const r = App.Session._runs.get(sid);
+  return !!(r && r.streaming);
+};
+
+App.Session.runningIds = function () {
+  const out = [];
+  App.Session._runs.forEach((r, sid) => { if (r.streaming) out.push(sid); });
+  return out;
+};
+
+/* 本次写入应落到哪个容器:后台会话写自己的 pane,前台写 live */
+App.Session.paneOf = function (sid) {
+  const live = App.els && App.els.messages;
+  if (!sid) return live;
+  if (sid !== App.sessionId) {
+    const r = App.Session._runs.get(sid);
+    if (r && r.pane) return r.pane;
+  }
+  return live;
+};
+
+/* 把一个会话转入后台:消息区搬进离屏容器,流式状态寄存起来(不取消、不 abort) */
+App.Session.park = function (sid) {
+  if (!sid) return;
+  const r = App.Session.runOf(sid);
+  const live = App.els && App.els.messages;
+  r.streaming = !!App.streaming;
+
+  if (live) {
+    // 只要有内容就搬走(哪怕不在流式):切回来时统一由 unpark 搬回,
+    // 避免"重新加载历史"导致正在进行的那一轮被重复渲染
+    const store = r.pane || document.createElement('div');
+    while (live.firstChild) store.appendChild(live.firstChild);
+    r.pane = store;
+  }
+  // abort 控制器按会话寄存:否则新会话发起请求时会去 abort 掉别人的流
+  if (App.abortController) {
+    r.abort = App.abortController;
+    App.abortController = null;
+  }
+  // 流式渲染句柄同理:它们指向已搬进 pane 的节点,必须随会话一起寄存,
+  // 后台会话继续用它写 pane;前台新会话会拿到全新句柄。
+  r.handles = {
+    _currentBotMsg: App._currentBotMsg,
+    _thinkingWrap: App._thinkingWrap,
+    _answerWrap: App._answerWrap,
+    _mdBuf: App._mdBuf,
+    _planCard: App._planCard,
+    _currentGroup: App._currentGroup,
+  };
+  App._currentBotMsg = null;
+  App._thinkingWrap = null;
+  App._answerWrap = null;
+  App._mdBuf = '';
+  App._planCard = null;
+  App._currentGroup = null;
+  App.streaming = false;
+};
+
+/* 切回某会话:把内容搬回 live,恢复它自己的流式状态 */
+App.Session.unpark = function (sid) {
+  if (!sid) return false;
+  const r = App.Session._runs.get(sid);
+  if (!r) return false;
+  const live = App.els && App.els.messages;
+  // 是否有该会话转入后台时的现场内容
+  const restored = !!(r.pane && r.pane.firstChild);
+  if (r.pane && live) {
+    while (r.pane.firstChild) live.appendChild(r.pane.firstChild);
+  }
+  if (r.pane) r.pane = null;
+  if (r.abort) {
+    App.abortController = r.abort;
+    r.abort = null;
+  }
+  if (r.handles) {
+    App._currentBotMsg = r.handles._currentBotMsg;
+    App._thinkingWrap = r.handles._thinkingWrap;
+    App._answerWrap = r.handles._answerWrap;
+    App._mdBuf = r.handles._mdBuf || '';
+    App._planCard = r.handles._planCard;
+    App._currentGroup = r.handles._currentGroup;
+    r.handles = null;
+  }
+  if (r.streaming) {
+    App.streaming = true;
+    document.body.classList.add('streaming');
+  }
+  if (!r.streaming) App.Session._runs.delete(sid);
+  return restored;
+};
+
 /* 会话列表缓存:5s 内不重复请求 */
 App.Session._listCache = { ids: null, ts: 0 };
 
@@ -140,8 +263,12 @@ App.Session.search = async function () {
       return;
     }
     const results = res.data.results;
+    // 注意后端 /v1/chat/search 返回的是 session_id(不是 id);原代码写
+    // r.id → data-id 变成 "undefined",点击搜索结果会切到一个不存在的会话。
+    // 同时补上 data-title,保证搜索结果与会话列表的标题口径一致。
     historyEl.innerHTML = results.map(r => `
-      <div class="session-item search-hit" data-id="${r.id}">
+      <div class="session-item search-hit" data-id="${App.escapeHtml(r.session_id)}"
+           data-title="${App.escapeHtml(r.title || '新会话')}">
         <div class="s-title">${App.escapeHtml(r.title || '新会话')} · ${r.snippets?.length || 0} 处命中</div>
       </div>
     `).join('');
@@ -222,7 +349,7 @@ App.Session.renderList = async function () {
       const timeStr = App.Session.formatTime(s.updated_at);
       return `
         <div class="session-item ${isActive ? 'active' : ''} ${isPinned ? 'pinned' : ''}"
-             data-id="${s.id}" data-title="${App.escapeHtml(s.title || '未命名')}">
+             data-id="${s.id}" data-title="${App.escapeHtml(s.title || '新会话')}">
           <div class="s-title">${App.escapeHtml(s.title || '新会话')}</div>
           <div class="s-meta">
             <span class="s-time">${timeStr}</span>
@@ -294,11 +421,14 @@ App.Session.renderCards = async function () {
     listEl.innerHTML = sorted.map(s => {
       const isActive = s.id === App.sessionId;
       const isPinned = pins.has(s.id);
+      const isRunning = App.Session.isRunning(s.id);
       const timeStr = App.Session.formatTime(s.updated_at);
+      // 后台仍在生成的会话加个呼吸点,让用户知道切走之后任务没停
+      const dot = isRunning ? '<span class="s-running-dot" title="后台生成中"></span>' : '';
       return `
-        <div class="session-item ${isActive ? 'active' : ''} ${isPinned ? 'pinned' : ''}"
-             data-id="${s.id}" data-title="${App.escapeHtml(s.title || '未命名')}">
-          <div class="s-title">${App.escapeHtml(s.title || '新会话')}</div>
+        <div class="session-item ${isActive ? 'active' : ''} ${isPinned ? 'pinned' : ''} ${isRunning ? 'running' : ''}"
+             data-id="${s.id}" data-title="${App.escapeHtml(s.title || '新会话')}">
+          <div class="s-title">${dot}${App.escapeHtml(s.title || '新会话')}</div>
           <div class="s-meta">
             <span class="s-time">${timeStr}</span>
             <span class="s-count">${s.messages || 0} 条</span>
@@ -465,7 +595,11 @@ App.Session.clearCurrent = async function () {
 
 /* 新建会话 */
 App.Session.newSession = async function () {
-  if (App.streaming && App.Chat?.stop) App.Chat.stop(true);
+  // 多会话并行:把当前会话转入后台(它的后台任务继续跑),不再 App.Chat.stop()。
+  // 必须在清空消息区**之前** park,否则已渲染的内容会被清掉还没进 pane。
+  const prevSid = App.sessionId;
+  if (prevSid) App.Session.park(prevSid);
+  App.Chat.runSid = '';
   if (App._currentGroup) {
     App._currentGroup.wrap.remove();
     App._currentGroup = null;
@@ -486,34 +620,39 @@ App.Session.newSession = async function () {
 
 /* 切换会话 */
 App.Session.select = async function (id) {
-  // 停止当前流式输出
-  if (App.streaming && App.Chat?.stop) App.Chat.stop(true);
   // 同一会话且消息区已有内容,跳过重复加载
   if (id === App.sessionId && App.els.messages && App.els.messages.querySelector('.msg')) {
     return;
   }
-  // 切换会话时关闭当前分组
-  if (App._currentGroup) {
-    const g = App._currentGroup;
-    if (g.head) g.head.innerHTML = `<span class="rg-pulse">📂</span><span class="rg-label">已切换会话(取消)</span>`;
-    if (g.wrap) g.wrap.classList.add('req-group-done');
-    App._currentGroup = null;
-  }
-  // 切换会话时重置所有状态
-  if (App.clearImageGenerating) App.clearImageGenerating();
-  App._thinkingWrap = null;
-  App._answerWrap = null;
-  App._mdBuf = '';
-  if (App.ExecTrace) App.ExecTrace.clear();
-  if (App.abortController) {
-    try { App.abortController.abort(); } catch (_) { /* 忽略 */ }
-    App.abortController = null;
-  }
-  App.sessionId = id;
-  App.Session.saveSessionId(id);
-  // 清空消息容器
+  // 多会话并行:切走时把上一个会话转入后台(保留它的流式任务继续跑),
+  // 不再 App.Chat.stop() —— stop 会 POST /v1/chat/cancel 让后端真的取消 agent。
+  const prevSid = App.sessionId;
+  if (prevSid && id !== prevSid) App.Session.park(prevSid);
+
   const msgs = App.els.messages;
   msgs.innerHTML = '';
+
+  // 该会话此前被转入后台 → 现场内容在它的 pane 里,整批搬回即可。
+  // 这里刻意**不重新拉 history**:这一轮的 assistant 消息要等流结束才落库,
+  // 此刻拉历史会缺掉正在进行的那一轮,并把 pane 里已有的连续内容冲掉。
+  if (App.Session.unpark(id)) {
+    // 该会话自己的流还在跑 → 恢复流式归属,后续增量正常渲染到前台
+    App.Chat.runSid = id;
+    App.scrollMessagesToBottom(true);
+    if (App.refreshWelcomePage) App.refreshWelcomePage();
+    if (App.Session.refreshList) await App.Session.refreshList();
+    const back = document.querySelector(`.sidebar-session-history .session-item[data-id="${CSS.escape(id)}"]`);
+    App.els.sessionLabel.textContent = (back && back.dataset.title) || '新会话';
+    if (App.Attach) App.Attach.reset();
+    if (App.CtxMeter) App.CtxMeter.refresh();
+    App.els.input.focus();
+    return;
+  }
+
+  // 渲染历史不是流式输出,必须清空 runSid —— 否则 App.Chat.pane() 会认为
+  // "本次仍属于那个已转入后台的会话",把历史节点写进它的离屏容器里去。
+  App.Chat.runSid = '';
+
   try {
     const res = await App.apiJSON(`/v1/chat/history?session_id=${encodeURIComponent(id)}`);
     if (!res.success) throw new Error(res.detail || `HTTP ${res.status}`);
@@ -884,16 +1023,12 @@ App.Session.select = async function (id) {
 
     if (App.refreshWelcomePage) App.refreshWelcomePage();
 
-    // 设置会话标题
-    let title = '新会话';
-    const item = document.querySelector(`.sidebar-session-history .session-item[data-id="${CSS.escape(id)}"]`);
-    if (item && item.dataset.title) {
-      title = item.dataset.title;
-    } else if (data.messages && data.messages.length) {
-      const first = data.messages.find((m) => m.role === 'user');
-      if (first) title = String(msgText(first)).slice(0, 30);
-    }
-    App.els.sessionLabel.textContent = title;
+    // 会话标题:一律以**后端权威标题**为准(data.title 由 /chat/history 返回,
+    // 与会话列表共用同一套「自定义名 > 首条用户消息」解析)。
+    // 旧实现先从侧边栏 DOM 的 data-title 取、取不到就退化成首条用户消息截断,
+    // 导致用户 rename 之后「列表是新名字、标题栏是旧名字」(典型场景:从搜索结果
+    // 点进去时,搜索结果项压根没有 data-title 属性)。
+    App.els.sessionLabel.textContent = data.title || '新会话';
   } catch (e) {
     if (App.appendMessage) App.appendMessage(`加载会话历史失败: ${e.message}`, 'error');
   }

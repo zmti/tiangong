@@ -1,6 +1,24 @@
 /* 聊天模块:SSE 流式对话 / 工具事件 / 停止生成 / 图片识别 */
 App.Chat = App.Chat || {};
 
+/* 本次流式所属会话。切换会话时它会连同已渲染内容被转入后台
+   (App.Session.park),此时它的后续输出必须写进自己的离屏容器,
+   而不是前台的消息区。 */
+App.Chat.runSid = '';
+
+/* 本次流式应该写入的消息容器。
+   多会话并行下必读:若本次所属会话已切到后台(用户跑去聊别的会话了),
+   返回它在 App.Session._runs 里的 pane;否则返回前台 live 容器。
+   直接写 App.els.messages 会让后台会话的输出串到当前会话的界面上。 */
+App.Chat.pane = function () {
+  const sid = App.Chat.runSid;
+  if (sid && sid !== App.sessionId && App.Session && App.Session.paneOf) {
+    const p = App.Session.paneOf(sid);
+    if (p) return p;
+  }
+  return App.els && App.els.messages;
+};
+
 /* 统一滚动到底部工具函数 - 防抖优化 */
 App._scrollToBottomTimer = null;
 App.scrollMessagesToBottom = function(force = false) {
@@ -243,6 +261,8 @@ App.Chat.doSend = async function (text, opts = {}) {
   }
   const input = App.els.input;
   input.value = '';
+  // 记录本次流式归属的会话:后续所有渲染都据此决定写前台还是写它的后台 pane
+  App.Chat.runSid = App.sessionId;
   if (App.syncComposer) App.syncComposer();
   App._planCard = null;
   App.clearImageGenerating();  // 清除上一轮可能残留的"生成中"卡片
@@ -479,7 +499,8 @@ App.Chat.doSend = async function (text, opts = {}) {
     if (App._answerWrap && App._answerWrap._answer) {
       App._answerWrap._answer.parentNode.insertBefore(el, App._answerWrap._answer);
     } else {
-      App.els.messages.insertBefore(el, App.els.messages.firstChild);
+      const _p0 = App.Chat.pane();
+      _p0.insertBefore(el, _p0.firstChild);
     }
   }
 
@@ -873,7 +894,7 @@ App.Chat.doSend = async function (text, opts = {}) {
           // 去重记录:避免同一工具结果重复显示(tool_done 和 tool 事件都可能触发)
           if (evt.type === 'tool_start') {
             // tool_start 是兼容旧事件的兜底处理
-            const children = App.els.messages.children;
+            const children = App.Chat.pane().children;
             let existingRunning = null;
             for (let i = children.length - 1; i >= 0; i--) {
               const n = children[i];
@@ -915,7 +936,7 @@ App.Chat.doSend = async function (text, opts = {}) {
               App.finishImageGenerating(evt.result || '');
             }
             // 检查是否已有该工具的显示记录,避免重复
-            const msgs = App.els.messages;
+            const msgs = App.Chat.pane();
             const toolChildren = msgs.children;
             let lastToolMsg = null;
             for (let i = toolChildren.length - 1; i >= 0; i--) {
@@ -992,7 +1013,7 @@ App.Chat.doSend = async function (text, opts = {}) {
               summary = `✅ ${flowName[evt.flow] || evt.flow} 编排完成`;
             }
             _showRail();
-            const lastRail = App.els.messages.querySelector('.msg.bot .process-rail:last-child');
+            const lastRail = App.Chat.pane().querySelector('.msg.bot .process-rail:last-child');
             if (lastRail && lastRail._summary) {
               lastRail._summary.textContent = summary;
             } else if (lastRail) {
@@ -1097,7 +1118,7 @@ App.Chat.doSend = async function (text, opts = {}) {
               App.removeTyping();
               typingShown = true;
               // 移除打字指示器
-              const msgs = App.els.messages;
+              const msgs = App.Chat.pane();
               const typingEl = msgs.querySelector('#typing');
               if (typingEl) {
                 typingEl.remove();
@@ -1164,7 +1185,7 @@ App.Chat.doSend = async function (text, opts = {}) {
             App.clearImageGenerating();
             cleanupStream();
             if (typingShown) App.removeTyping();
-            const errBotMsg = App._currentBotMsg || (App.els && App.els.messages && App.els.messages.querySelector('.msg.bot:last-child, .msg.msg-bot:last-child'));
+            const errBotMsg = App._currentBotMsg || (App.Chat.pane() && App.Chat.pane().querySelector('.msg.bot:last-child, .msg.msg-bot:last-child'));
             if (errBotMsg) {
               errBotMsg.classList.add('no-animation');
               // 保留 steps-flow(工具步骤可见,与历史一致);仅隐藏过程栏与 step-counter
@@ -1228,7 +1249,7 @@ App.Chat.doSend = async function (text, opts = {}) {
             if (typingShown) App.removeTyping();
             // 与历史回放统一:终态隐藏 process-rail(历史卡片的 rail 无 .visible,默认 display:none),
             // 保留 steps-flow(工具步骤可见)——仅隐藏纯流式态的 step-counter。
-            const botMsg = App._currentBotMsg || (App.els && App.els.messages && App.els.messages.querySelector('.msg.bot:last-child, .msg.msg-bot:last-child'));
+            const botMsg = App._currentBotMsg || (App.Chat.pane() && App.Chat.pane().querySelector('.msg.bot:last-child, .msg.msg-bot:last-child'));
             if (botMsg) {
               botMsg.classList.add('no-animation');
               const rail = botMsg.querySelector('.process-rail');
@@ -1469,14 +1490,16 @@ App.Chat.doSend = async function (text, opts = {}) {
     }
 
     // 记录流开始前的滚动比例，用于流式完成后判断是否应跟随滚动
-    const scrollRatioBefore = App.els.messages.scrollHeight === 0 ? 1 : App.els.messages.scrollTop / (App.els.messages.scrollHeight - App.els.messages.clientHeight);
+    const _pane1 = App.Chat.pane();
+    const scrollRatioBefore = _pane1.scrollHeight === 0 ? 1 : _pane1.scrollTop / (_pane1.scrollHeight - _pane1.clientHeight);
 
     // 清理流超时计时器
     cleanupStream();
     App.clearImageGenerating(); // 任何流终止都清理图片生成卡片,避免残留
 
     // ── 滚动锚定：只有用户已在底部(<48px)时才跟随，否则显示“回到底部”提示 ──
-    const atBottomNow = App.els.messages.scrollHeight - App.els.messages.scrollTop <= App.els.messages.clientHeight * 0.95;
+    const _pane2 = App.Chat.pane();
+    const atBottomNow = _pane2.scrollHeight - _pane2.scrollTop <= _pane2.clientHeight * 0.95;
     const wasAtBottomBefore = scrollRatioBefore > 0.95; // 流开始前用户是否在底部
     if (wasAtBottomBefore || atBottomNow) {
       // 用户在流开始前或当前就在底部，允许自动跟随
@@ -1577,6 +1600,19 @@ App.Chat.doSend = async function (text, opts = {}) {
       }
     }
     if (!isStale) App.abortController = null;
+    /* 本次流到此结束。清除该会话的"运行中"标记:
+       - 若是前台会话结束,顺带刷新列表让高亮/时间更新;
+       - 若它在后台跑完(用户早切走了),额外给个提示,否则用户不知道那边好了。 */
+    const _finSid = App.Chat.runSid;
+    if (_finSid && App.Session) {
+      App.Session._runs.delete(_finSid);
+      if (_finSid !== App.sessionId) {
+        if (App.toast) App.toast('后台会话已生成完毕,可切回查看', 'ok');
+        if (App.Session.refreshList) {
+          try { await App.Session.refreshList(); } catch (_) { /* 忽略 */ }
+        }
+      }
+    }
     if (App.Attach) App.Attach.reset();
     if (App.CtxMeter) App.CtxMeter.refresh();
     // 新建的会话在发出第一条消息前后端没有记录(侧边栏列表里不存在),

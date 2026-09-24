@@ -341,6 +341,13 @@ class Settings(BaseSettings):
     agent_checkpoint_batch_flush_interval: float = 2.0
     # 批量写入最大缓冲条数;超过则立即强制刷新最旧条目
     agent_checkpoint_batch_max_buffer: int = 10
+    # 单次 run 保留的历史版本数(时间旅行用);超出只留最近 N 个版本。
+    # checkpoint_versions 每次落盘都存一份完整 state 快照,不设上限会急剧膨胀
+    # (实测单表可到近 1GB,拖慢所有 checkpoint 读写)。0=不限
+    agent_checkpoint_max_versions_per_run: int = 5
+    # checkpoint 落盘是否卸载到线程池执行。存储后端是同步 sqlite3,
+    # 直接在大 state 上双写会阻塞事件循环;开启后走 asyncio.to_thread。
+    agent_checkpoint_offload_to_thread: bool = True
 
     # ---- 模型路由(简单/复杂任务分流) ----
     agent_routing_enabled: bool = False
@@ -434,6 +441,8 @@ class Settings(BaseSettings):
     # run_code 沙箱使用的 Python 解释器路径(打包后 sys.executable 是应用 exe,不可用作解释器);
     # 留空则自动探测:当前解释器(开发) -> PATH 中的 python -> 常见安装位置
     sandbox_python: str = ""
+    # 强制沙箱使用 Docker 容器模式(生产建议开启);true 时 Docker 不可用会直接报错而非降级 subprocess
+    sandbox_force_docker: bool = False
 
     # ---- 终端命令 ----
     # run_terminal 使用的 shell: auto(按平台自动) / cmd / powershell / bash

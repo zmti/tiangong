@@ -217,7 +217,7 @@
     footer.appendChild(createTime());
     content.appendChild(footer);
     wrap.appendChild(content);
-    App.els.messages.appendChild(wrap);
+    App.Chat.pane().appendChild(wrap);
     scrollBottom();
     if (App.refreshWelcomePage) App.refreshWelcomePage();
     return wrap;
@@ -336,7 +336,7 @@
     content.appendChild(footer);
 
     wrap.appendChild(content);
-    App.els.messages.appendChild(wrap);
+    App.Chat.pane().appendChild(wrap);
     scrollBottom();
     return wrap;
   }

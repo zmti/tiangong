@@ -320,6 +320,21 @@ def remove_builtin_model(provider: str, model_id: str) -> bool:
     return True
 
 
+def clear_builtin_models(provider: str) -> int:
+    """清空某内置厂商的全部扩展模型(获取/添加来的),返回被清除的条数。
+
+    只动 builtin_ext,不影响代码里定义的内置模型和 default_model
+    (后者来自 settings,不依赖扩展列表)。
+    """
+    if provider not in BUILTIN_PROVIDERS:
+        raise ValueError(f"未知内置厂商: {provider}")
+    ext = get_builtin_ext()
+    removed = len(ext.get(provider, []) or [])
+    ext[provider] = []
+    _save()
+    return removed
+
+
 def list_builtin_ext_models(provider: str) -> List[dict]:
     # 过一遍 _norm_model:补齐 capabilities(含按 id 的推断),
     # 否则历史数据里没有该字段的模型既进不了生成候选,又会混进对话模型列表。

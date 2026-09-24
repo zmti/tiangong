@@ -13,7 +13,7 @@ from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from app.api import attachments, chat, documents, project, files, mcp, mcp_server, runs, schedule, tasks, telemetry, tools, tts, user_profile, budget, advanced, analytics, assistants, plugins, safety, persistent_memory, planning, search, metrics, sessions, long_running, tenants, system, collaboration, reasoning, memory_cleanup, cross_session, collaboration_ui, artifacts, workflow, multimodal, rules, config_models
+from app.api import attachments, chat, documents, project, files, mcp, mcp_server, runs, schedule, tasks, telemetry, tools, tts, user_profile, budget, advanced, analytics, assistants, plugins, safety, persistent_memory, planning, search, metrics, sessions, long_running, tenants, system, collaboration, reasoning, memory_cleanup, cross_session, collaboration_ui, artifacts, workflow, multimodal, rules, config_models, eval_ab
 from app.api.security import require_api_key, require_admin
 from app.config import settings, APP_VERSION
 from app.tools.registry import get_registry
@@ -448,6 +448,7 @@ app.include_router(cross_session.router, dependencies=_auth)
 app.include_router(collaboration_ui.router, dependencies=_auth)
 app.include_router(artifacts.router, dependencies=_auth)  # Artifacts 实时渲染预览
 app.include_router(rules.router, dependencies=_auth)  # 智能体规则
+app.include_router(eval_ab.router, dependencies=_auth)  # A/B 评估对比
 
 # 本地生成图片的静态目录(data/images),供聊天与历史直接展示
 _images_dir = os.path.join(settings.resolved_data_dir, "images")

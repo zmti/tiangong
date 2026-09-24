@@ -102,9 +102,8 @@ class CheckpointManager:
         async with _DB_LOCK:
             return await self._save_locked(state)
 
-    async def _save_locked(self, state: AgentState) -> str:
-        """实际保存逻辑(需已持有 _DB_LOCK)。"""
-        now = time.time()
+    def _build_payload(self, state: AgentState) -> str:
+        """序列化状态并做大消息截断(CPU 密集,不碰 IO)。"""
         payload = state.to_json()
 
         # 大消息截断保护:防止超长 messages 导致 SQLite 写入失败
@@ -127,7 +126,10 @@ class CheckpointManager:
                     logger.debug("Checkpoint: messages truncated to cap=%d, total_len=%d", cap, len(payload))
             except Exception:  # noqa: BLE001
                 pass  # 截断失败不影响落盘
-        
+        return payload
+
+    def _write_locked_sync(self, state: AgentState, payload: str, now: float) -> int:
+        """真正落盘(同步)。调用方负责放到线程里,避免阻塞事件循环。"""
         # 使用事务包裹双写,防止 checkpoint_versions 写入成功但 checkpoints 失败导致版本不一致
         with self._backend.transaction():
             # 获取当前版本号
@@ -139,7 +141,7 @@ class CheckpointManager:
                 limit=1
             )
             version = (rows[0]["version"] + 1) if rows else 1
-            
+
             # 插入版本历史
             self._backend.upsert(
                 "checkpoint_versions",
@@ -153,7 +155,7 @@ class CheckpointManager:
                 },
                 conflict_columns=["run_id", "version"]
             )
-            
+
             # 插入或更新 checkpoints
             self._backend.upsert(
                 "checkpoints",
@@ -169,8 +171,62 @@ class CheckpointManager:
                 },
                 conflict_columns=["run_id"]
             )
-        
+
+        # 版本历史保留策略:checkpoint_versions 每行都是一份完整 state 快照,
+        # 不设上限会让该表无限膨胀(实测近 1GB)并拖慢所有 checkpoint 读写。
+        self._trim_versions_sync(state.run_id)
+        return version
+
+    def _trim_versions_sync(self, run_id: str) -> None:
+        """只保留该 run 最近 N 个历史版本(同步)。"""
+        from app.config import settings as _cfg
+        keep = int(getattr(_cfg, "agent_checkpoint_max_versions_per_run", 0) or 0)
+        if keep <= 0:
+            return
+        try:
+            # 按 version 倒序取第 keep 个的版本号,小于它的全部删除。
+            # 用 execute 只取 version 列,避免把整份 state blob 读进内存。
+            rows = self._backend.execute(
+                "SELECT version FROM checkpoint_versions WHERE run_id = ? "
+                "ORDER BY version DESC LIMIT 1 OFFSET ?",
+                (run_id, keep),
+                fetch=True,
+            )
+            if not rows:
+                return
+            cutoff = int(rows[0]["version"])
+            self._backend.delete(
+                "checkpoint_versions",
+                "run_id = ? AND version <= ?",
+                (run_id, cutoff),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("checkpoint 版本裁剪失败 run=%s: %s", run_id[:8], exc)
+
+    async def _save_locked(self, state: AgentState) -> str:
+        """实际保存逻辑(需已持有 _DB_LOCK)。"""
+        from app.config import settings as _cfg
+        now = time.time()
+
+        offload = bool(getattr(_cfg, "agent_checkpoint_offload_to_thread", True))
+        if offload:
+            # 序列化 + 双写都是 CPU/IO 密集的同步操作(state 常达数百 KB)。
+            # 直接在事件循环里做会阻塞整个 loop,表现为 UI/流式输出卡顿,
+            # 因此整体卸载到线程池执行。
+            try:
+                await asyncio.to_thread(self._save_sync_body, state, now)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("checkpoint 落盘失败 run=%s: %s", state.run_id[:8], exc)
+            return state.run_id
+
+        payload = self._build_payload(state)
+        self._write_locked_sync(state, payload, now)
         return state.run_id
+
+    def _save_sync_body(self, state: AgentState, now: float) -> None:
+        """在线程中执行:序列化 + 双写 + 版本裁剪。"""
+        payload = self._build_payload(state)
+        self._write_locked_sync(state, payload, now)
 
     async def delete(self, run_id: str) -> bool:
         async with _DB_LOCK:
@@ -182,13 +238,18 @@ class CheckpointManager:
 
     async def load(self, run_id: str) -> Optional[AgentState]:
         async with _DB_LOCK:
-            rows = self._backend.select(
-                "checkpoints",
-                "run_id = ?",
-                (run_id,),
-                limit=1
-            )
-        
+            # 读 + JSON 解码都卸载到线程:state 常达数百 KB,
+            # 在事件循环里解码会阻塞流式输出。
+            return await asyncio.to_thread(self._load_sync, run_id)
+
+    def _load_sync(self, run_id: str) -> Optional[AgentState]:
+        rows = self._backend.select(
+            "checkpoints",
+            "run_id = ?",
+            (run_id,),
+            limit=1
+        )
+
         if not rows:
             return None
         try:
@@ -282,17 +343,23 @@ class CheckpointManager:
             params.append(tenant_id)
 
         where = " AND ".join(conditions) if conditions else ""
-        
+
         async with _DB_LOCK:
-            rows = self._backend.select(
-                "checkpoints",
-                where,
-                tuple(params),
-                order_by="updated_at DESC",
-                limit=limit,
-                offset=offset,
+            # 一次要解码 limit 条(默认 100)完整 state,整体卸载到线程
+            return await asyncio.to_thread(
+                self._list_sync, where, tuple(params), limit, offset
             )
-        
+
+    def _list_sync(self, where: str, params: tuple, limit: int, offset: int) -> list[dict]:
+        rows = self._backend.select(
+            "checkpoints",
+            where,
+            params,
+            order_by="updated_at DESC",
+            limit=limit,
+            offset=offset,
+        )
+
         out: list[dict] = []
         for r in rows:
             try:
@@ -321,8 +388,8 @@ class CheckpointManager:
     async def clear(self, status: Optional[str] = None) -> int:
         async with _DB_LOCK:
             if status:
-                rows = self._backend.select(
-                    "checkpoints", "status = ?", (status,), columns=["run_id"]
+                rows = self._backend.execute(
+                    "SELECT run_id FROM checkpoints WHERE status = ?", (status,), fetch=True
                 )
                 run_ids = [r["run_id"] for r in rows]
                 self._backend.delete("checkpoints", "status = ?", (status,))
@@ -348,11 +415,11 @@ class CheckpointManager:
         cutoff = _time.time() - ttl_days * 86400
         async with _DB_LOCK:
             # 先查出过期记录
-            rows = self._backend.select(
-                "checkpoints",
+            rows = self._backend.execute(
+                "SELECT run_id FROM checkpoints WHERE "
                 "status IN ('done', 'failed', 'cancelled') AND updated_at < ?",
                 (cutoff,),
-                columns=["run_id"],
+                fetch=True,
             )
             if not rows:
                 return 0

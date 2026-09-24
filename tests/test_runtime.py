@@ -184,15 +184,21 @@ def test_checkpoint_save_load_resume(tmp_path):
     db = os.path.join(tmp_path, "ckpt.db")
     cm = CheckpointManager(db_path=db)
 
+    async def _body(state):
+        await cm.save(state)
+        assert await cm.exists(state.run_id)
+        assert await cm.count() == 1
+        loaded = await cm.load(state.run_id)
+        items = await cm.list()
+        await cm.delete(state.run_id)
+        return loaded, items, await cm.exists(state.run_id)
+
     state = AgentState(session_id="s1", user_input="你好")
     state.steps.append({"step": 1})
     state.node = "n2"
-    cm.save(state)
 
-    assert cm.exists(state.run_id)
-    assert cm.count() == 1
+    loaded, items, exists_after_delete = run(_body(state))
 
-    loaded = cm.load(state.run_id)
     assert loaded is not None
     assert loaded.session_id == "s1"
     assert loaded.user_input == "你好"
@@ -200,13 +206,11 @@ def test_checkpoint_save_load_resume(tmp_path):
     assert loaded.node == "n2"
 
     # 列表视图
-    items = cm.list()
     assert len(items) == 1
     assert items[0]["run_id"] == state.run_id
     assert items[0]["summary"]["input"] == "你好"
 
-    cm.delete(state.run_id)
-    assert not cm.exists(state.run_id)
+    assert not exists_after_delete
 
 
 def test_checkpoint_resume_continues_from_saved_node(tmp_path):
@@ -221,7 +225,9 @@ def test_checkpoint_resume_continues_from_saved_node(tmp_path):
         state.answer = "finished"
 
     cm = CheckpointManager(db_path=os.path.join(tmp_path, "ckpt2.db"))
-    g = Graph(checkpoint=cm)
+    # 关闭批量写入:本测的是"节点边界立即落盘,重启可恢复"的语义;
+    # 开启批量时非终态只在缓冲区,需等 flush_interval 才落盘。
+    g = Graph(checkpoint=cm, batch_checkpoint=False)
     g.add_node(Node("n1", n1))
     g.add_node(Node("n2", n2))
     g.set_entry("n1")
@@ -234,7 +240,7 @@ def test_checkpoint_resume_continues_from_saved_node(tmp_path):
     assert state.node == "n2"
 
     # 模拟进程重启:从 checkpoint 恢复
-    restored = cm.load(state.run_id)
+    restored = run(cm.load(state.run_id))
     assert restored.node == "n2"
 
     # 继续执行
@@ -363,10 +369,10 @@ def test_interrupt_survives_checkpoint_restart(tmp_path):
     state = AgentState(session_id="s1", user_input="hi")
     state, _ = run(g.arun(state))
     assert state.status == "interrupted"
-    assert cm.exists(state.run_id)
+    assert run(cm.exists(state.run_id))
 
     # 模拟重启:从 checkpoint 恢复,再 resume
-    restored = cm.load(state.run_id)
+    restored = run(cm.load(state.run_id))
     assert restored.status == "interrupted"
     restored.interrupt["resume"] = "ok"
     run(g.arun(restored))
@@ -439,38 +445,65 @@ def test_send_branches_share_base_state():
 def test_checkpoint_versions_accumulate(tmp_path):
     """每次 save 都追加版本快照,版本号递增。"""
     cm = CheckpointManager(db_path=os.path.join(tmp_path, "tt.db"))
-    st = AgentState(session_id="s1", user_input="hi")
-    st.node = "a"
-    st.status = "running"
-    cm.save(st)
-    st.node = "b"
-    st.status = "running"
-    cm.save(st)
-    st.node = END
-    st.status = "completed"
-    st.answer = "done"
-    cm.save(st)
 
-    versions = cm.versions(st.run_id)
+    async def _body(st):
+        for node, status in (("a", "running"), ("b", "running"), (END, "completed")):
+            st.node = node
+            st.status = status
+            await cm.save(st)
+        return await cm.versions(st.run_id)
+
+    st = AgentState(session_id="s1", user_input="hi")
+    st.answer = "done"
+    versions = run(_body(st))
+
     assert [v["version"] for v in versions] == [1, 2, 3]
     assert [v["node"] for v in versions] == ["a", "b", END]
+
+
+def test_checkpoint_versions_trimmed_to_keep_window(tmp_path):
+    """版本历史只保留最近 N 个(防 checkpoint_versions 无限膨胀)。
+
+    该表每行都是一份完整 state 快照,不设上限会让数据库膨胀到 GB 级,
+    拖慢所有 checkpoint 读写(表现为运行卡顿)。
+    """
+    from app.config import settings
+
+    cm = CheckpointManager(db_path=os.path.join(tmp_path, "tt_trim.db"))
+    old = settings.agent_checkpoint_max_versions_per_run
+
+    async def _body(st):
+        for i in range(10):
+            st.node = f"n{i}"
+            await cm.save(st)
+        return await cm.versions(st.run_id)
+
+    try:
+        settings.agent_checkpoint_max_versions_per_run = 3
+        st = AgentState(session_id="s1", user_input="hi")
+        versions = run(_body(st))
+    finally:
+        settings.agent_checkpoint_max_versions_per_run = old
+
+    # 10 次 save 只留最近 3 个版本,且保留的是最新的
+    assert [v["version"] for v in versions] == [8, 9, 10]
+    assert [v["node"] for v in versions] == ["n7", "n8", "n9"]
 
 
 def test_checkpoint_load_version_time_travel(tmp_path):
     """按版本号加载历史状态,可回到中间节点。"""
     cm = CheckpointManager(db_path=os.path.join(tmp_path, "tt2.db"))
-    st = AgentState(session_id="s1", user_input="hi")
-    st.node = "a"
-    st.metadata["step"] = 1
-    cm.save(st)
-    st.node = "b"
-    st.metadata["step"] = 2
-    cm.save(st)
-    st.node = "c"
-    st.metadata["step"] = 3
-    cm.save(st)
 
-    mid = cm.load_version(st.run_id, 2)
+    async def _body(st):
+        for node, step in (("a", 1), ("b", 2), ("c", 3)):
+            st.node = node
+            st.metadata["step"] = step
+            await cm.save(st)
+        return await cm.load_version(st.run_id, 2)
+
+    st = AgentState(session_id="s1", user_input="hi")
+    mid = run(_body(st))
+
     assert mid is not None
     assert mid.node == "b"
     assert mid.metadata["step"] == 2
@@ -479,33 +512,41 @@ def test_checkpoint_load_version_time_travel(tmp_path):
 def test_rollback_resets_latest_pointer(tmp_path):
     """rollback 把最新指针重置到历史版本,后续执行从此分叉。"""
     cm = CheckpointManager(db_path=os.path.join(tmp_path, "tt3.db"))
-    st = AgentState(session_id="s1", user_input="hi")
-    st.node = "a"
-    cm.save(st)
-    st.node = "b"
-    cm.save(st)
-    st.node = "c"
-    cm.save(st)
 
-    rolled = cm.rollback(st.run_id, 2)
+    async def _body(st):
+        for node in ("a", "b", "c"):
+            st.node = node
+            await cm.save(st)
+        rolled = await cm.rollback(st.run_id, 2)
+        latest = await cm.load(st.run_id)
+        latest_node_after_rollback = latest.node
+        # 从回滚点继续执行会产生新版本(版本号继续递增,不覆盖历史)
+        latest.node = "b2"
+        await cm.save(latest)
+        return rolled, latest_node_after_rollback, await cm.versions(st.run_id)
+
+    st = AgentState(session_id="s1", user_input="hi")
+    rolled, latest_node_after_rollback, versions = run(_body(st))
+
     assert rolled is not None
     assert rolled.node == "b"
     # 最新指针已被重置为版本 2
-    latest = cm.load(st.run_id)
-    assert latest.node == "b"
+    assert latest_node_after_rollback == "b"
 
-    # 从回滚点继续执行会产生新版本(版本号继续递增,不覆盖历史)
-    latest.node = "b2"
-    cm.save(latest)
-    versions = cm.versions(st.run_id)
     assert [v["version"] for v in versions] == [1, 2, 3, 4]
     assert versions[-1]["node"] == "b2"
 
 
 def test_rollback_missing_version_returns_none(tmp_path):
     cm = CheckpointManager(db_path=os.path.join(tmp_path, "tt4.db"))
+
+    async def _body(st):
+        await cm.save(st)
+        return await cm.load_version(st.run_id, 99), await cm.rollback(st.run_id, 99)
+
     st = AgentState(session_id="s1", user_input="hi")
     st.node = "a"
-    cm.save(st)
-    assert cm.load_version(st.run_id, 99) is None
-    assert cm.rollback(st.run_id, 99) is None
+    loaded, rolled = run(_body(st))
+
+    assert loaded is None
+    assert rolled is None

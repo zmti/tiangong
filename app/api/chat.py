@@ -867,8 +867,15 @@ async def stream_alias(
 
 @router.get("/chat/history")
 async def get_history(session_id: str = Query("default")) -> dict:
+    # 同时返回会话的权威标题:前端「切换会话后的标题栏」以前是先操作会话列表 DOM、
+    # 取不到就退化成首条用户消息截断 —— 用户 rename 后列表与标题栏会不一致。
+    # 现在由后端直接给出,与会话列表共用 session_title 一套解析。
     history = await _store().get_history(session_id)
-    return {"session_id": session_id, "messages": history}
+    try:
+        title = await _store().session_title(session_id)
+    except Exception:  # noqa: BLE001
+        title = "新会话"
+    return {"session_id": session_id, "title": title, "messages": history}
 
 
 @router.get("/chat/context")

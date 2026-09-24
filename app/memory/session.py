@@ -399,6 +399,43 @@ class SessionStore:
                 (session_id,)
             )
 
+    async def session_title(self, session_id: str) -> str:
+        """返回会话的权威标题(会话列表与会话详情共用同一套解析)。
+
+        优先级:自定义标题 > 首条用户消息前 30 字 > 创建时间 > "新会话"。
+
+        为什么需要单独这个方法:之前「会话列表」用 list_sessions 里的解析,
+        而「切换会话后标题栏」是前端自己在 DOM 上取第一条用户消息拼的,
+        两套逻辑不一致 —— 用户 rename 过后,列表显示新名字、标题栏却还是旧的
+        (只要标签不在 DOM 里就退化成消息截断)。这里收敛为单一真源。
+        """
+        tid = await self._resolve_tid()
+        try:
+            rows = self._backend.select(
+                "sessions", "id = ? AND tenant_id = ?", (session_id, tid), limit=1
+            )
+        except Exception:  # noqa: BLE001
+            rows = []
+        if not rows:
+            return "新会话"
+        row = rows[0]
+        custom = (row.get("title") or "").strip()
+        if custom:
+            return custom
+        try:
+            msgs = json.loads(row["messages"] or "[]")
+        except Exception:  # noqa: BLE001
+            msgs = []
+        for m in msgs:
+            content = await self._extract_content(m)
+            if m.get("role") == "user" and content:
+                return content.strip()[:30]
+        ts = row.get("created_at", 0) or row.get("updated_at", 0) or 0
+        if ts:
+            import datetime as _dt
+            return _dt.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M")
+        return "新会话"
+
     async def list_sessions(self, limit: int = 200) -> list[dict]:
         """列出当前租户的所有会话(含标题、消息数、更新时间、分类),按最近更新倒序。"""
         tid = await self._resolve_tid()

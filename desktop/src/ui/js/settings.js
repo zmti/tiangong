@@ -178,7 +178,43 @@ App.Settings.renderProviderAdmin = async function () {
       addBtn.innerHTML = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> 添加';
       addBtn.title = '手动添加模型';
       addBtn.addEventListener('click', () => App.Settings._openBuiltinModelForm(p));
-      actions.append(fetchBtn, addBtn);
+
+      // 一键清空:只清"获取/添加"进来的扩展模型,代码内置的模型保留
+      const clearBtn = document.createElement('button');
+      clearBtn.className = 'prov-action danger';
+      const CLEAR_ICON = '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>';
+      // 成功刷新后本元素会被重建,所以只有"未成功"分支才需要还原按钮文本
+      const flashThenRestore = (text) => {
+        clearBtn.textContent = text;
+        setTimeout(() => { clearBtn.innerHTML = CLEAR_ICON + ' 清空'; clearBtn.disabled = false; }, 1500);
+      };
+      clearBtn.innerHTML = CLEAR_ICON + ' 清空';
+      clearBtn.title = '清空通过「获取/添加」加入的模型（内置模型保留）';
+      clearBtn.addEventListener('click', async () => {
+        if (!window.confirm(
+          `清空「${p.name}」中通过「获取/添加」加入的模型？\n内置模型会保留。`
+        )) return;
+        clearBtn.disabled = true;
+        clearBtn.textContent = '清空中';
+        try {
+          const res = await App.apiJSON(
+            `/v1/providers/builtin/${encodeURIComponent(p.id)}/models`,
+            { method: 'DELETE' }
+          );
+          if (!res || !res.success) { flashThenRestore('清空失败'); return; }
+          if (!res.data?.removed) {
+            // 本来就没有扩展模型,给个反馈免得用户以为按钮没生效
+            flashThenRestore('无模型可清');
+            return;
+          }
+          await App.Settings.refreshProvidersUI();
+          if (App.ModelPicker?.refreshBadge) App.ModelPicker.refreshBadge();
+        } catch (_) {
+          flashThenRestore('清空失败');
+        }
+      });
+
+      actions.append(fetchBtn, addBtn, clearBtn);
     } else {
       const editBtn = document.createElement('button');
       editBtn.className = 'prov-action';
@@ -200,11 +236,19 @@ App.Settings.renderProviderAdmin = async function () {
 
     // 模型列表
     if (models.length) {
+      // 获取回来的模型动辄几十个,默认只展示前几个,其余折叠,避免把设置页撑爆
+      const DEFAULT_VISIBLE_MODELS = 6;
       const modelList = document.createElement('div');
       modelList.className = 'prov-card-models';
-      models.forEach((m) => {
+      const collapsedItems = [];
+      models.forEach((m, idx) => {
         const item = document.createElement('div');
         item.className = 'prov-model-item' + (m.default ? ' active' : '');
+        // 默认模型始终可见,折叠时也不该把"默认"这个关键信息藏起来
+        if (idx >= DEFAULT_VISIBLE_MODELS && !m.default) {
+          item.hidden = true;
+          collapsedItems.push(item);
+        }
         const modelName = document.createElement('span');
         modelName.className = 'prov-model-name';
         modelName.textContent = m.name || m.id;
@@ -232,6 +276,26 @@ App.Settings.renderProviderAdmin = async function () {
         modelList.appendChild(item);
       });
       card.appendChild(modelList);
+
+      // 折叠开关:只在确实有隐藏项时出现
+      if (collapsedItems.length) {
+        const toggle = document.createElement('button');
+        toggle.className = 'prov-models-toggle';
+        let expanded = false;
+        const setLabel = () => {
+          toggle.textContent = expanded
+            ? '收起'
+            : `展开全部 ${models.length} 个模型`;
+        };
+        setLabel();
+        toggle.addEventListener('click', () => {
+          expanded = !expanded;
+          collapsedItems.forEach((el) => { el.hidden = !expanded; });
+          toggle.classList.toggle('expanded', expanded);
+          setLabel();
+        });
+        card.appendChild(toggle);
+      }
     } else {
       const empty = document.createElement('div');
       empty.className = 'prov-card-empty';
