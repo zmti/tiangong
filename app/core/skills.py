@@ -411,6 +411,162 @@ _skill_registry: Optional[SkillRegistry] = None
 _skill_lock = threading.Lock()
 
 
+# ---- 技能发现与推荐 ----
+def discover_skills_for_task(task_description: str, top_k: int = 5) -> list[Skill]:
+    """根据任务描述推荐相关技能(基于关键词匹配描述)。"""
+    registry = get_skill_registry()
+    all_skills = registry.list()
+    task_lower = task_description.lower()
+    scored = []
+    for skill in all_skills:
+        score = 0
+        # 描述关键词匹配
+        for word in task_lower.split():
+            if len(word) > 2 and word in skill.description.lower():
+                score += 2
+            if len(word) > 2 and word in skill.name.lower():
+                score += 3
+        # 步骤中的工具名匹配
+        for step in skill.steps:
+            if step.tool.lower() in task_lower:
+                score += 2
+        if score > 0:
+            scored.append((score, skill))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [s for _, s in scored[:top_k]]
+
+
+def compose_skills(skill_names: list[str], composed_name: str, composed_description: str) -> Skill:
+    """将多个技能组合为新技能(顺序执行，参数透传)。"""
+    registry = get_skill_registry()
+    steps = []
+    all_params: dict[str, SkillParam] = {}
+    for name in skill_names:
+        skill = registry.get(name)
+        if not skill:
+            continue
+        for step in skill.steps:
+            steps.append(SkillStep(
+                tool=step.tool,
+                args=step.args.copy(),
+                label=f"[{name}] {step.label}"
+            ))
+        for p in skill.params:
+            if p.name not in all_params:
+                all_params[p.name] = p
+    return Skill(
+        name=composed_name,
+        description=composed_description,
+        steps=steps,
+        params=list(all_params.values()),
+        timeout=sum(registry.get(n).timeout for n in skill_names if registry.get(n)),
+    )
+
+
+# ---- 技能版本管理 ----
+@dataclass
+class SkillVersion:
+    """技能版本记录。"""
+    version: int
+    skill: Skill
+    created_at: float
+    changelog: str = ""
+
+
+class SkillVersionManager:
+    """技能版本管理器：支持版本回滚、变更记录。"""
+
+    def __init__(self, registry: SkillRegistry):
+        self._registry = registry
+        self._versions: dict[str, list[SkillVersion]] = {}
+        self._lock = threading.RLock()
+
+    def save_version(self, skill_name: str, changelog: str = "") -> int:
+        """保存当前技能为新版本。"""
+        skill = self._registry.get(skill_name)
+        if not skill:
+            return 0
+        with self._lock:
+            versions = self._versions.setdefault(skill_name, [])
+            new_version = len(versions) + 1
+            versions.append(SkillVersion(
+                version=new_version,
+                skill=Skill(
+                    name=skill.name,
+                    description=skill.description,
+                    steps=[SkillStep(**s.__dict__) for s in skill.steps],
+                    params=[SkillParam(**p.__dict__) for p in skill.params],
+                    timeout=skill.timeout,
+                    enabled=skill.enabled,
+                ),
+                created_at=time.time(),
+                changelog=changelog,
+            ))
+            return new_version
+
+    def rollback(self, skill_name: str, version: int) -> bool:
+        """回滚到指定版本。"""
+        with self._lock:
+            versions = self._versions.get(skill_name, [])
+            target = next((v for v in versions if v.version == version), None)
+            if not target:
+                return False
+            self._registry.register(target.skill)
+            return True
+
+    def list_versions(self, skill_name: str) -> list[dict]:
+        with self._lock:
+            versions = self._versions.get(skill_name, [])
+            return [{"version": v.version, "created_at": v.created_at, "changelog": v.changelog} for v in versions]
+
+
+_skill_version_manager: Optional[SkillVersionManager] = None
+_skill_version_lock = threading.Lock()
+
+
+def get_skill_version_manager() -> SkillVersionManager:
+    global _skill_version_manager
+    if _skill_version_manager is None:
+        with _skill_version_lock:
+            if _skill_version_manager is None:
+                _skill_version_manager = SkillVersionManager(get_skill_registry())
+    return _skill_version_manager
+
+
+# ---- 技能市场雏形：从目录动态加载技能定义 ----
+def load_skills_from_directory(skills_dir: str) -> int:
+    """从目录加载 YAML/JSON 技能定义文件。"""
+    import os
+    import yaml
+    count = 0
+    registry = get_skill_registry()
+    for fname in os.listdir(skills_dir):
+        if not (fname.endswith(".yaml") or fname.endswith(".yml") or fname.endswith(".json")):
+            continue
+        path = os.path.join(skills_dir, fname)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                if fname.endswith(".json"):
+                    data = json.load(f)
+                else:
+                    data = yaml.safe_load(f)
+            if not isinstance(data, dict):
+                continue
+            skill = Skill(
+                name=data.get("name", fname[:-5]),
+                description=data.get("description", ""),
+                steps=[SkillStep(**s) for s in data.get("steps", [])],
+                params=[SkillParam(**p) for p in data.get("params", [])],
+                timeout=data.get("timeout", 120.0),
+                enabled=data.get("enabled", True),
+            )
+            registry.register(skill)
+            count += 1
+        except Exception as e:
+            logger.warning(f"加载技能 {fname} 失败: {e}")
+    return count
+
+
 def get_skill_registry() -> SkillRegistry:
     global _skill_registry
     if _skill_registry is None:
