@@ -53,6 +53,22 @@ class VectorStoreBackend(abc.ABC):
     def close(self) -> None:
         """关闭连接/释放资源"""
 
+    def iter_items(self, tenant_id: Optional[str] = None) -> list[tuple[str, dict]]:
+        """遍历全部 (id, metadata);传 tenant_id 时只返回该租户的条目。
+
+        默认实现读取底层 store 的 _ids / _metas。不支持枚举的后端(纯 Milvus /
+        pgvector 适配器)会取不到这两个属性,此时**返回空列表而不是抛异常**,
+        避免 /v1/documents/stats 之类的只读接口直接 500。
+        """
+        try:
+            ids, metas = self._ids, self._metas  # noqa: SLF001
+        except Exception:  # noqa: BLE001
+            return []
+        items = list(zip(ids, metas))
+        if tenant_id is not None:
+            items = [(i, m) for i, m in items if m.get("tenant_id", "default") == tenant_id]
+        return items
+
 
 # 全局后端实例缓存
 _backend_instance: Optional[VectorStoreBackend] = None
@@ -103,8 +119,34 @@ def _create_backend(backend_type: str) -> VectorStoreBackend:
         raise ValueError(f"未知向量存储后端: {backend_type}")
 
 
+# ----- 透传底层 VectorStore 的适配器基类 -----
+class _StoreBackedBackend(VectorStoreBackend):
+    """包装 app.rag.store.VectorStore 的适配器基类。
+
+    引入本抽象层前,get_store() 直接返回 VectorStore 实例,因此一批调用方会直接
+    访问它的成员,例如:
+      - app/api/documents.py: store._metas / store._ids / store._int_ids / store._index
+      - app/rag/documents.py: store._ids / store._metas
+      - app/rag/multi_retriever.py: store._connect() / store._close(conn)  (BM25 召回)
+    抽象层若只暴露 add/delete/search/count/clear,这些调用会抛 AttributeError:
+    /v1/documents/stats 直接 500,BM25 路径则被 try/except 静默吞掉导致召回缺失。
+
+    这里用 __getattr__ 把未实现的属性透明透传给底层 store,保证"引入抽象层"这一
+    改动对既有调用方是行为兼容的;抽象接口仍然由显式方法(add/delete/search...)提供。
+    """
+
+    def __getattr__(self, name: str):
+        # 只在常规查找失败时触发;_store 已写入 __dict__ 时不会递归。
+        store = self.__dict__.get("_store")
+        if store is not None:
+            return getattr(store, name)
+        raise AttributeError(
+            f"{type(self).__name__} 尚未初始化底层 store,无法访问属性 {name!r}"
+        )
+
+
 # ----- Faiss 适配器（复用现有 VectorStore） -----
-class _FaissAdapter(VectorStoreBackend):
+class _FaissAdapter(_StoreBackedBackend):
     def __init__(self, db_path: Optional[str] = None, dim: int = 0):
         from app.rag.store import VectorStore
         self._store = VectorStore(db_path=db_path, dim=dim)
@@ -133,7 +175,7 @@ class _FaissAdapter(VectorStoreBackend):
 
 
 # ----- SQLite-only 适配器 -----
-class _SQLiteOnlyAdapter(VectorStoreBackend):
+class _SQLiteOnlyAdapter(_StoreBackedBackend):
     def __init__(self, db_path: Optional[str] = None, dim: int = 0):
         from app.rag.store import VectorStore
         # 强制关闭 faiss

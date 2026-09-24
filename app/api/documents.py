@@ -33,9 +33,8 @@ async def document_stats() -> dict:
     store = get_store()
     sources: dict[str, int] = {}
     cnt = 0
-    for meta in store._metas:  # noqa: SLF001
-        if meta.get("tenant_id", "default") != tid:
-            continue
+    # 走抽象层的公开遍历接口:不支持枚举的后端返回空列表,不会让只读统计接口 500
+    for _cid, meta in store.iter_items(tid):
         src = meta.get("source", "unknown")
         sources[src] = sources.get(src, 0) + 1
         cnt += 1
@@ -53,10 +52,7 @@ async def clear_documents() -> dict:
     from app.core.tenant_context import get_tenant
     tid = get_tenant() or "default"
     store = get_store()
-    ids = [
-        cid for cid, meta in zip(store._ids, store._metas)  # noqa: SLF001
-        if meta.get("tenant_id", "default") == tid
-    ]
+    ids = [cid for cid, _meta in store.iter_items(tid)]
     for cid in ids:
         store.delete(cid)
     return {"cleared": True, "chunks": len(ids)}
@@ -77,10 +73,7 @@ async def reset_index(force: bool = False, confirm: str = "") -> dict:
     from app.core.tenant_context import get_tenant
     tid = get_tenant() or "default"
     store = get_store()
-    ids = [
-        cid for cid, meta in zip(store._ids, store._metas)  # noqa: SLF001
-        if meta.get("tenant_id", "default") == tid
-    ]
+    ids = [cid for cid, _meta in store.iter_items(tid)]
     count = len(ids)
     for cid in ids:
         store.delete(cid)

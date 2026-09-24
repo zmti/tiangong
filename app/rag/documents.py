@@ -300,10 +300,8 @@ def index_document(filename: str, content: bytes, doc_id: Optional[str] = None) 
     # 删除同文档旧索引(同名文件重新上传时替换)
     stale_ids = []
     try:
-        all_ids = store._ids
-        all_metas = store._metas
         stale_ids = [
-            cid for cid, meta in zip(all_ids, all_metas)
+            cid for cid, meta in store.iter_items()
             if meta.get("source") == filename and meta.get("tenant_id") == tid
         ]
     except Exception:
@@ -319,6 +317,15 @@ def index_document(filename: str, content: bytes, doc_id: Optional[str] = None) 
         store.add(cid, vec, meta, tenant_id=tid)
         added += 1
 
+    # 同步更新 BM25 倒排索引:与 index_text() 保持一致。
+    # 此前只有 index_text() 更新,导致经 /v1/documents/upload 上传的文档
+    # 在 BM25 这一路召回里永远命中不了(多路召回退化为纯向量召回)。
+    try:
+        from app.rag.retriever import get_multi_retriever
+        get_multi_retriever().update_index(chunks)
+    except Exception:  # noqa: BLE001
+        pass
+
     # 记录 hash
     _save_doc_hash(filename, content_hash)
     return {"doc_id": doc_id, "filename": filename, "chunks": added, "hash": content_hash}
@@ -331,7 +338,7 @@ def delete_document(source: str) -> dict:
     tid = get_tenant() or "default"
     store = get_store()
     stale_ids = [
-        cid for cid, meta in zip(store._ids, store._metas)  # noqa: SLF001
+        cid for cid, meta in store.iter_items()
         if meta.get("source") == source and meta.get("tenant_id", "default") == tid
     ]
     for cid in stale_ids:
