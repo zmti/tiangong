@@ -628,6 +628,10 @@ App.Session.select = async function (id) {
   // 不再 App.Chat.stop() —— stop 会 POST /v1/chat/cancel 让后端真的取消 agent。
   const prevSid = App.sessionId;
   if (prevSid && id !== prevSid) App.Session.park(prevSid);
+  // 【修复】切换会话必须同步全局 App.sessionId:否则后续发送 / 渲染 / 标题仍指向旧会话,
+  // 造成"点 A 看 B 的内容、发的消息却存到 A"的记忆错乱(多会话并行重构时误删了这行)。
+  App.sessionId = id;
+  App.Session.saveSessionId(id);
 
   const msgs = App.els.messages;
   msgs.innerHTML = '';

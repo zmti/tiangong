@@ -263,6 +263,9 @@ App.Chat.doSend = async function (text, opts = {}) {
   input.value = '';
   // 记录本次流式归属的会话:后续所有渲染都据此决定写前台还是写它的后台 pane
   App.Chat.runSid = App.sessionId;
+  // 本次流式**所属会话**的快照:即便切换会话让 App.sessionId 改变,本流也始终知道
+  // 自己属于哪个会话,用于事件循环的"前台才渲染 / 后台静默"判定与 finally 的归属修正。
+  const mySid = App.sessionId;
   if (App.syncComposer) App.syncComposer();
   App._planCard = null;
   App.clearImageGenerating();  // 清除上一轮可能残留的"生成中"卡片
@@ -870,6 +873,11 @@ App.Chat.doSend = async function (text, opts = {}) {
             if (App.DEBUG) console.log('[SSE] Heartbeat processed');
             continue;
           }
+          // 后台会话:静默消费事件、不渲染任何 UI,彻底避免与前台串台。
+          // 仅当本流所属会话仍是前台时才处理 UI 事件;切走后其流仍在后端跑,
+          // 但 UI 写目标应为它自己的离屏 pane —— 为安全起见一律不渲染,
+          // 待用户切回时由 /chat/history 重新加载即可看到完整结果。
+          if (mySid !== App.sessionId) continue;
           // 图片生成:尽早展示专属"生成中"进度卡。tool_call_start/tool_start 为主信号,
           // tool_call_delta / tool_route 为兜底(二者都带工具名,且一定早于结果事件)
           const _toolName = evt.name || evt.tool || '';
@@ -1489,44 +1497,49 @@ App.Chat.doSend = async function (text, opts = {}) {
       }
     }
 
-    // 记录流开始前的滚动比例，用于流式完成后判断是否应跟随滚动
-    const _pane1 = App.Chat.pane();
-    const scrollRatioBefore = _pane1.scrollHeight === 0 ? 1 : _pane1.scrollTop / (_pane1.scrollHeight - _pane1.clientHeight);
-
-    // 清理流超时计时器
+    // 前后台都先清理流超时计时器,防止定时器泄漏
     cleanupStream();
     App.clearImageGenerating(); // 任何流终止都清理图片生成卡片,避免残留
 
-    // ── 滚动锚定：只有用户已在底部(<48px)时才跟随，否则显示“回到底部”提示 ──
-    const _pane2 = App.Chat.pane();
-    const atBottomNow = _pane2.scrollHeight - _pane2.scrollTop <= _pane2.clientHeight * 0.95;
-    const wasAtBottomBefore = scrollRatioBefore > 0.95; // 流开始前用户是否在底部
-    if (wasAtBottomBefore || atBottomNow) {
-      // 用户在流开始前或当前就在底部，允许自动跟随
-      App.scrollMessagesToBottom(true);
-    } else {
-      // 用户在上方浏览，保持位置不变，显示返回按钮
-      const pill = document.createElement('div');
-      pill.id = 'scroll-pill';
-      pill.style.cssText = `
-        position: fixed; right: 24px; bottom: 24px;
-        width: 40px; height: 40px; border-radius: 50%;
-        background: var(--primary); display: flex; align-items: center; justify-content: center;
-        font-size: 16px; color: #fff; box-shadow: var(--shadow-sm);
-        z-index: 100; opacity: 0; transition: opacity 0.3s;
-        cursor: pointer;
-      `;
-      pill.textContent = '↓';
-      pill.title = '回到底部';
-      pill.addEventListener('click', () => {
+    // 仅**前台**会话渲染滚动锚定 / 回到底部提示 / 异常恢复 UI。
+    // 后台会话的流被静默消费(见事件循环顶部的 foreground guard),不渲染任何 UI,
+    // 彻底避免与前台串台;切回后台会话时由 /chat/history 重新加载即可看到完整结果。
+    if (mySid === App.sessionId) {
+      // 记录流开始前的滚动比例，用于流式完成后判断是否应跟随滚动
+      const _pane1 = App.Chat.pane();
+      const scrollRatioBefore = _pane1.scrollHeight === 0 ? 1 : _pane1.scrollTop / (_pane1.scrollHeight - _pane1.clientHeight);
+
+      // ── 滚动锚定：只有用户已在底部(<48px)时才跟随，否则显示“回到底部”提示 ──
+      const _pane2 = App.Chat.pane();
+      const atBottomNow = _pane2.scrollHeight - _pane2.scrollTop <= _pane2.clientHeight * 0.95;
+      const wasAtBottomBefore = scrollRatioBefore > 0.95; // 流开始前用户是否在底部
+      if (wasAtBottomBefore || atBottomNow) {
+        // 用户在流开始前或当前就在底部，允许自动跟随
         App.scrollMessagesToBottom(true);
-        pill.remove();
-      });
-      // 移除现有的 pill (防止重复)
-      const old = document.getElementById('scroll-pill');
-      if (old) old.remove();
-      document.body.appendChild(pill);
-      setTimeout(() => pill.style.opacity = '1', 100);
+      } else {
+        // 用户在上方浏览，保持位置不变，显示返回按钮
+        const pill = document.createElement('div');
+        pill.id = 'scroll-pill';
+        pill.style.cssText = `
+          position: fixed; right: 24px; bottom: 24px;
+          width: 40px; height: 40px; border-radius: 50%;
+          background: var(--primary); display: flex; align-items: center; justify-content: center;
+          font-size: 16px; color: #fff; box-shadow: var(--shadow-sm);
+          z-index: 100; opacity: 0; transition: opacity 0.3s;
+          cursor: pointer;
+        `;
+        pill.textContent = '↓';
+        pill.title = '回到底部';
+        pill.addEventListener('click', () => {
+          App.scrollMessagesToBottom(true);
+          pill.remove();
+        });
+        // 移除现有的 pill (防止重复)
+        const old = document.getElementById('scroll-pill');
+        if (old) old.remove();
+        document.body.appendChild(pill);
+        setTimeout(() => pill.style.opacity = '1', 100);
+      }
     }
 
     // 流被异常中断:直接显示错误,不再回退非流式接口
@@ -1534,7 +1547,8 @@ App.Chat.doSend = async function (text, opts = {}) {
     // 场景2: 收到过事件(工具执行等)但流未正常完成(连接中断/后端异常) → "执行中断"
     // 【关键修复】recover 可能因后端重启/网络抖动而长时间挂起,必须**先清理 UI**
     // 再异步尝试服务端补全,否则 typing 指示器和 streaming 状态会永远卡住。
-    if (!done && !isError) {
+    // 仅前台会话走 recover/错误提示;后台会话的流被静默消费,不向前台注入错误信息。
+    if (mySid === App.sessionId && !done && !isError) {
       App.removeTyping();
       if (App._currentGroup) _finishGroup();
       if (renderTimer !== null) { clearTimeout(renderTimer); renderTimer = null; }
@@ -1603,10 +1617,10 @@ App.Chat.doSend = async function (text, opts = {}) {
     /* 本次流到此结束。清除该会话的"运行中"标记:
        - 若是前台会话结束,顺带刷新列表让高亮/时间更新;
        - 若它在后台跑完(用户早切走了),额外给个提示,否则用户不知道那边好了。 */
-    const _finSid = App.Chat.runSid;
+    const _finSid = mySid;
     if (_finSid && App.Session) {
       App.Session._runs.delete(_finSid);
-      if (_finSid !== App.sessionId) {
+      if (_finSid !== App.sessionId && !isError) {
         if (App.toast) App.toast('后台会话已生成完毕,可切回查看', 'ok');
         if (App.Session.refreshList) {
           try { await App.Session.refreshList(); } catch (_) { /* 忽略 */ }
