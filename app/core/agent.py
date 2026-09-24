@@ -171,6 +171,7 @@ from app.core.llm import LLMClient, ToolCall, LLMError
 from app.core.planner import TaskPlan, _normalize_steps, apply_plan_tool, generate_plan
 from app.core.prompts import TOOL_CALL_PATTERN, build_system_prompt, build_tools_description
 from app.core.telemetry import _current_run_id, tracer
+from app.core.reasoning_engine import reason
 from app.tools.categories import SYSTEM_TOOLS
 from app.tools.registry import ToolRegistry, get_registry
 

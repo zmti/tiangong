@@ -327,6 +327,7 @@ def get_registry() -> ToolRegistry:
         from app.tools import web_test_tool  # noqa: F401  # 注册 H5/网页自动测试工具(web_auto_test)
         from app.agents import handoff_tool  # noqa: F401  # 注册角色委派/团队工具(list_roles/handoff_to_role)
         from app.rag import documents  # noqa: F401  # 注册 rag_search 工具
+        from app.core import reasoning_engine  # noqa: F401  # 注册 chain_of_thought 推理工具
 
         default_registry._imported = True
     return default_registry
