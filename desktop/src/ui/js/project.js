@@ -92,6 +92,30 @@
     console.log('[Project.loadForSession] sessionId=' + sessionId + ', 项目=' + (p ? p.name : '(无)'));
   }
 
+  /* 对外 API: 新建会话时调用。
+   * 若该会话已有绑定则沿用;否则继承 default_project(default_project 由 _setProjectFor
+   * 同步更新,其注释即为"新建会话继承用"),并落到本会话。
+   * 目的:避免新会话沿用上一个会话的旧项目去发消息 —— project_path 会指到错误的工作目录,
+   * 后端 agent 就在错误的项目里执行(表现:"会话里的项目识别不对")。
+   */
+  function bindNewSession(sessionId) {
+    var map = _readMap();
+    if (map[sessionId]) {
+      App.currentProject = map[sessionId];
+    } else {
+      var p = null;
+      try {
+        var raw = localStorage.getItem(LS_DEFAULT_KEY);
+        if (raw) p = JSON.parse(raw);
+      } catch (e) { /* ignore */ }
+      App.currentProject = p || null;
+      if (p) _setProjectFor(sessionId, p);
+    }
+    updateProjectButton();
+    LOG('bindNewSession sessionId=' + sessionId
+      + ', 项目=' + (App.currentProject ? App.currentProject.name : '(无)'));
+  }
+
   /* 删除某 session 的项目绑定 (删除会话时调用) */
   function clearForSession(sessionId) {
     var map = _readMap();
@@ -566,6 +590,7 @@
     browseFolder: browseFolder,
     // per-session API, 由 session.js 调用
     switchToSession: loadForSession,
+    switchToNewSession: bindNewSession,
     clearForSession: clearForSession,
   };
 })();

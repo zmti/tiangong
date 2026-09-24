@@ -606,6 +606,9 @@ App.Session.newSession = async function () {
   }
   App.sessionId = 'desktop-' + Date.now().toString(36);
   App.Session.saveSessionId(App.sessionId);
+  // 【修复】新建会话同样要重置项目:否则会沿用上一个会话的项目(project_path 指错目录)。
+  // 新会话无绑定时继承 default_project,并落到本会话。
+  if (App.Project && App.Project.switchToNewSession) App.Project.switchToNewSession(App.sessionId);
   App.els.sessionLabel.textContent = '新会话';
   App.els.messages.innerHTML = '';
   // 显示聊天视图，隐藏会话列表
@@ -632,6 +635,11 @@ App.Session.select = async function (id) {
   // 造成"点 A 看 B 的内容、发的消息却存到 A"的记忆错乱(多会话并行重构时误删了这行)。
   App.sessionId = id;
   App.Session.saveSessionId(id);
+  // 【修复】切换会话必须同步项目:项目是 per-session 绑定(project.js 的 session_projects),
+  // 但此前 session.js 从未调用过 App.Project.switchToSession,导致 App.currentProject 一直
+  // 停留在上一个会话 → ①项目选择器不随会话切换 ②发出的 project_path 是上个会话的目录,
+  // 后端 agent 在错误项目里执行(表现:"识别不出这个会话的项目")。
+  if (App.Project && App.Project.switchToSession) App.Project.switchToSession(id);
 
   const msgs = App.els.messages;
   msgs.innerHTML = '';
@@ -1061,6 +1069,8 @@ App.Session.deleteSession = async function (id) {
   try {
     await App.apiJSON(`/v1/chat/session/${encodeURIComponent(id)}`, { method: 'DELETE' });
   } catch (_) { /* 忽略删除失败 */ }
+  // 会话删了就一并解绑它的项目,避免 session_projects 里留下孤儿绑定
+  if (App.Project && App.Project.clearForSession) App.Project.clearForSession(id);
   App.Session._listCache = { ids: null, ts: 0 };
   App.Session.renderCards();
 };
