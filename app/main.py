@@ -13,7 +13,7 @@ from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
-from app.api import attachments, chat, documents, project, files, mcp, mcp_server, runs, schedule, tasks, telemetry, tools, tts, user_profile, budget, advanced, analytics, assistants, plugins, safety, persistent_memory, planning, search, metrics, sessions, long_running, tenants, system, collaboration, reasoning, memory_cleanup, cross_session, collaboration_ui, artifacts, workflow, multimodal, rules, config_models, eval_ab
+from app.api import attachments, chat, documents, project, files, mcp, mcp_server, runs, schedule, tasks, telemetry, tools, tts, user_profile, budget, advanced, analytics, assistants, plugins, safety, persistent_memory, planning, search, metrics, sessions, long_running, tenants, system, collaboration, reasoning, memory_cleanup, cross_session, collaboration_ui, artifacts, workflow, multimodal, rules, config_models, eval_ab, audit
 from app.api.security import require_api_key, require_admin
 from app.config import settings, APP_VERSION
 from app.tools.registry import get_registry
@@ -195,6 +195,17 @@ def _init_memory_ttl():
         logger.warning("记忆管理器初始化失败(不影响主服务): %s", e)
 
 
+def _init_audit_log():
+    """启动审计日志后台刷新"""
+    try:
+        from app.core.audit import get_audit_logger
+        logger_ = get_audit_logger()
+        logger_.start()
+        logger.info("审计日志已启动")
+    except Exception as e:
+        logger.warning("审计日志初始化失败(不影响主服务): %s", e)
+
+
 async def _init_tool_route_cache():
     """初始化工具路由缓存"""
     try:
@@ -342,6 +353,7 @@ async def _startup():
     _init_tenant_manager()
     _init_tool_hot_loader()
     _init_memory_ttl()
+    _init_audit_log()
 
     # 异步初始化
     await _init_mcp()
@@ -356,6 +368,13 @@ async def _shutdown():
     _stop_session_archiver()
     await _stop_long_running()
     _stop_memory_ttl()
+    
+    # 停止审计日志
+    try:
+        from app.core.audit import get_audit_logger
+        await get_audit_logger().stop()
+    except Exception as e:
+        logger.warning("审计日志停止失败: %s", e)
     
     # 停止 Telemetry 清理
     try:
@@ -449,6 +468,7 @@ app.include_router(collaboration_ui.router, dependencies=_auth)
 app.include_router(artifacts.router, dependencies=_auth)  # Artifacts 实时渲染预览
 app.include_router(rules.router, dependencies=_auth)  # 智能体规则
 app.include_router(eval_ab.router, dependencies=_auth)  # A/B 评估对比
+app.include_router(audit.router, dependencies=_auth)  # 审计日志
 
 # 本地生成图片的静态目录(data/images),供聊天与历史直接展示
 _images_dir = os.path.join(settings.resolved_data_dir, "images")
