@@ -1064,6 +1064,8 @@ async def vision(
         # 使用前端选中的模型(与聊天一致);留空回退全局配置
         llm = LLMClient(provider or None, model or None)
         if not model_supports_vision(llm.info.get("model", "")):
+            # 文件日志只收 WARNING 及以上,失败必须打 warning,否则事后无从排查
+            logger.warning("[Vision] 模型 %s 不在视觉名单内,拒绝识别", llm.info.get("model"))
             return {
                 "answer": "",
                 "error": f"当前模型 {llm.info.get('model')} 不支持图片识别。"
@@ -1080,6 +1082,8 @@ async def vision(
         answer = await llm.chat(messages)
         if _looks_like_vision_refusal(answer):
             # 上游以 200 把"不支持视觉"包装成文本返回,拦截并转成可操作的中文提示
+            logger.warning("[Vision] 上游以 200 返回视觉拒绝: model=%s, 原文=%r",
+                           llm.info.get("model", ""), (answer or "")[:200])
             return {
                 "answer": "",
                 "error": f"上游模型 {llm.info.get('model', '')} 不支持图片输入。"
@@ -1088,6 +1092,7 @@ async def vision(
             }
         answer = (answer or "").strip()
         if not answer:
+            logger.warning("[Vision] 模型返回空内容: model=%s", llm.info.get("model", ""))
             return {
                 "answer": "",
                 "error": f"模型 {llm.info.get('model', '')} 返回了空内容,未能识别图片。"
@@ -1097,6 +1102,8 @@ async def vision(
         return {"answer": answer, "model": llm.info["model"], "session_id": session_id}
     except LLMError as e:
         msg = str(e)
+        logger.warning("[Vision] LLM 调用失败: provider=%s model=%s err=%s",
+                       provider or "-", model or "-", msg[:300])
         lowered = msg.lower()
         if (
             "does not support image input" in lowered
@@ -1117,6 +1124,7 @@ async def vision(
     except HTTPException:
         raise
     except Exception as e:  # noqa: BLE001
+        logger.warning("[Vision] 未预期异常: %s: %s", type(e).__name__, e)
         return {"answer": "", "error": f"图片识别异常: {e}"}
 
 

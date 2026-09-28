@@ -3289,6 +3289,20 @@ body.side-open #sidePanel {
   font-size: 11px;
   line-height: 1.4;
 }
+/* 图片生成能力被用户关闭(不是失败):用中性样式,别拿红色报错吓人 */
+.img-gen-off .img-gen-bubble {
+  border-color: var(--border);
+  background: var(--bg-elev);
+}
+.img-gen-off .img-gen-icon {
+  color: var(--muted);
+  opacity: 0.9;
+}
+.img-gen-off .img-gen-status {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
 @keyframes img-fade-in {
   from { opacity: 0; transform: scale(.98); }
   to { opacity: 1; transform: scale(1); }
@@ -5488,7 +5502,28 @@ body.sidebar-collapsed .status-bar {
   background: var(--info-soft);
 }
 
-/* ---- 生成模型选择器:自定义可搜索组合框 ----
+/* 生成模型卡片右上角的「启用 / 禁用」开关:比主题开关小一号,
+   塞进 gen-card-head 时不至于挤掉徽章 */
+.gen-switch {
+  width: 32px;
+  height: 18px;
+  border-radius: 9px;
+}
+.gen-switch .toggle-knob {
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+}
+.gen-switch.on .toggle-knob { transform: translateX(14px); }
+
+/* 能力被禁用:整张卡片灰显,模型选择器也一并锁住(避免"看着能选其实不生效") */
+.gen-card.off { opacity: 0.62; }
+.gen-card.off .gen-combo,
+.gen-card.off .gen-meta { pointer-events: none; }
+.gen-card.off .gen-card-name { color: var(--muted); }
+
+/* 生成模型选择器:自定义可搜索组合框 ----
    取代原生 <select>:原生下拉在候选很多时(几十个模型)样式不可控、且无法搜索。
    弹层用「body 传送门 + position:fixed」渲染,避开 .settings-content{overflow:auto}
    的裁切;z-index 高于设置弹窗(.modal-overlay=1000)。 */

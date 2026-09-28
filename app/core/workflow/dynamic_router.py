@@ -5,7 +5,6 @@
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
 from typing import Any, Optional
@@ -38,7 +37,17 @@ class DynamicEdgeEvaluator:
         self.variables = variables
         self.node_results = node_results or {}
         # 合并为统一上下文
-        self._context: dict[str, Any] = {**self.variables}
+        self._context: dict[str, Any] = {}
+        self._refresh_context()
+
+    def _refresh_context(self) -> None:
+        """按当前 variables / node_results 重建求值上下文。
+
+        关键:原先只在构造时快照一次。循环场景下循环体每轮都会产生新的
+        variables / node_results,若不刷新,while/until 条件永远读到第一轮的
+        旧值 —— 条件恒为真,循环只能靠 max_iterations 兜底退出。
+        """
+        self._context = {**self.variables}
         self._context.update(self.node_results)
 
     def evaluate(self, condition_expr: str) -> bool:
@@ -52,6 +61,9 @@ class DynamicEdgeEvaluator:
         """
         if not condition_expr or not condition_expr.strip():
             return True  # 无条件边
+
+        # 循环/多轮执行时 variables 可能已被更新,求值前必须重建上下文
+        self._refresh_context()
 
         # 1. 模板变量替换
         rendered = self._render_template(condition_expr)
@@ -106,37 +118,26 @@ class DynamicEdgeEvaluator:
         """渲染模板变量。
 
         支持格式:
-        - {{node_id}} -> 节点结果
-        - {{node_id.output}} -> 节点结果的 output 字段
-        - {{node_id.output.result.value}} -> 嵌套路径访问
-        - {{variable_name}} -> 工作流变量
+        - {{expr}} -> 对 expr 在当前上下文做 safe_eval 求值后,用其 Python 字面量结果替换
+        - 例如 {{result.output.score >= 60}} / {{cond.output}} / {{mode}}
+
+        无法求值(变量缺失/表达式非法)时保留原样,交由外层 safe_eval 处理或返回 False。
+        这正是 examples.py / README 中 `{{classify.output.sentiment == 'positive'}}`
+        这类「整段表达式模板」的预期工作方式。
         """
+        from app.core.workflow.safe_eval import safe_eval as _safe_eval
+
         def replace_match(m: re.Match) -> str:
-            path = m.group(1).strip()
-            value = self._resolve_path(path)
-            if value is None:
-                return m.group(0)  # 保留原样
-            return json.dumps(value, ensure_ascii=False)
+            expr = m.group(1).strip()
+            try:
+                value = _safe_eval(expr, self._context)
+            except Exception:
+                return m.group(0)
+            # repr 生成合法的 Python 字面量(True/False/None/字符串/容器等),
+            # 供外层 safe_eval 安全解析。
+            return repr(value)
 
         return _TEMPLATE_PATTERN.sub(replace_match, text)
-
-    def _resolve_path(self, path: str) -> Any:
-        """解析点分路径,如 'node_1.output.answer'。"""
-        parts = path.split('.')
-        current = self._context
-
-        for part in parts:
-            if isinstance(current, dict):
-                if part in current:
-                    current = current[part]
-                else:
-                    return None
-            elif hasattr(current, part):
-                current = getattr(current, part)
-            else:
-                return None
-
-        return current
 
     def get_context_summary(self) -> dict:
         """获取当前上下文的摘要(用于调试)。"""

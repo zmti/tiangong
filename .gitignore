@@ -7,6 +7,7 @@ venv/
 .venv_build/
 venv_build
 .venv314/
+.workbuddy
 
 # 环境变量
 .env
@@ -62,6 +63,7 @@ desktop/node_modules/
 desktop/dist/
 desktop/app.asar
 desktop/app.asar.bak2
+*.bak
 desktop/build_app/
 desktop/build_pyinstaller/
 desktop/_asar_bak2/
@@ -94,3 +96,7 @@ electron_userdata_dev/
 .DS_Store
 Thumbs.db
 
+
+desktop_fluter/
+desktop_rust/
+dist/

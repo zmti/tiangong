@@ -31,6 +31,8 @@ class MockLLM(LLMClient):
         self.provider = "mock"
         self.model = "mock-model"
         self.client = None
+        # 禁用原生工具调用,避免调用基类需要 API key
+        self.chat_with_tools = None  # type: ignore[attr-defined]
 
     @property
     def info(self) -> dict:
@@ -171,7 +173,7 @@ class TestE2EPlanning:
 class TestE2ECheckpoint:
     """测试 Checkpoint 断点续跑。"""
 
-    def test_checkpoint_save_and_resume(self):
+    async def test_checkpoint_save_and_resume(self):
         """测试保存并恢复运行。"""
         reg = make_add_registry()
         mock = NativeMockLLM([
@@ -182,16 +184,16 @@ class TestE2ECheckpoint:
         run_id = str(uuid.uuid4())[:8]
 
         # 运行并获取结果
-        result = asyncio.run(agent.run("计算 1+2"))
+        result = await agent.run("计算 1+2")
 
         # 验证 checkpoint 已保存(run_id从state中获取)
         mgr = CheckpointManager()
         # 检查最近一次运行的checkpoint
-        runs = mgr.list(limit=1)
+        runs = await mgr.list(limit=1)
         assert len(runs) >= 0  # 可能没有checkpoint(取决于配置)
         assert result is not None
 
-    def test_checkpoint_persistence(self):
+    async def test_checkpoint_persistence(self):
         """测试 Checkpoint 持久化能力。"""
         from app.runtime.state import AgentState
 
@@ -216,7 +218,7 @@ class TestE2ECheckpoint:
 class TestE2EMemory:
     """测试记忆系统。"""
 
-    def test_memory_search_injection(self):
+    async def test_memory_search_injection(self):
         """测试记忆检索注入上下文。"""
         from app.memory.ltm import MemoryStore
 
@@ -253,7 +255,7 @@ class TestE2ETenantIsolation:
         assert get_tenant() is None
         clear_tenant()
 
-    def test_memory_tenant_isolation(self):
+    async def test_memory_tenant_isolation(self):
         """测试记忆存储的租户隔离。"""
         from app.memory.ltm import MemoryStore
 
@@ -263,8 +265,8 @@ class TestE2ETenantIsolation:
         store.save("租户B的记忆", memory_id="mem_b_1", tenant_id="tenant_b")
 
         # 检索时按租户过滤
-        mems_a = store.list(tenant_id="tenant_a")
-        mems_b = store.list(tenant_id="tenant_b")
+        mems_a = await store.list(tenant_id="tenant_a")
+        mems_b = await store.list(tenant_id="tenant_b")
 
         assert len(mems_a) >= 1
         assert len(mems_b) >= 1

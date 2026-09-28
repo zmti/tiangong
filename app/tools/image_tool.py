@@ -13,12 +13,15 @@ import requests
 from pydantic import Field
 
 from app.config import settings
-from app.core.config_runtime import resolve_value
 from app.tools.registry import tool
 
 
 def _image_enabled() -> bool:
-    """无任意生成端点时自动禁用图片工具(按 provider 路由后,compat/qwen/自定义均可)。"""
+    """无任意生成端点时自动禁用图片工具(按 provider 路由后,compat/qwen/自定义均可)。
+
+    设置页的「生成模型」开关**不**在这里摘除工具:那个开关的语义是"不用专门配的
+    生成模型,改用当前对话所选的模型",能力本身照常可用。
+    """
     from app.api.config_models import _any_gen_base_url
     return _any_gen_base_url()
 
@@ -81,8 +84,8 @@ def _download_with_curl(url: str, dest: str) -> bool:
         return False
 
 
-def _generate_image_data_url(prompt: str, size: str = "512x512") -> tuple[str, bool]:
-    """调用 /images/generations,把返回的图片落盘到本地,返回 (URL, 是否本地)。
+def _generate_image_data_url(prompt: str, size: str = "512x512") -> tuple[str, bool, dict]:
+    """调用 /images/generations,把返回的图片落盘到本地,返回 (URL, 是否本地, 用参元信息)。
 
     主动请求 response_format=b64_json:实测 agnes-image-2.0-flash 支持该参数,
     直接返回 base64 落盘,由本地 /images 路由提供,完全绕开外网 CDN。
@@ -91,14 +94,23 @@ def _generate_image_data_url(prompt: str, size: str = "512x512") -> tuple[str, b
     一旦走"返回远程 URL"路径,后端下不来 + 前端也加载不了 → 界面完全不显示图片。
     若个别模型不支持 response_format,则去掉该参数重试一次(兼容旧认知)。
     """
-    # 模型可配置:桌面端覆盖 > .env/IMAGE_MODEL > 代码默认值 agnes-image-2.0-flash;
-    # image_model 为空时才回退到 openai_compat_model(保持原有兜底逻辑)。
-    model = resolve_value("image_model", settings.image_model or settings.openai_compat_model)
+    # 模型优先级:桌面端覆盖 > 跟随对话模型(支持多模态时)> .env/IMAGE_MODEL > 代码默认值
+    # (image_model 为空时才回退到 openai_compat_model,保持原有兜底逻辑)
+    from app.api.config_models import gen_endpoint_for_model, resolve_gen_model
+    model, _model_source = resolve_gen_model(
+        "image", settings.image_model or settings.openai_compat_model
+    )
     # 按 provider 路由:选了某 provider 下的图片模型,请求发到该 provider 的端点
-    from app.api.config_models import gen_endpoint_for_model
     ep = gen_endpoint_for_model(model, "image")
     base_url = ep["base_url"]
     api_key = ep["api_key"] or "sk-placeholder"
+    # 跟着结果回给调用方:排查"到底用了哪个模型"时不必再猜优先级算得对不对
+    _info = {
+        "model": model,
+        "model_source": _model_source,
+        "provider": ep.get("provider", ""),
+        "provider_name": ep.get("provider_name", ""),
+    }
     if not base_url:
         raise RuntimeError(f"图片生成失败: 模型 {model} 所属端点未配置 base_url")
     payload = {
@@ -129,7 +141,7 @@ def _generate_image_data_url(prompt: str, size: str = "512x512") -> tuple[str, b
     if item.get("b64_json"):
         raw = base64.b64decode(item["b64_json"])
         name = _save_image(raw, "png")
-        return _image_url(name), True
+        return _image_url(name), True, _info
 
     # 回退到 URL 下载
     if item.get("url"):
@@ -141,7 +153,7 @@ def _generate_image_data_url(prompt: str, size: str = "512x512") -> tuple[str, b
                 dl = requests.get(src, timeout=180, verify=False)
                 dl.raise_for_status()
                 name = _save_image(dl.content, ext)
-                return _image_url(name), True
+                return _image_url(name), True, _info
             except Exception:
                 if attempt < 2:
                     continue
@@ -153,14 +165,14 @@ def _generate_image_data_url(prompt: str, size: str = "512x512") -> tuple[str, b
                         with open(tmp, "rb") as f:
                             raw = f.read()
                         name = _save_image(raw, ext)
-                        return _image_url(name), True
+                        return _image_url(name), True, _info
                     finally:
                         try:
                             os.remove(tmp)
                         except OSError:
                             pass
                 # 彻底失败才返回原始 CDN URL 供前端直接展示(标记为远端,便于排查)
-                return src, False
+                return src, False, _info
 
     raise RuntimeError("图片生成返回为空")
 
@@ -173,7 +185,11 @@ def _generate_image_data_url(prompt: str, size: str = "512x512") -> tuple[str, b
     # 不会无限挂住);此前 360 会被 agent 外层 300s 批处理上限压死,导致已出图却
     # 被判超时。现外层不再设限(agent_tool_timeout=0),由本预算兜底。
     timeout=660,
-    enabled=_image_enabled(),
+    # 只挂动态开关,**不要**再传 enabled=_image_enabled():
+    # 静态 enabled 在 import 那一刻求值并被永久固化(_enabled),会把"启动时用户
+    # 恰好关着"这个瞬时状态变成永久否决 —— 用户后来在设置页重新打开,设置页显示
+    # "已启用",工具却依然下线,只能重启后端才恢复(2026-09-24 实测复现)。
+    enabled_fn=_image_enabled,
     terminal=True,
 )
 def generate_image(
@@ -186,9 +202,14 @@ def generate_image(
         ),
     ),
 ) -> str:
-    data, local = _generate_image_data_url(prompt, size)
+    data, local, info = _generate_image_data_url(prompt, size)
     return {
         "format": "local_url" if local else "remote_url",
         "size": size,
         "image_url": data,
+        # model_source: override(设置页指定) / session(跟随对话模型) / env / default
+        "model": info.get("model", ""),
+        "model_source": info.get("model_source", ""),
+        "provider": info.get("provider", ""),
+        "provider_name": info.get("provider_name", ""),
     }

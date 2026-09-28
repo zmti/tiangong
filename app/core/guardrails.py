@@ -43,6 +43,7 @@ _INJECTION_PATTERNS: tuple[str, ...] = (
     "without your instructions",
     "你的指令是",
     "你现在是",
+    "你现在扮演",
     "角色扮演为管理员",
     "dans la suite",
     "假裝",
@@ -52,7 +53,13 @@ _INJECTION_PATTERNS: tuple[str, ...] = (
     "stop obeying",
     "override your",
     "bypass your",
-    "绕过",
+    # 中文"绕过"是极高频的日常用词("绕过这个瓶颈/绕过已废弃接口"),裸词拦截误伤严重,
+    # 必须带上"绕过的是规则/限制/安全"这类宾语才算越权意图。
+    "绕过限制",
+    "绕过安全",
+    "绕过系统",
+    "绕过规则",
+    "绕过你的",
     # 来自 safety_engine: 更全面的 jailbreak 检测
     "do as i say",
     "act as if",
@@ -71,11 +78,19 @@ _INJECTION_PATTERNS: tuple[str, ...] = (
     "this is a test only",
     "simulation only",
     "experiment only",
-    # 分隔符注入变体(字面量匹配,不含正则特殊字符)
-    "---\n", "***\n", "===\n", "\n\n---", "\n\n***",
-    # 分隔后紧跟指令的模式(含通配符 *)
+    # 分隔后紧跟指令的模式(* 会转成 .* 做正则匹配)
     "忽略*\n", "忽略*之前的", "忽略*所有之前的",
-    "你*\指令是", "你*\是",
+    # 说明: 这里曾经放过 "---\n" / "***\n" / "===\n" / "\n\n---" / "\n\n***" 这类
+    # "分隔符"字面量模式,它们有两个致命问题:
+    #   1) 全是**普通 Markdown 语法**(水平线 *** / ---、setext 标题下划线 ===、
+    #      YAML front matter 收尾 ---),任何带排版的中文提示词都会命中;
+    #   2) 更严重的是 "***\n" 含通配符 *,会走正则分支:re.escape 后三个 * 各变成
+    #      .*  → 最终正则是 ".*.*.*\n",等价于"只要文本里有换行就命中"。
+    # 实测工作流 Agent 节点仅因 prompt 里有一行 "***" 分隔线就被判成
+    # "疑似指令注入/越权操作"直接拒绝执行。分隔符本身不构成越权意图,已移除;
+    # 真正的注入语义由上面的"忽略*"等带语义的通配模式承担。
+    # (同理,旧写法 "你*\指令是" / "你*\是" 经 re.escape 后反斜杠被转义成字面量,
+    #  实际匹配的是 "你...\是",属于永不命中的死模式,已删除。)
     # 中英混合变体
     "忽略*以上指令", "忽略*上面的", "忽略*此前",
     "forget*everything", "forget*all",
@@ -105,7 +120,11 @@ _SENSITIVE_PATH_PATTERNS: tuple[re.Pattern, ...] = (
     re.compile(r"\.ssh[\\/](id_rsa|id_ed25519|config)"),
     re.compile(r"\.aws[\\/]credentials"),
     re.compile(r"credentials\.json"),
-    re.compile(r"\bsecret[\\/_-]?"),  # 敏感文件/路径中的 secret 关键词
+    # 敏感文件/路径中的 secret 关键词。
+    # 注意: 原写法 r"\bsecret[\\/_-]?" 的字符集是**可选**的(?),等价于裸词 \bsecret,
+    # 于是任何出现英文 "secret" 的输入(如"这个 secret 变量")都会被判成越权读文件。
+    # 必须要求后面真的跟着路径分隔符或连字符,才是 secret/xxx、secret_key 这类形态。
+    re.compile(r"\bsecret[\\/_-][\w.-]*"),
     re.compile(r"(?i)\bsecret[_-]?[kK]ey\b"),  # secret_key / secret-key
     re.compile(r"(?i)\bsecret[_-]?[pP]ass\b"),  # secret_pass / secret-pass
     re.compile(r"password\.txt"),

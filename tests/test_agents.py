@@ -175,7 +175,8 @@ def test_delegate_parallel_fans_out_tasks(monkeypatch):
             {"instruction": "调研话题A"},
             {"instruction": "调研话题B", "max_steps": 3},
         ])
-        out = run(delegate_parallel.func(tasks=tasks, max_steps=8))
+        out_str = run(delegate_parallel.run({"tasks": tasks, "max_steps": 8}))
+        out = json.loads(out_str)
     finally:
         _delegate_parent.reset(tok_p)
         _delegate_depth.reset(tok_d)
@@ -189,16 +190,20 @@ def test_delegate_parallel_fans_out_tasks(monkeypatch):
 
 def test_delegate_parallel_invalid_tasks():
     """tasks 不是合法 JSON 数组时返回错误。"""
+    import json
     from app.tools.delegation_tool import delegate_parallel
 
-    out = run(delegate_parallel.func(tasks="not-json", max_steps=5))
+    out_str = run(delegate_parallel.run({"tasks": "not-json", "max_steps": 5}))
+    out = json.loads(out_str)
     assert "error" in out
 
 
 def test_delegate_parallel_empty_tasks():
+    import json
     from app.tools.delegation_tool import delegate_parallel
 
-    out = run(delegate_parallel.func(tasks="[]", max_steps=5))
+    out_str = run(delegate_parallel.run({"tasks": "[]", "max_steps": 5}))
+    out = json.loads(out_str)
     assert "error" in out
 
 
@@ -208,6 +213,7 @@ def test_delegate_parallel_too_many_tasks():
     from app.tools.delegation_tool import delegate_parallel
 
     tasks = json.dumps([{"instruction": f"任务{i}"} for i in range(12)])
-    out = run(delegate_parallel.func(tasks=tasks, max_steps=5))
+    out_str = run(delegate_parallel.run({"tasks": tasks, "max_steps": 5}))
+    out = json.loads(out_str)
     assert "error" in out
     assert "最多 10 项" in out["error"]

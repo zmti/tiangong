@@ -229,7 +229,12 @@ class LoopController:
         }
 
     async def _execute_body(self) -> dict:
-        """执行循环体(子图)。"""
+        """执行循环体(子图)。
+
+        每轮结果会回写到 variables / node_results,使 while/until 条件能够
+        观测到循环体本轮产生的值(否则条件读到的是循环开始前的旧快照,
+        循环永远无法自然终止,只能靠 max_iterations 兜底)。
+        """
         if not self.subgraph_ids:
             # 没有子图,返回当前迭代值
             return {"iteration": self._iteration, "item": self.current_item}
@@ -242,6 +247,10 @@ class LoopController:
             node = self.workflow_nodes[node_id]
             result = await self.execute_node(node)
             results[node_id] = result
+
+        # 回写:让下一轮的条件评估能看到本轮产出
+        self.node_results.update(results)
+        self.variables.update(results)
 
         return results
 

@@ -163,18 +163,15 @@
   display: none;
 }
 
+/* hover 时把描述显示在标签右侧。
+   旧写法是 position:absolute; left:36px + 不透明背景,直接盖在标签上(如"结束"被
+   "工作流出口"整块压住),看起来像坏掉的 tooltip; chip 自身还有 overflow:hidden,
+   想挪出 chip 也会被裁掉,所以改为行内展开,谁也不遮谁。 */
 .wf-node-chip:hover .chip-desc {
   display: block;
-  position: absolute;
-  left: 36px;
-  top: 50%;
-  transform: translateY(-50%);
-  background: var(--bg);
-  padding: 4px 8px;
-  border-radius: var(--radius-sm);
-  box-shadow: var(--shadow);
-  z-index: 100;
-  white-space: nowrap;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 6em;
 }
 
 .wf-sidebar-footer {
@@ -302,7 +299,9 @@
 /* ========== 画布 ========== */
 .wf-canvas-wrap {
   flex: 1 1 auto;
-  min-height: 400px;
+  /* 原 400px: 矮窗口下 400(画布)+240(运行记录) 已超 .wf-main 高度,
+     而 .wf-main 是 overflow:hidden → 运行记录被无声裁掉、看不到也滚不到。 */
+  min-height: 240px;
   position: relative;
   overflow: auto;
   background: 
@@ -872,7 +871,10 @@
 
 /* ========== 运行历史 ========== */
 .wf-run-history-wrap {
-  flex: 0 0 auto;
+  /* 0 1 auto + min-height:0: 窗口变矮时允许整块收缩(由内部列表滚动承接),
+     否则 400px 画布 + 240px 记录会把 .wf-main 撑破,被 overflow:hidden 无声裁掉 */
+  flex: 0 1 auto;
+  min-height: 0;
   border-top: 1px solid var(--border);
   background: var(--bg-soft);
   max-height: 240px;
@@ -885,6 +887,7 @@
 .wf-run-history-wrap[hidden] { display: none; }
 
 .wf-run-history-head {
+  flex: 0 0 auto;   /* 标题栏不参与压缩,记录多时不能被挤掉 */
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -897,7 +900,8 @@
 }
 
 .wf-run-history {
-  flex: 1;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
   padding: 10px 12px;
   display: flex;
@@ -906,6 +910,10 @@
 }
 
 .wf-run-item {
+  /* ★ 关键: 列方向 flex 子项默认 flex-shrink:1, 记录一多就被整体压扁
+     (实测 8 条时每行只剩 21px, 而内容需 31px, 被自身 overflow:hidden 切掉 → 文字互相重叠、
+     看起来"排版乱了")。固定不收缩, 溢出交给 .wf-run-history 滚动。 */
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 10px;

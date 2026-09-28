@@ -16,6 +16,10 @@
 """
 from __future__ import annotations
 
+# 提前加载 core.planner 以取得 TaskPlan 定义(避免循环导入)
+import app.core.planner as _core_planner
+TaskPlan = _core_planner.TaskPlan
+
 import asyncio
 import datetime
 import json
@@ -26,7 +30,8 @@ import uuid
 from typing import Optional
 
 from app.config import settings
-from app.core.constants import TEST_FAIL_MARKERS, TRANSIENT_PATTERNS, NO_RETRY_TOOLS
+from app.core.constants import (TEST_FAIL_MARKERS, TRANSIENT_PATTERNS, NO_RETRY_TOOLS,
+                                is_context_length_error)
 from app.runtime.graph import END, Graph, Node
 from app.runtime.state import AgentState
 
@@ -49,9 +54,7 @@ def _clip_history_for_json(history: list[dict]) -> str:
     clipped = []
     total_bytes = 0
     for m in history:
-        # 修复: 去掉 `or m.get("kind")` 兜底——kind 是类型标记("text"),不是内容,
-        # 空正文消息在此处会变成字面 'text' 回喂给模型。
-        raw = m.get("content", "")
+        raw = m.get("content", "") or m.get("kind", "")
         if not str(raw).strip():
             continue
         s = str(raw)
@@ -85,112 +88,83 @@ def _truncate_to_token_budget(text: str, max_tokens: int, llm=None) -> tuple[str
     return cut, True
 
 
-# ---- 输出完整性守卫(防"回答说一半就停")----
-#
-# 背景(2026-09-20 实测):agnes-3.0-flash 等 OpenAI 兼容网关在达到 max_tokens 或
-# 上游自身截断时,会把 finish_reason 归一化成 "stop"(而不是 "length"),
-# 于是 llm.py 里唯一的截断检测(`finish_reason == "length"`)失效;
-# agent 把"半句答案"当成最终答案落库 → 用户看到"输出中断"
-# (实例:答案停在 "...正式应用 2 项 edit：",后续的 edit_file 工具调用再没发生)。
-#
-# 这里补两层防护:
-#   ① `_answer_looks_truncated` 本地判断答案是否"没写完"(无需额外 LLM 调用);
-#   ② 命中后自动续写:把已输出内容作为 assistant 前缀回灌模型,要求从断点接着写,
-#      新 token 追加渲染(前端不做 answer_reset),最多续写 agent_answer_continue_max 次。
-_TRUNCATION_TAIL_CHARS = set(":：,，、;；(（[【{「『-—<=要的与和及或但")
-_LEGIT_LINE_PREFIX = re.compile(r"^\s*(\d+[.)、]|[-*+|>#]|```|~~~)")
-# 续写提示词:要求"接着写"而不是"重新写",并以哨兵表示其实已写完(避免无意义追加)
-_CONTINUE_PROMPT = (
-    "[系统] 你上一条回复在输出中途被截断了(没有写完)。请**直接从断点继续输出剩余内容**:"
-    "不要重复已输出的文字,不要重新开头,不要复述前面的结论,不要加\"继续\"之类的说明。"
-    "如果上一条其实已经完整结束,只输出:(已完成)"
-)
-_CONTINUE_DONE_MARKERS = ("(已完成)", "（已完成）", "(已完成)。", "（已完成）。")
+# ---- 续写/截断检测(从已删除的 app.agent_core 外科手术式回收) ----
+# 背景:答案"输出中断"自动续写特性原本只在 app.agent_core 实现且未接入 live 图内核,
+# 双内核收敛(删除 agent_core)时把这些与架构无关的纯判定函数回收进 live 模块,
+# 保留其单测;特性本身的接入(run_stream/_stream_round 续写)仍待移植到图内核。
 
+def _answer_looks_truncated(answer: str, min_len: int = 10, max_output_tokens: int = 0) -> tuple[bool, str]:
+    """判断答案是否疑似被截断(未正常结束)。Returns: (is_truncated, reason)。
 
-def _answer_looks_truncated(
-    text: str, max_output_tokens: int = 0
-) -> tuple[bool, str]:
-    """判断答案是否"没写完"。返回 (是否截断, 原因)。
-
-    只做本地启发式判断,不产生额外 LLM 调用;误判代价是一次多余续写请求
-    (模型会回"(已完成)"哨兵,内容不被追加),漏判代价是用户看到半截答案。
-    因此宁可偏保守一点:只在信号明确时判定截断。
+    仅当存在明确信号(触顶 max_output_tokens / 未闭合代码块 / 未完成标点)时才判为截断,
+    默认视为正常结束——避免过度判定导致每次回答都多一次续写调用。
+    max_output_tokens 硬限制优先于标点启发式(上游回 stop 但仍触顶时也视为截断)。
     """
-    if not text:
+    if not answer or not answer.strip():
         return False, ""
-    s = text.rstrip()
-    if not s:
-        return False, ""
-    # ① 代码块未闭合:最明确的截断信号
+    # max_output_tokens 硬限制优先:即使结尾是正常标点,触顶也视为截断(上游回 stop 的兜底)
+    if max_output_tokens > 0:
+        from app.memory.context import estimate_tokens
+        if estimate_tokens(answer) >= max_output_tokens:
+            return True, "hit_max_output_tokens"
+    s = answer.rstrip()
+    # 未闭合的代码块:用户看到半截代码
     if s.count("```") % 2 == 1:
         return True, "code_fence_unclosed"
-    # ② 行内代码未闭合(排除 ``` 已在上一步处理)
-    if (s.count("`") - s.count("```") * 3) % 2 == 1:
-        return True, "inline_code_unclosed"
-    # ③ 结尾悬空:逗号/冒号/顿号/连接词等"话没说完"的符号
-    if s[-1] in _TRUNCATION_TAIL_CHARS:
-        return True, f"dangling_tail({s[-1]!r})"
-    if s.endswith("**") or s.endswith("###"):
-        return True, "dangling_markdown"
-    # ④ 最后一行是无终结标点的长散文 —— 疑似被硬切断
-    #    (列表项 / 表格行 / 引用行 / 编号行 / 代码围栏行 都算正常结尾,排除)
-    last_line = s.splitlines()[-1].strip()
-    if last_line and not _LEGIT_LINE_PREFIX.match(last_line):
-        if len(last_line) >= 40 and last_line[-1] not in "。!?.!?；;：:）)】」』\"'`*_|—…":
-            return True, "no_terminal_punct"
-    # ⑤ 估算输出 tokens 触顶:上游按 max_tokens 截断但回了 stop
-    if max_output_tokens > 0:
-        try:
-            from app.memory.context import estimate_tokens
-
-            if estimate_tokens(s) >= max_output_tokens * 0.92:
-                return True, "hit_max_output_tokens"
-        except Exception:  # noqa: BLE001 token 估算失败不影响主流程
-            pass
+    # 显式完成标记
+    if s.endswith(("(已完成)", "（已完成）", "(已完成)。", "（已完成）。")):
+        return False, ""
+    # 以明显的断句符号结尾,通常不算截断
+    if s.endswith(("。", "！", "？", ".", "!", "?")):
+        return False, ""
+    # 以明显未完成的标点结尾
+    if s.endswith(("：", ":", "，", ",", "、", ";", "；", "(", "（", "[", "【", "{", "『", "「", "-", "—", "<=", "要", "的", "与", "和", "及", "或", "但")):
+        return True, "以未完成标点结尾"
+    # 若最后一行看起来像列表项开头,可能是正常结尾
+    import re
+    if re.search(r"^\s*(\d+[.)、]|[-*+|>#]|```|~~~)", s):
+        return False, ""
     return False, ""
 
 
 def _strip_continuation_overlap(prev: str, cont: str) -> str:
-    """裁掉续写结果与已输出内容重叠的头部(模型习惯先复述一段再接着写)。"""
+    """去除续写内容中与前文重叠的前缀。"""
     if not prev or not cont:
-        return cont or ""
-    # ① 直接前缀重叠:prev 的后缀 == cont 的前缀
-    max_len = min(len(prev), len(cont), 2000)
-    for n in range(max_len, 7, -1):
-        if prev[-n:] == cont[:n]:
-            return cont[n:]
-    # ② 整段复述:cont 开头一小段已完整出现在 prev 尾部附近 → 丢弃该段
-    head = cont[:120]
-    if len(head) >= 40 and prev.rfind(head) >= max(0, len(prev) - 4000):
-        return cont[len(head):]
+        return cont
+    prev = prev.rstrip()
+    cont = cont.lstrip()
+    max_overlap = min(len(prev), len(cont), 200)
+    for i in range(max_overlap, 0, -1):
+        if prev.endswith(cont[:i]):
+            return cont[i:]
     return cont
+
+
+# 续写相关
+_CONTINUE_PROMPT = (
+    "请从上一次回答中断的地方继续，不要重复已输出的内容。"
+    "直接输出后续内容即可。"
+)
+_CONTINUE_DONE_MARKERS = ("(已完成)", "（已完成）", "(已完成)。", "（已完成）。")
 
 
 from app.core.llm import LLMClient, ToolCall, LLMError
 from app.core.planner import TaskPlan, _normalize_steps, apply_plan_tool, generate_plan
 from app.core.prompts import TOOL_CALL_PATTERN, build_system_prompt, build_tools_description
 from app.core.telemetry import _current_run_id, tracer
-from app.core.reasoning_engine import reason
+from app.core.observability import get_observability, traced, trace_block
 from app.tools.categories import SYSTEM_TOOLS
 from app.tools.registry import ToolRegistry, get_registry
+from app.core.verification import run_verification_hook
+from app.core.memory_consolidation import consolidate_memory, recall_memory, get_consolidator
+from app.core.task_planner import TaskPlanner, PLAN_TEMPLATES, create_plan_from_template
+from app.core.cost_control import get_cost_controller, CostController, BudgetExceededError
+
+# 复用 core.planner 的 TaskPlan 定义
+import app.core.planner as _core_planner
+TaskPlan = _core_planner.TaskPlan
 
 logger = logging.getLogger(__name__)
-
-
-def _looks_truncated(result_str: str) -> bool:
-    """工具结果是否代表"参数/代码在生成时被输出上限截断"。
-
-    典型场景(2026-09-23):模型用 run_code 写长脚本,输出 token 触顶后流被切断,
-    网关把残缺 JSON 补齐成"合法"参数,沙箱拿到残代码 →
-    SyntaxError: unterminated string literal。这类错误**修不好**(模型看到的
-    代码本身就是残的),自愈/重试都白搭,必须让模型改道:
-    write_file 分段写 + run_terminal 执行。
-    """
-    if not result_str:
-        return False
-    return '"truncated": true' in result_str or "代码疑似不完整" in result_str
-
 
 # 计划工具:在 ReAct 循环内被 Agent 拦截,维护私有计划状态
 PLAN_TOOLS = ("set_plan", "update_plan")
@@ -200,7 +174,7 @@ ORCHESTRATION_MODES = ("sequential", "hierarchical", "consensual")
 
 # 工具路由快速通道阈值: 简短问候直接跳过 LLM 路由
 _TOOL_ROUTE_SHORT_INPUT_THRESHOLD = 15
-_TOOL_ROUTE_SHORT_INPUT_KEYWORDS = ("代码", "文件", "搜索", "网页", "执行", "运行", "分析", "报告", "计算")
+_TOOL_ROUTE_SHORT_INPUT_KEYWORDS = ("代码", "文件", "搜索", "网页", "执行", "运行", "分析", "报告", "计算", "+", "-", "*", "/", "=")
 
 # 任务规划快速通道阈值: 简短消息跳过规划
 _PLAN_SHORT_INPUT_THRESHOLD = 20
@@ -211,6 +185,40 @@ _CONFIRM_POLL_INTERVAL = 0.8
 
 # 错误分析最近消息数
 _ERROR_RECENT_MESSAGE_COUNT = 6
+
+# ---- "答案是没解析成功的工具调用块"的检测 ----
+# 背景(2026-09-28 实测):文本模式下模型吐出
+#   <tool_calls><invoke name="run_terminal">\n\n</invoke></tool_calls>
+# (invoke 体为空 —— 参数被输出上限截断或模型本身没给参数)。XML 解析器解析不出
+# tool_calls → 该轮被当作"没有工具调用" → finalize 直接把原始 XML 当成最终答案
+# 发给了用户(会话 desktop-muc7dv38, 09:22:22),气泡里是一串 <tool_calls>。
+_UNPARSED_TOOL_CALL_MAX_LEN = 4000
+_UNPARSED_TOOL_CALL_MIN_PROSE = 20
+
+
+def _looks_like_unparsed_tool_call(text: str) -> bool:
+    """判断答案是否其实是"没解析成功的工具调用块"(而非给用户的正文)。
+
+    判定分两步,尽量不误伤:
+      1) 答案必须**以**工具调用块开头(允许被 ``` 代码块包裹)。
+         正常回答即使夹带标签,也是先说正文;而以标签开头说明整条都是残骸。
+      2) 把工具调用块剥掉后,剩下的实质正文(去掉符号/空白)不足 20 字符。
+    """
+    t = (text or "").strip()
+    if not t or len(t) > _UNPARSED_TOOL_CALL_MAX_LEN:
+        return False
+    # 允许被 ```json / ```xml 代码块包裹
+    t = re.sub(r'^```[a-zA-Z]*\s*', '', t)
+    t = re.sub(r'\s*```$', '', t).strip()
+    low = t.lower()
+    if not low.startswith(("<tool_calls", "<tool_call", "<invoke", '{"tool"')):
+        return False
+    s = re.sub(r'<tool_calls?>[\s\S]*?</tool_calls?>', '', t, flags=re.IGNORECASE)
+    s = re.sub(r'<invoke\b[\s\S]*?</invoke>', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'<invoke\b[^>]*/?>', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\{"tool"\s*:[\s\S]*?\}\s*\}', '', s)
+    s = re.sub(r'</?(?:tool_calls?|invoke|parameter)\b[^>]*>', '', s, flags=re.IGNORECASE)
+    return len(re.sub(r'[\s\-_*`|\[\]{}<>]+', '', s)) < _UNPARSED_TOOL_CALL_MIN_PROSE
 
 # 历史摘要保留最近消息数
 _MEMORY_RECENT_HISTORY_COUNT = 6
@@ -253,11 +261,11 @@ class Agent:
         task_config: Optional[dict] = None,
         project_path: str = "",
         fast_mode: bool = False,
+        # 智能体硬规则(chat.py._build_agent 会传入, 缺了会抛 TypeError 导致对话主流程崩溃)。
+        # 默认 None, 不影响其它调用方; 语义见 _execute_tool_once / 输入扫描处。
         rule_blocked_tools: Optional[list[str]] = None,
         rule_terms: Optional[list[str]] = None,
         rule_paths: Optional[list[str]] = None,
-        rule_terms_action: str = "block",
-        # warn-action 的禁词/禁路径:仅记录不拦截(与 block 列表分离,保留各自的 action 语义)
         rule_warn_terms: Optional[list[str]] = None,
         rule_warn_paths: Optional[list[str]] = None,
     ):
@@ -277,9 +285,9 @@ class Agent:
         # 自动缩放配置:根据任务复杂度动态调整参数
         self._task_config = task_config
         if task_config:
-            # task_config 优先,如果没有则使用参数或默认配置
+            # task_config 优先，如果没有则使用参数或默认配置
             # 注意: max_steps=0 表示"不设步骤上限"(新语义),不能用 `or` 把 0 当成空值覆盖;
-            # 这里用 is None 判断:task_config 显式传 0 时保留 0。
+            # 这里用 is not None 判断:task_config 显式传 0 时保留 0。
             self.max_steps = task_config.get("max_steps") if task_config.get("max_steps") is not None else (max_steps if max_steps is not None else settings.agent_max_steps)
             self.context_budget = task_config.get("context_budget") or settings.context_char_budget
             self.mode = task_config.get("mode") or (mode or settings.agent_mode or "auto").lower()
@@ -318,15 +326,16 @@ class Agent:
         elif self.mode == "review":
             self._verify_enabled = True
             self._reflect_enabled = True
-        self.registry = registry or get_registry()
-        base_prompt = system_prompt or settings.agent_system_prompt
-        # 把"用户规则实际禁用了哪些工具"以事实形式写进系统提示,让 LLM 在做工具决策前
-        # 就拿到真值,避免它凭空声称某工具"被用户规则禁用"(2026-09-21 历史规则残留误报的根因类问题)。
-        # 空集合时显式声明"无工具被禁用",并禁止 LLM 在没收到真实拒绝响应时编造禁用说法。
-        self.system_prompt = (base_prompt or "") + self._build_rule_blocked_note(rule_blocked_tools)
-        # 自动测试触发:若当前项目被识别为 H5/网页,告知 agent 改动前端后应主动冒烟测试。
-        # 与规则禁用声明同源:都是把"实时事实"写进系统提示,让 LLM 按指令行动。
-        self.system_prompt = self.system_prompt + self._build_web_test_note(project_path)
+        if registry is None:
+            # 显式取"真正注册了工具"的 app.tools.registry 实例(含 async list(),
+            # 供 smart_router 使用)。模块全局 get_registry() 默认是空注册表、没有
+            # async list() 方法,若 Agent 落到那个空表,工作流/对话里的 Agent 节点就
+            # 调不到任何工具,智能路由也会反复打 "has no attribute 'list'" warning。
+            # 调用方显式传入 registry 时保持原样。
+            from app.tools.registry import get_registry as _tool_registry_get
+            registry = _tool_registry_get()
+        self.registry = registry
+        self.system_prompt = system_prompt or settings.agent_system_prompt
         self.temperature = temperature if temperature is not None else settings.agent_temperature
         self.route = route if route is not None else settings.agent_routing_enabled
         # 上下文预算:实例级覆盖(子智能体可给更小预算以强制聚焦)。
@@ -339,21 +348,19 @@ class Agent:
         self.session_id = session_id or ""
         # 人机协作确认通过的危险工具(本次运行允许执行);空=未开启确认流或未批准
         self.approve_tools = list(approve_tools or [])
+        # 智能体硬规则(chat.py._build_agent 传入, get_active_rules 已把 blocked/warn 分桶)。
+        # blocked_* 会在工具执行处拦截; warn_* 按"仅记录不拦截"语义只存不拦(留观测钩子)。
+        self.rule_blocked_tools = list(rule_blocked_tools or [])
+        self.rule_terms = list(rule_terms or [])
+        self.rule_paths = list(rule_paths or [])
+        self.rule_warn_terms = list(rule_warn_terms or [])
+        self.rule_warn_paths = list(rule_warn_paths or [])
         # 多模态内容块(OpenAI content parts):图片 image_url 等,随用户消息一起送 LLM。
         # 由 chat 接口解析 attachments 生成;模型不支持视觉时降级为文本提示。
         self.multimodal_parts: list[dict] = []
         # 分层记忆注入的提示块(由 _node_prepare 异步检索后缓存)
         self._memory_note: str = ""
         self._dangerous_tools = {s.strip() for s in settings.agent_dangerous_tools.split(",") if s.strip()}
-        # 用户自定义智能体规则(来自 /v1/rules):硬规则分桶。
-        # 空值时全部护栏/工具拦截分支恒不触发 → 无规则行为与改动前完全一致。
-        self._rule_blocked_tools: set[str] = set(t for t in (rule_blocked_tools or []) if t and t.strip())
-        self._rule_terms: Optional[list[str]] = [t for t in (rule_terms or []) if t and t.strip()] or None
-        self._rule_paths: Optional[list[str]] = [p for p in (rule_paths or []) if p and p.strip()] or None
-        self._rule_terms_action: str = rule_terms_action
-        # warn-action 规则:仅记录不拦截
-        self._rule_warn_terms: Optional[list[str]] = [t for t in (rule_warn_terms or []) if t and t.strip()] or None
-        self._rule_warn_paths: Optional[list[str]] = [p for p in (rule_warn_paths or []) if p and p.strip()] or None
         # 危险工具频率限制(共享实现,与 ToolExecutor 行为一致)
         from app.core.tool_safety import DangerousToolRateLimiter
 
@@ -363,23 +370,13 @@ class Agent:
         # 工具路由:预选后只把相关工具子集暴露给模型;None=未路由(全量)
         self._active_tools: Optional[list[str]] = None
         self._always_tools = list(SYSTEM_TOOLS)
-        # 原生工具调用开关:初始化时探测 LLM 是否支持。
-        # 注意:不能只判断 hasattr —— LLMClient 子类(测试 Mock、降级占位等)
-        # 可能把 chat_with_tools 设为 None(不支持),hasattr 仍为 True,
-        # 运行时调用才抛 'NoneType' object is not callable。必须同时校验可调用性。
-        self._native_enabled = (
-            settings.agent_native_tools
-            and callable(getattr(self.llm, "chat_with_tools", None))
-        )
+        # 原生工具调用开关:初始化时探测 LLM 是否支持
+        self._native_enabled = settings.agent_native_tools and callable(getattr(self.llm, "chat_with_tools", None))
         # 基线值: 该实例"意图"的原生工具开关。_reset_run_state 每轮恢复到基线,
         # 而非无条件用全局 settings —— 允许调用方(CLI)通过覆盖 _native_enabled
         # 一次性关闭原生路径, 且多轮复用实例时不被 _reset_run_state 重置回去。
         self._native_baseline = self._native_enabled
         self._schemas_cache = None
-        # 工具连续失败追踪: 键=(工具名, 参数哈希), 值=连续失败次数。
-        # 挂在实例上跨轮共享, 每个 tools 轮次内递增, 成功即清零该工具条目,
-        # 达到阈值(3 次)强制 finalize, 避免同参数死循环重试。
-        self._tool_failure: dict[tuple, int] = {}
         # 任务计划状态(Plan-then-Execute)
         self._plan: Optional[TaskPlan] = None
         self._plan_dirty = False
@@ -417,6 +414,34 @@ class Agent:
             except Exception as e:  # noqa: BLE001  # checkpoint 不可用不影响主流程
                 logger.warning("checkpoint 加载失败,降级为无持久化模式: %s", e)
                 self._checkpoint = None
+
+        # 自动验证钩子:代码变更后运行 pytest/ruff/mypy
+        self._verification_enabled = getattr(settings, "agent_verification_enabled", True)
+        self._verification_hook = None
+        if self._verification_enabled:
+            from app.core.verification import get_verification_hook
+            self._verification_hook = get_verification_hook(self.project_path)
+
+        # 记忆固化器:每轮对话后提取关键决策/代码片段
+        self._memory_consolidator = None
+        if getattr(settings, "agent_memory_consolidation_enabled", True):
+            from app.core.memory_consolidation import get_consolidator
+            self._memory_consolidator = get_consolidator()
+
+        # 增强版任务规划器:JSON 计划 + 检查点 + 可中断
+        self._task_planner = None
+        if self._checkpoint:
+            self._task_planner = TaskPlanner(self._checkpoint)
+
+        # 成本控制器:Token预算 + 模型分级路由 + 语义缓存
+        self._cost_controller = None
+        if getattr(settings, "agent_token_budget_session", 0) > 0 or getattr(settings, "agent_token_budget_request", 0) > 0 or getattr(settings, "agent_token_budget_task", 0) > 0:
+            self._cost_controller = get_cost_controller()
+
+        # 可观测性:追踪、指标、告警
+        self._observability = None
+        if getattr(settings, "agent_tracing_enabled", True):
+            self._observability = get_observability()
 
     def _disable_native(self) -> None:
         """关闭原生工具路径(当前运行 + 后续轮次基线), 降级为文本模式。
@@ -464,45 +489,56 @@ class Agent:
         # _runtime_approved(本地放行工具名单)在第 1 轮 run_stream 入口就冲掉,
         # 导致 --yolo 形同虚设、危险工具仍触发 interrupt 卡死。
         self._runtime_approved = set(getattr(self, "_baseline_approved", set()))
-        # 工具连续失败追踪:清空, 避免上一问的失败计数导致本问直接 giveup
-        self._tool_failure = {}
-        # 取消标志:恢复为"未取消"。同一 Agent 实例跨任务复用时(交互端/后台任务
-        # 管理器),上一任务 cancel() 后若不复位,本任务入口即被 cancel_check 命中,
-        # 图直接标记 cancelled(表现为"新会话一发起就被取消")。
-        # 注: _cancel_flag 本身是外部(tasks.py)注入的引用,reset() 只清状态不清引用。
-        if self._cancel_flag is not None:
-            self._cancel_flag.clear()
 
     # ---- 对外接口 ----
 
     async def run(self, user_input: str, history: list[dict] | None = None) -> AgentResult:
         """执行 Agent,返回结果和完整执行步骤。带 trace 记录。"""
         self._reset_run_state()
+        
+        # 成本控制:开始请求、检查预算
+        task_id = getattr(self, "_current_task_id", "")
+        if self._cost_controller:
+            try:
+                # 根据输入长度估算复杂度
+                complexity = "simple" if len(user_input) < 100 else "standard" if len(user_input) < 500 else "complex"
+                self._cost_controller.begin_request(
+                    session_id=self.session_id,
+                    task_id=task_id,
+                    task_complexity=complexity,
+                )
+            except BudgetExceededError as e:
+                return AgentResult(answer=f"预算超限: {e}", steps=[], model=self.llm.info["model"])
+
+        # 启动追踪
+        trace = None
+        if self._observability:
+            trace = self._observability.start_trace(
+                name="agent_run",
+                session_id=self.session_id,
+                task_id=task_id,
+                kind="agent_run",
+            )
+
         if self.mode == "ensemble":
-            return await self._run_ensemble(user_input, history or [])
+            result = await self._run_ensemble(user_input, history or [])
+            if trace and self._observability:
+                self._observability.end_trace(trace.trace_id, "ok" if result.answer else "error")
+            return result
         if self.mode in ORCHESTRATION_MODES:
-            return await self._run_orchestrated(user_input, history or [])
+            result = await self._run_orchestrated(user_input, history or [])
+            if trace and self._observability:
+                self._observability.end_trace(trace.trace_id, "ok" if result.answer else "error")
+            return result
         state = AgentState(session_id=self.session_id, user_input=user_input)
-        return await self._run_state(state, history or [], stream=False)
-
-    def _apply_resume(self, state: AgentState, resume_value: Optional[dict],
-                      new_input: str | None = None) -> None:
-        """把用户的批准/拒绝决定写回中断状态(恢复前的公共步骤)。
-
-        注意 status 守卫:只有状态为 interrupted 时才回填 resume。
-        checkpoints 里的 status 列会被"续跑中"的后续落盘覆盖成 running,
-        但续跑时加载到的是中断当时落盘的那版(interrupted),守卫成立。
-        """
-        if new_input is not None:
-            state.user_input = new_input
-        if state.status == "interrupted" and state.interrupt is not None:
-            state.interrupt["resume"] = resume_value
-            state.status = "running"
-        self._sync_from_state(state)
+        result = await self._run_state(state, history or [], stream=False)
+        if trace and self._observability:
+            self._observability.end_trace(trace.trace_id, "ok" if result.answer else "error")
+        return result
 
     async def resume(self, run_id: str, new_input: str | None = None,
                      resume_value: Optional[dict] = None,
-                     stream: bool = False):
+                     stream: bool = False) -> "AgentResult | AsyncGenerator[dict, None]":
         """从 checkpoint 恢复并继续执行。
 
         Args:
@@ -512,40 +548,108 @@ class Agent:
                 - [工具名,...]:已批准的工具白名单
                 - {confirmation_id: {"approved": bool}}:按确认请求逐个决定
             若运行处于中断状态则从中断节点继续,否则从头节点继续。
-            stream: True 时返回**异步生成器**(逐事件产出 token/tool/plan/
-                confirmation/done),供 SSE 实时推送;False 时返回 AgentResult。
-
-        修复(2026-09-20 "人工确认后会话卡顿"):旧实现无论 stream 传什么都走
-        _run_state → graph.arun(非流式),即调快点"批准"后必须等整轮跑完
-        (实测常 5~20 分钟,多轮 LLM+工具)才能拿到**第一个字节**,
-        期间前端只有一个打字指示器 → 用户观感"会话卡顿";5 分钟后前端看门狗
-        abort,界面上跳出红条"续跑超时,请稍后在运行记录面板重试"。
-        流式分支必须走 graph.arun_stream,中途每个 token/工具事件都能立即送出。
+            stream: 是否流式返回事件。为 True 时返回一个异步生成器(逐条 yield
+                思考/工具/token/done 事件),使 /v1/chat/resume 走 SSE 流式续跑
+                (带 30s 心跳):前端续跑看门狗不会因"长时间零事件"误报红条,且能实时
+                看到进度。为 False(默认,兼容 runs.py / enhancements.py 等旧调用方)
+                时返回一次性 AgentResult,语义不变。
         """
         if self._checkpoint is None:
             raise RuntimeError("checkpoint 未启用,无法恢复运行")
         state = await self._checkpoint.load(run_id)
         if state is None:
             raise RuntimeError(f"未找到运行记录: {run_id}")
-        self._apply_resume(state, resume_value, new_input)
-        history = state.metadata.get("history", []) or []
+        if new_input is not None:
+            state.user_input = new_input
+        if state.status == "interrupted" and state.interrupt is not None:
+            state.interrupt["resume"] = resume_value
+            state.status = "running"
+        self._sync_from_state(state)
         if stream:
-            # 返回异步生成器(未 await);调用方用 async for 消费。
-            # 注意:此函数仍是 async,返回生成器对象即为本协程的返回值。
-            return self._stream_state(state, history, event_name="resume_stream")
-        return await self._run_state(state, history, stream=False)
+            # 流式续跑:Agent.resume 直接返回生成器,chat.py 的
+            # isinstance(gen, AsyncGeneratorType) 判定为真 → 走 _resume_sse
+            # (SSE + 30s 心跳)。此前这里 await 后返回 AgentResult,该判定恒 False,
+            # _resume_sse 成为死代码,续跑全程零事件 → 前端"续跑等待超时"红条。
+            return self._resume_stream(state)
+        return await self._run_state(state, state.metadata.get("history", []) or [], stream=False)
 
-    async def checkpoints(self, limit: int = 50, status: Optional[str] = None) -> list[dict]:
+    async def _resume_stream(self, state: AgentState):
+        """流式续跑:从已 resume 过渡的状态出发,逐条 yield 图事件。
+
+        与 run_stream 语义一致,只是起点是从 checkpoint 恢复的 state(而非新建)。
+        graph.arun_stream 与 arun 共用同一引擎与中断恢复逻辑,因此续跑行为一致,
+        仅事件实时下发(供 SSE 实时刷新 + 心跳保活前端看门狗)。
+        """
+        run_id = state.run_id
+        token = _current_run_id.set(run_id)
+        tracer.record({
+            "type": "run_start",
+            "run_id": run_id,
+            "session_id": self.session_id,
+            "input": (state.user_input or "")[:200],
+            "max_steps": self.max_steps,
+            "tool_confirm": bool(settings.agent_tool_confirm),
+            "resume": True,
+        })
+        t0 = time.time()
+        graph = self._build_graph()
+        state.metadata["history"] = state.metadata.get("history", []) or []
+        state.metadata["stream"] = True
+        cancelled = False
+        try:
+            async for evt in graph.arun_stream(state):
+                yield evt
+            # 取消标志命中:产出 cancelled 并抛出,让调用方(如 _resume_sse)感知
+            if state.status == "cancelled":
+                cancelled = True
+                yield {"type": "cancelled", "model": state.metadata.get("model", ""),
+                       "steps": state.steps}
+                raise asyncio.CancelledError(f"任务被取消 (run {run_id[:8]})")
+            model = state.metadata.get("model") or self.llm.info["model"]
+            interrupt = None
+            if state.status == "interrupted" and state.interrupt:
+                interrupt = state.interrupt.get("value")
+            done = {"type": "done", "model": model, "steps": state.steps, "run_id": run_id}
+            # 传递 finish_reason:前端检测截断(d=length)用
+            fr = state.metadata.get("finish_reason", "")
+            if fr:
+                done["finish_reason"] = fr
+            if interrupt is not None:
+                done["interrupt"] = interrupt
+            if state.status == "failed" and state.error:
+                done["error"] = state.error
+            yield done
+        except asyncio.CancelledError:
+            # 取消传播: 记录 trace 后向外抛出, 让调用方感知并终止
+            if not cancelled:
+                logger.warning("resume_stream 被外部取消: run_id=%s", run_id)
+                tracer.record({"type": "run_end", "run_id": run_id, "ok": False,
+                               "error": "cancelled", "duration": round(time.time() - t0, 3)})
+                _current_run_id.reset(token)
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.warning("resume() 运行异常，记录 trace 后终止: %s", e)
+            tracer.record({"type": "run_end", "run_id": run_id, "ok": False,
+                           "error": str(state.error or "")[:300],
+                           "duration": round(time.time() - t0, 3)})
+            _current_run_id.reset(token)
+            raise
+        tracer.record({"type": "run_end", "run_id": run_id, "ok": True,
+                       "steps": len(state.steps), "answer_len": len(state.answer or ""),
+                       "duration": round(time.time() - t0, 3)})
+        _current_run_id.reset(token)
+
+    def checkpoints(self, limit: int = 50, status: Optional[str] = None) -> list[dict]:
         """列出已持久化的运行记录(供后台任务/断点续跑管理)。"""
         if self._checkpoint is None:
             return []
-        return await self._checkpoint.list(limit=limit, status=status)
+        return self._checkpoint.list(limit=limit, status=status)
 
-    async def versions(self, run_id: str) -> list[dict]:
+    def versions(self, run_id: str) -> list[dict]:
         """列出某次运行的全部历史版本(时间旅行)。"""
         if self._checkpoint is None:
             return []
-        return await self._checkpoint.versions(run_id)
+        return self._checkpoint.versions(run_id)
 
     async def rollback(self, run_id: str, version: int,
                        resume_value: Optional[dict] = None) -> AgentResult:
@@ -555,7 +659,7 @@ class Agent:
         """
         if self._checkpoint is None:
             raise RuntimeError("checkpoint 未启用,无法回滚")
-        state = await self._checkpoint.rollback(run_id, version)
+        state = self._checkpoint.rollback(run_id, version)
         if state is None:
             raise RuntimeError(f"未找到运行记录 {run_id} 的版本 {version}")
         if state.status == "interrupted" and state.interrupt is not None:
@@ -585,25 +689,13 @@ class Agent:
                 yield evt
             return
         state = AgentState(session_id=self.session_id, user_input=user_input)
-        async for evt in self._stream_state(state, history or []):
-            yield evt
-
-    async def _stream_state(self, state: AgentState, history: list[dict],
-                            event_name: str = "run_stream"):
-        """流式跑图:token/thinking/tool/plan/confirmation 逐条产出,最后产出 done。
-
-        run_stream(新任务)与 resume(中断续跑)共用同一套流式管线:
-        走的是 graph.arun_stream(节点内 emit 的事件进队列后立即 yield),
-        而不是 graph.arun(整轮跑完才返回)——后者会让 SSE 端在长任务里
-        长时间收不到任何字节(fetch 层表现为"卡住")。
-        """
         run_id = state.run_id
         token = _current_run_id.set(run_id)
         tracer.record({
             "type": "run_start",
             "run_id": run_id,
-            "session_id": state.session_id or self.session_id,
-            "input": (state.user_input or "")[:200],
+            "session_id": self.session_id,
+            "input": (user_input or "")[:200],
             "max_steps": self.max_steps,
             "tool_confirm": bool(settings.agent_tool_confirm),
         })
@@ -625,27 +717,23 @@ class Agent:
             interrupt = None
             if state.status == "interrupted" and state.interrupt:
                 interrupt = state.interrupt.get("value")
-            done = {"type": "done", "model": model, "steps": state.steps, "run_id": run_id}
+            done = {"type": "done", "model": model, "steps": state.steps}
             # 传递 finish_reason:前端检测截断(d=length)用
             fr = state.metadata.get("finish_reason", "")
             if fr:
                 done["finish_reason"] = fr
             if interrupt is not None:
-                # 续跑中又碰到需要确认的工具:带上 run_id + 确认集合,
-                # 前端能直接渲染新卡片并继续自动续跑(缺失就成"点了批准没下文")
-                if isinstance(interrupt, dict):
-                    interrupt.setdefault("run_id", run_id)
                 done["interrupt"] = interrupt
             if state.status == "failed" and state.error:
                 done["error"] = state.error
             yield done
         except asyncio.CancelledError:
+            # 取消传播: 记录 trace 后向外抛出, 让调用方(任务管理器)感知并终止
             if not cancelled:
-                logger.warning("%s 被外部取消: run_id=%s", event_name, run_id)
+                logger.warning("run_stream 被外部取消: run_id=%s", run_id)
                 tracer.record({"type": "run_end", "run_id": run_id, "ok": False,
                                "error": "cancelled", "duration": round(time.time() - t0, 3)})
                 _current_run_id.reset(token)
-                yield {"type": "cancelled", "model": state.metadata.get("model", ""), "steps": state.steps}
             raise
         except Exception as e:  # noqa: BLE001
             logger.warning("run() 运行异常，记录 trace 后终止: %s", e)
@@ -653,9 +741,6 @@ class Agent:
                            "error": str(state.error or "")[:300],
                            "duration": round(time.time() - t0, 3)})
             _current_run_id.reset(token)
-            # 异常时 yield done 事件,确保前端不会永远等待
-            yield {"type": "done", "model": state.metadata.get("model", ""),
-                   "steps": state.steps, "error": str(e)[:200]}
             raise
         tracer.record({"type": "run_end", "run_id": run_id, "ok": True,
                        "steps": len(state.steps), "answer_len": len(state.answer or ""),
@@ -679,16 +764,26 @@ class Agent:
         graph = self._build_graph()
         state.metadata["history"] = history
         state.metadata["stream"] = stream
+        
+        # 记录图执行指标
+        if self._observability:
+            self._observability.obs("graph.nodes_total", len(graph._nodes), {"session_id": self.session_id})
+        
         try:
             state, _events = await graph.arun(state)
         except Exception as e:  # noqa: BLE001
             tracer.record({"type": "run_end", "run_id": run_id, "ok": False,
                            "error": str(e)[:300], "duration": round(time.time() - t0, 3)})
+            if self._observability:
+                self._observability.inc("graph.runs.failed", 1, {"session_id": self.session_id})
             _current_run_id.reset(token)
             raise
         tracer.record({"type": "run_end", "run_id": run_id, "ok": True,
                        "steps": len(state.steps), "answer_len": len(state.answer or ""),
                        "duration": round(time.time() - t0, 3)})
+        if self._observability:
+            self._observability.inc("graph.runs.success", 1, {"session_id": self.session_id})
+            self._observability.obs("graph.duration_ms", round((time.time() - t0) * 1000), {"session_id": self.session_id})
         _current_run_id.reset(token)
         model = state.metadata.get("model") or self.llm.info["model"]
         interrupt = None
@@ -734,7 +829,6 @@ class Agent:
         # 当 max_steps==0(不限制步骤上限)时,Graph 层仍保留绝对兜底 500,
         # 真正的无上限语义由 _node_llm 的 _HARD_ROUND_CAP=500 兜底 + 三重收敛机制
         # (同参 3 连败 / replan 耗尽 / 连续空答案)保证不会实际跑满 500 轮。
-        # 500 远小于"死循环",又远大于"正常长任务",是安全的兜底上限。
         max_iters = (base_max + 10) if base_max > 0 else 500
         g = Graph(name="agent", checkpoint=self._checkpoint,
                   max_iters=max_iters,
@@ -761,7 +855,8 @@ class Agent:
     async def _route_llm(self, state: AgentState) -> Optional[str]:
         """llm 节点之后的路由:给上限→giveup;有工具调用→tools;否则→finalize。"""
         if state.metadata.get("giveup"):
-            logger.warning("[_route_llm] → giveup (steps exhausted)")
+            logger.warning("[_route_llm] → giveup (reason=%s)",
+                           state.metadata.get("giveup_reason") or "unknown")
             return "giveup"
         if state.metadata.get("tool_calls"):
             logger.info("[_route_llm] → tools (count=%d)", len(state.metadata["tool_calls"]))
@@ -776,6 +871,7 @@ class Agent:
         兜底防死循环(同参 3 连败 / replan 耗尽 / 连续空答案),不再按轮数强制 giveup。
 
         规则: 基础步数 + 剩余步骤数 * 每步预算, 但设硬上限防止膨胀失控。
+        硬上限 = base_max + 30 (默认 40), 避免复杂计划导致单请求运行 50 步以上。
         """
         base_max = self.max_steps
         if base_max <= 0:
@@ -804,21 +900,16 @@ class Agent:
         # 提升日志级别以便更容易诊断问题
         logger.info("[_route_finalize] answer_len=%d has_tools=%s consecutive_empty=%d",
                      len(answer or ""), has_tool_steps, state.metadata.get("consecutive_empty_answers", 0))
-        # 空答案(含"上游网关校验错误被当正文"的无效答案):跟踪连续次数，超阈值 giveup
-        from app.core.llm import _looks_like_gateway_error as _is_gw_err
-        invalid_answer = bool(answer) and _is_gw_err(answer)
-        if not answer or not answer.strip() or invalid_answer:
+        # 空答案:跟踪连续空答案次数，超过阈值则触发 giveup
+        if not answer or not answer.strip():
             consecutive_empty = int(state.metadata.get("consecutive_empty_answers", 0)) + 1
             state.metadata["consecutive_empty_answers"] = consecutive_empty
             logger.warning("[_route_finalize] empty answer #%d, will retry", consecutive_empty)
-            # 工具密集任务中 LLM 可能多次只输出 thinking,提高阈值到 4
-            # 仅在无任何工具调用时保持较低阈值(首次空直接重试)
-            giveup_threshold = 2 if not has_tool_steps else 4
-            if consecutive_empty >= giveup_threshold:
+            # 连续 2 次空答案即放弃(避免 LLM 只输出 thinking 标签导致无限循环)
+            if consecutive_empty >= 2:
                 state.metadata["giveup"] = True
                 state.metadata["giveup_reason"] = "empty_answers"
-                logger.warning("[_route_finalize] giving up after %d consecutive empty answers (has_tools=%s)",
-                               consecutive_empty, has_tool_steps)
+                logger.warning("[_route_finalize] giving up after %d consecutive empty answers", consecutive_empty)
                 return "giveup"
             return "llm"
         # 有答案时重置计数器
@@ -859,24 +950,7 @@ class Agent:
 
         # 输入护栏
         from app.core.guardrails import INPUT_BLOCK_MESSAGE, run_input_guardrails
-        guard = run_input_guardrails(
-            user_input,
-            user_terms=self._rule_terms,
-            user_paths=self._rule_paths,
-            user_terms_action=self._rule_terms_action,
-        )
-        # warn-action 规则:仅记录命中,不拦截(保留供审计)
-        if self._rule_warn_terms or self._rule_warn_paths:
-            warn_guard = run_input_guardrails(
-                user_input,
-                user_terms=self._rule_warn_terms,
-                user_paths=self._rule_warn_paths,
-                user_terms_action="warn",
-            )
-            if warn_guard.violations:
-                state.metadata.setdefault("guardrail_warn_violations", []).extend(
-                    v.__dict__ for v in warn_guard.violations
-                )
+        guard = run_input_guardrails(user_input)
         if guard.blocked:
             state.answer = INPUT_BLOCK_MESSAGE
             state.steps.append({"step": 0, "type": "guardrail", "content": guard.reasons()})
@@ -901,9 +975,7 @@ class Agent:
 
         state.metadata["model"] = self.llm.info["model"]
         if state.metadata.get("stream"):
-            # 状态提示不进 thinking 流:它不是 LLM 的真实推理,前端"思考过程"区
-            # 只显示模型思维链(reasoning)。prepare 阶段信息走日志,不上前端。
-            pass
+            state.emit({"type": "thinking", "content": f"准备中: 模型 {state.metadata['model']}", "phase": "prepare"})
 
         # 轻量交互模式: 跳过工具路由/任务规划/记忆注入(各自带 AGENT_LLM_TIMEOUT 的
         # 重 LLM 调用)。多轮简单问答只需主 LLM 应答,省掉这些准备段即可秒级响应,
@@ -924,10 +996,8 @@ class Agent:
             state.metadata["history"] = await asyncio.wait_for(
                 self._prepare_history(history), timeout=llm_step_timeout * 2
             )
-            # 压缩成功:不进 thinking 流(那不是模型推理)。仅记录日志,
-            # 前端"思考过程"区只显示真实思维链(reasoning)。
-            if history and len(state.metadata["history"]) < len(history):
-                logger.info("历史上下文已压缩: %d -> %d 条消息", len(history), len(state.metadata["history"]))
+            if state.metadata.get("stream") and history and len(state.metadata["history"]) < len(history):
+                state.emit({"type": "thinking", "content": "历史上下文已压缩", "phase": "prepare"})
         except asyncio.TimeoutError:
             # 超时: 用本地截断替代原始历史, 避免超长上下文导致 context_length 错误
             cap = int(getattr(settings, "context_char_budget", 0) or 0)
@@ -974,7 +1044,37 @@ class Agent:
             logger.warning("记忆注入超时,跳过记忆继续执行")
             self._memory_note = ""
 
-        # 6) 构造消息(纯本地计算,不超时)
+        # 5b) 跨会话记忆检索:从固化记忆库召回相关知识
+        if self._memory_consolidator and not self.fast_mode:
+            try:
+                recalled = recall_memory(user_input, user_id="default", top_k=3)
+                if recalled:
+                    consolidator = get_consolidator()
+                    memory_note = consolidator.build_memory_note(recalled, max_chars=1500)
+                    if memory_note:
+                        self._memory_note = (self._memory_note + "\n\n" + memory_note).strip()
+                        logger.debug("跨会话记忆注入: %d 条", len(recalled))
+            except Exception as e:
+                logger.warning("跨会话记忆检索失败: %s", e)
+
+        # 6) 任务规划器检查点恢复:如果有关联的 run_id 且处于暂停状态,尝试恢复计划
+        if self._task_planner and self._checkpoint and not self.fast_mode:
+            try:
+                # 检查是否有可恢复的计划检查点
+                checkpoints = await self._checkpoint.list(limit=10, status="paused", session_id=self.session_id)
+                for cp in checkpoints:
+                    if cp.get("metadata", {}).get("plan_id"):
+                        # 尝试恢复计划
+                        restored_plan = await self._task_planner.resume_from_checkpoint(cp["run_id"])
+                        if restored_plan:
+                            self._plan = restored_plan
+                            state.plan = self._plan.to_dict()
+                            logger.info("从检查点恢复任务计划: run_id=%s", cp["run_id"][:8])
+                            break
+            except Exception as e:
+                logger.debug("计划检查点恢复失败(忽略): %s", e)
+
+        # 7) 构造消息(纯本地计算,不超时)
         state.messages = self._build_messages(user_input, state.metadata.get("history", []) or [])
 
         state.active_tools = self._active_tools
@@ -1002,24 +1102,23 @@ class Agent:
         rounds = int(state.metadata.get("llm_rounds", 0))
         # 动态步数计算:基于计划进度自动扩展
         dynamic_max = self._get_dynamic_max_steps(state)
-
-        # dynamic_max == 0(用户配置 agent_max_steps=0,即"不设步骤上限"):
-        # 跳过强制给up,由以下收敛机制保证不死循环:
-        #  - 同一工具连续失败 3 次 → _tool_failure 触发 giveup
-        #  - 重新规划次数耗尽(agent_replan_max_times) → _maybe_replan 不再 replan
-        #  - 连续空答案(>4)→ _route_finalize 触发 giveup
-        #  - 非空答案且无工具调用 → 直接 END(任务完成,非 giveup)
+        
         total_steps = len(state.steps)
+        # dynamic_max == 0(agent_max_steps=0,即"不设步骤上限"):跳过强制 giveup,
+        # 由收敛机制保证不死循环:
+        #  - 同一工具连续失败 3 次 → _tool_failure 触发 giveup
+        #  - 重新规划次数耗尽(agent_replan_max_times)
+        #  - 连续空答案 → _route_finalize 触发 giveup
+        #  - 非空答案且无工具调用 → 直接 END(任务完成,非 giveup)
         if dynamic_max > 0 and rounds >= dynamic_max and total_steps >= dynamic_max:
             state.metadata["giveup"] = True
             state.metadata["giveup_reason"] = "steps_exhausted"
             logger.warning("steps exhausted: rounds=%d, total_steps=%d, dynamic_max=%d",
                           rounds, total_steps, dynamic_max)
             return
-        # 不限制模式(dynamic_max==0)的兜底防死循环:LLM 反复调工具但任务无进展
-        # (工具不报错、答案一直空、replan 已耗尽)时,轮数无上限会无限跑。
-        # 用一个较大的绝对轮数上限(500,对应约数百次工具调用)做最后防线,
-        # 远低于 Graph.max_iters=5000,保证"不设上限"语义在实际中仍有界。
+        # 不限制模式(dynamic_max==0)的最后防线:轮数无上限时,若 LLM 反复调工具而任务
+        # 无进展(工具不报错、答案一直空、replan 已耗尽)会无限跑。用绝对轮数上限 500
+        # 兜底,保证"不设上限"语义在实际中仍有界。
         _HARD_ROUND_CAP = 500
         if dynamic_max == 0 and rounds >= _HARD_ROUND_CAP:
             state.metadata["giveup"] = True
@@ -1030,6 +1129,26 @@ class Agent:
         state.metadata["llm_rounds"] = rounds + 1
 
         is_stream = state.metadata.get("stream", False)
+        
+        # 语义缓存:仅非流式、无工具调用的简单问答尝试缓存
+        cache_key = None
+        if not is_stream and self._cost_controller and rounds == 0:
+            # 构建查询文本(最后一条用户消息)
+            last_user = ""
+            for msg in reversed(state.messages):
+                if msg.get("role") == "user":
+                    last_user = msg.get("content", "")
+                    break
+            if last_user:
+                cached = self._cost_controller.get_cached_response(last_user)
+                if cached:
+                    logger.info("语义缓存命中,跳过 LLM 调用")
+                    state.metadata["tool_call_mode"] = "text"
+                    state.metadata["resp"] = cached
+                    state.metadata["tool_calls"] = []
+                    state.metadata["from_cache"] = True
+                    return
+
         try:
             if is_stream:
                 tool_call_mode, resp, tool_calls = await self._call_llm_stream(state.messages, state)
@@ -1038,8 +1157,7 @@ class Agent:
         except LLMError as e:
             err_msg = str(e).lower()
             # context_length 错误: 修剪消息后重试一次
-            if ("context_length" in err_msg or "too long" in err_msg or "maximum context" in err_msg
-                    or "token" in err_msg and ("limit" in err_msg or "exceed" in err_msg)):
+            if is_context_length_error(err_msg):
                 logger.warning("LLM context_length 错误(round=%d), 修剪消息后重试: %s", rounds, e)
                 self._trim_state_messages(state)
                 # 二次重试: 失败则放弃
@@ -1059,85 +1177,22 @@ class Agent:
                     state.metadata["last_llm_error"] = str(e2)
                     return
             else:
-                # 限流/瞬态错误(频率过高/超时/网络抖动):退避后重试,而不是立即放弃。
-                # 这是"输出中途断掉/思考内容没了"的主要根因——流中途被限流杀死后
-                # 直接 giveup,已流出的思考/答案全部残缺。
-                # 两种重入方式(2026-09-20 起区分):
-                #   · 已有内容显示给用户(partial 非空)→ **断点续写**:保留前文、追加剩余,
-                #     不发 answer_reset(否则用户看到已读内容被清掉重来);
-                #   · 还没输出任何内容 → 保持原语义:answer_reset + 整轮重新生成
-                #     (前端会保留旧内容直到新 token 到达,不会闪空白)。
-                from app.core.llm import _is_rate_limit as _rl, _is_retryable as _rt
-                recovered = False
-                last_err = e
-                if _rl(str(e)) or _rt(str(e)):
-                    # 流中途断了但已有内容显示给用户 → 不重生成,改为"断点续写":
-                    # 把已输出片段作为 assistant 前缀回灌 + 续写提示,新 token 直接追加。
-                    # 否则用户会看到已读的内容被清掉重来(观感更差,且多花一次完整生成)。
-                    partial = (state.metadata.get("partial_answer") or "") if is_stream else ""
-                    for _attempt in range(2):
-                        _delay = 5.0 * (_attempt + 1)  # 5s / 15s
-                        if partial:
-                            state.emit({"type": "status",
-                                        "content": f"前文已保留，正在续写剩余内容({_attempt + 1}/2)，约 {_delay:.0f}s 后继续…"})
-                        else:
-                            state.emit({"type": "answer_reset"})
-                            state.emit({"type": "status",
-                                        "content": f"模型限流或网络波动，正在重试({_attempt + 1}/2)，约 {_delay:.0f}s 后继续…"})
-                        logger.warning("LLM 瞬态失败(round=%d, attempt=%d, partial=%d字), %ss 后%s: %s",
-                                       rounds, _attempt + 1, len(partial), _delay,
-                                       "续写" if partial else "重试", last_err)
-                        # 长退避期间每隔 5s 发一次状态心跳，避免前端空闲超时把连接当死链
-                        for _tick in range(int(_delay // 5)):
-                            await asyncio.sleep(5)
-                            state.emit({"type": "status",
-                                        "content": f"仍在续写剩余内容({_attempt + 1}/2)…" if partial
-                                        else f"仍在重试({_attempt + 1}/2)…"})
-                        try:
-                            if partial and is_stream:
-                                cont_msgs = list(state.messages) + [
-                                    {"role": "assistant", "content": partial},
-                                    {"role": "user", "content": _CONTINUE_PROMPT},
-                                ]
-                                tool_call_mode, tail, tool_calls = await self._call_llm_stream(
-                                    cont_msgs, state, prefix=partial
-                                )
-                                tail = _strip_continuation_overlap(partial, tail)
-                                if tail.strip() and tail.strip() in _CONTINUE_DONE_MARKERS:
-                                    tail = ""
-                                resp = partial + tail
-                            elif is_stream:
-                                tool_call_mode, resp, tool_calls = await self._call_llm_stream(state.messages, state)
-                            else:
-                                tool_call_mode, resp, tool_calls = await self._call_llm(state.messages)
-                            recovered = True
-                            break
-                        except LLMError as e2:
-                            last_err = e2
-                            # 续写轮又断了:累加最新片段,下一轮继续往后接
-                            partial = (state.metadata.get("partial_answer") or partial) if is_stream else ""
-                            continue
-                if not recovered:
-                    logger.warning("LLM 调用失败(round=%d): %s", rounds, last_err)
-                    state.emit({"type": "error", "content": f"执行出错: {last_err}"})
-                    state.metadata["tool_call_mode"] = "text"
-                    state.metadata["resp"] = ""
-                    state.metadata["tool_calls"] = []
-                    state.metadata["giveup"] = True
-                    state.metadata["giveup_reason"] = "llm_error"
-                    state.metadata["last_llm_error"] = str(last_err)
-                    return
+                logger.warning("LLM 调用失败(round=%d): %s", rounds, e)
+                state.emit({"type": "error", "content": f"执行出错: {e}"})
+                state.metadata["tool_call_mode"] = "text"
+                state.metadata["resp"] = ""
+                state.metadata["tool_calls"] = []
+                state.metadata["giveup"] = True
+                state.metadata["giveup_reason"] = "llm_error"
+                state.metadata["last_llm_error"] = str(e)
+                return
         state.metadata["tool_call_mode"] = tool_call_mode
         state.metadata["resp"] = resp or ""
         state.metadata["tool_calls"] = [tc.to_dict() for tc in tool_calls]
-        # 追踪 finish_reason:截断检测(finish_reason=length)用。
-        # 必须在每次 LLM 调用结束后立即从 LLMClient 实例读取(调用结束才写完),
-        # 否则跨调用实例属性会把上一次的 finish_reason 误判为本次截断。
+        # 追踪 finish_reason:截断检测(d=length)用
         finish_reason = getattr(self.llm, "_finish_reason", "") or ""
         if finish_reason:
             state.metadata["finish_reason"] = finish_reason
-        else:
-            state.metadata.pop("finish_reason", None)  # 无 finish_reason 时清除残留, 防止误报截断
         # 提升日志级别以便更容易诊断问题
         logger.info("[_node_llm] round=%d resp_len=%d tool_calls=%d mode=%s",
                     rounds, len(resp or ""), len(tool_calls), tool_call_mode)
@@ -1148,35 +1203,37 @@ class Agent:
             state.metadata["reasoning"] = reasoning
             state.emit({"type": "thinking", "content": reasoning, "reasoning": True})
 
-        # 网关诊断文案绝不进 state.messages(2026-09-20 二轮修正):
-        # 本轮有工具调用时,这句文案纯粹是 provider 拿诊断文本填空 text 块的噪音,
-        # 清空后照常执行工具;若留在上下文里,后续每轮的请求都会带着它,
-        # 而且会伪造出"模型确实说过这句话"的假象。无工具调用的情形交给
-        # _node_finalize 既有的空答案重试兜底(那里会标 gateway_error_answer)。
-        if resp and tool_calls:
-            from app.core.llm import _looks_like_gateway_error as _is_gw_echo
-            if _is_gw_echo(resp):
-                logger.warning(
-                    "[_node_llm] 丢弃网关诊断文案(round=%d, 同轮 %d 个工具调用): %r",
-                    rounds, len(tool_calls), resp[:120],
-                )
-                state.metadata["gateway_error_echo"] = resp[:200]
-                resp = ""
-
         if tool_call_mode == "native" and tool_calls:
             state.messages.append({
                 "role": "assistant",
                 "content": resp or "",
                 "tool_calls": [tc.to_openai() for tc in tool_calls],
             })
-            # thinking 事件只发"非正文"的思考内容: 流式模式下 resp 的 token 已经
-            # 通过 _call_llm_stream 的 token 事件实时渲染到答案区, 再发一遍会造成
-            # 内容显示两遍; 非流式模式则保留 thinking 事件供前端折叠展示
-            if resp and not state.metadata.get("stream"):
-                state.emit({"type": "thinking", "content": resp})
+            # 注意: 流式模式下 resp 的 token 已通过 _call_llm_stream 的 token 事件
+            # 发送到 answer 区, 此处不再重复发射为 thinking 事件, 避免内容显示两遍
         elif tool_calls:
             state.messages.append({"role": "assistant", "content": resp or ""})
         # 无工具调用:最终回答由 finalize 节点处理
+        
+        # 记录用量并存入语义缓存(仅首轮、无工具调用、非流式)
+        if self._cost_controller and rounds == 0 and not tool_calls and not is_stream:
+            try:
+                # 从 LLM 客户端获取 token 用量
+                usage = getattr(self.llm, "_last_usage", None)
+                if usage:
+                    input_tokens = usage.get("prompt_tokens", 0)
+                    output_tokens = usage.get("completion_tokens", 0)
+                    self._cost_controller.end_request(input_tokens, output_tokens, {"round": rounds})
+                # 缓存回答
+                last_user = ""
+                for msg in reversed(state.messages):
+                    if msg.get("role") == "user":
+                        last_user = msg.get("content", "")
+                        break
+                if last_user and resp:
+                    self._cost_controller.cache_response(last_user, resp)
+            except Exception as e:
+                logger.debug("成本记录/缓存失败: %s", e)
 
     async def _node_tools(self, state: AgentState, graph: Graph) -> Optional[str]:
         """执行一批工具调用(并行)、回喂结果、更新计划、注入反思。终端工具成功则结束。
@@ -1252,23 +1309,6 @@ class Agent:
             })
         state.metadata["tool_seq"] = tool_seq + len(batch)
 
-        # 输出触顶提醒:本轮 finish_reason=length 时,长参数很可能在半途被切断
-        # (网关会把残缺 JSON 补齐成"合法"参数放行,所以下游不一定报错)。
-        # 只在确有"大参数"调用时提示,避免每轮刷屏;引导模型改道分段写文件。
-        if state.metadata.get("finish_reason") == "length":
-            big = sorted({tc.name for tc in tool_calls if len(tc.arguments or "") > 1200})
-            if big:
-                state.messages.append({
-                    "role": "system",
-                    "content": (
-                        "提示:上一轮输出达到长度上限(finish_reason=length),"
-                        + "、".join(big)
-                        + " 的参数可能不完整。若代码/文件内容被截断,不要原样重试 —— "
-                        "请改用 write_file 分段写入文件(可多次追加),再用 run_terminal 执行;"
-                        "或把单次输出缩短到 100 行以内。"
-                    ),
-                })
-
         # 防止 state.messages 无限增长导致 context_length 错误
         self._trim_state_messages(state)
 
@@ -1286,27 +1326,6 @@ class Agent:
                 for ch in answer:
                     state.emit({"type": "token", "content": ch})
             return END
-
-        # 连续失败检测:同一工具+同一参数连续失败3次才终止(避免路径错误直接放弃)
-        # 失败计数挂在 Agent 实例的 metadata 上(跨运行共享), 每次 tools 轮次前重置,
-        # 成功时清零对应条目
-        for tc, result_str, is_err in batch:
-            # 失败键:用工具名 + 参数前 200 字符(稳定、可读、可跨进程复现),
-            # 而非内置 hash()——后者受 PYTHONHASHSEED 随机化、同一进程内不同
-            # 参数也可能 %100000 同桶,导致不同参数的失败互相串号、3 连败误判。
-            key = (tc.name, (tc.arguments or "")[:200])
-            if is_err:
-                self._tool_failure[key] = self._tool_failure.get(key, 0) + 1
-            else:
-                # 成功则清除该工具的所有失败计数(重置)
-                self._tool_failure = {k: v for k, v in self._tool_failure.items() if k[0] != tc.name}
-        for (tname, targs), fail_count in self._tool_failure.items():
-            if fail_count >= 3:
-                logger.warning("consecutive failure detected: tool=%s args=%s fails=%d, forcing finalize",
-                               tname, targs[:80], fail_count)
-                state.metadata["giveup"] = True
-                state.metadata["giveup_reason"] = "tool_failures"
-                return None
 
         # 计划失败后重新规划:同工具连续失败达阈值时,基于失败原因生成修订版计划
         if await self._maybe_replan(state, batch):
@@ -1332,83 +1351,63 @@ class Agent:
             answer = state.metadata.get("reasoning", "") or ""
             if answer:
                 logger.info("[_node_finalize] resp 为空,使用 reasoning 作为 answer (len=%d)", len(answer))
-            # 如果仍然为空,注入提示让 LLM 生成最终回答(流式/非流式都补调)
-            if not answer:
-                logger.info("[_node_finalize] resp 和 reasoning 均为空,补调 LLM 生成回答")
+            # 如果仍然为空，非流式模式下补一次 LLM 调用（带超时保护）
+            if not answer and not state.metadata.get("stream"):
                 try:
-                    # 追加提示消息,要求基于工具结果给出总结
-                    state.messages.append({
-                        "role": "user",
-                        "content": "请基于以上工具执行结果,给出最终回答。直接输出回答内容,不要调用工具。"
-                    })
                     answer = await asyncio.wait_for(
                         self.llm.chat(state.messages, temperature=self.temperature),
                         timeout=float(getattr(settings, "agent_llm_timeout", 60) or 60)
                     )
-                    # 流式模式:补调结果需要手动发射 token
-                    if state.metadata.get("stream") and answer:
-                        for ch in answer:
-                            state.emit({"type": "token", "content": ch})
-                except (asyncio.TimeoutError, Exception) as e:
-                    logger.warning("finalize 阶段补调 LLM 失败: %s", e)
-                    answer = "抱歉,我无法生成有效回答。请简化需求或提供更多背景信息。"
+                except asyncio.TimeoutError:
+                    logger.warning("finalize 阶段 LLM 补调用超时")
 
         # 输出 token 配额硬控制
         if self.max_output_tokens > 0 and answer:
             full, truncated = _truncate_to_token_budget(answer, self.max_output_tokens, self.llm)
             if truncated:
-                # 截断提示不进 thinking 流:它是答案的元信息,前端在答案区已能看到
-                # "[已达输出配额上限...]" 后缀。thinking 区只保留模型真实推理。
                 answer = full + "\n...[已达输出配额上限,回答已截断]"
+                if state.metadata.get("stream"):
+                    state.emit({"type": "thinking",
+                                "content": f"[已达输出配额上限 {self.max_output_tokens} token,回答已截断]"})
 
         state.answer = answer
-        # 剥离 LLM 内部 XML 标签,确保存储的答案不含内部内容
+        # 剥离 <thinking>...</thinking> 标签,确保存储的答案不含思考内容
         if state.answer:
-            # 丢弃完整的 thinking/system/plan 等块
-            for tag in ('thinking', 'system', 'plan', 'phase', 'analysis',
-                        'reflection', 'context', 'instruction', 'output', 'reasoning'):
-                state.answer = re.sub(r'<' + tag + r'[^>]*>[\s\S]*?</' + tag + r'>', '', state.answer, flags=re.IGNORECASE)
-            # 清理残留的孤立标签
-            for tag in ('thinking', 'system', 'plan', 'phase', 'analysis',
-                        'reflection', 'context', 'instruction', 'output', 'reasoning'):
-                state.answer = re.sub(r'<' + tag + r'[^>]*>', '', state.answer, flags=re.IGNORECASE)
-                state.answer = re.sub(r'</' + tag + r'>', '', state.answer, flags=re.IGNORECASE)
+            # 丢弃完整的 thinking 块（思考过程），保留正文
+            state.answer = re.sub(r'<thinking[^>]*>[\s\S]*?</thinking>', '', state.answer, flags=re.IGNORECASE)
+            # 清理可能残留的孤立标签
+            state.answer = re.sub(r'<thinking[^>]*>', '', state.answer, flags=re.IGNORECASE)
+            state.answer = re.sub(r'</thinking>', '', state.answer, flags=re.IGNORECASE)
             # 规范化空白
             state.answer = state.answer.strip()
             state.answer = re.sub(r'[ \t]+', ' ', state.answer)
             state.answer = re.sub(r'\n{3,}', '\n\n', state.answer)
-        # 上游网关校验错误被当正文回包的兜底标记(2026-09-20 "答案变成一句报错"):
-        # 整段答案就是 "empty content block is not allowed" / "empty message" 这类
-        # 网关校验文案时,标记为无效答案,由 _route_finalize 按空答案重试,
-        # 而不是当成正常回答展示/落库。
-        # 主修在 llm._StreamHeadGuard(流式路径根本不会产出这段文本);这里是最后一道网,
-        # 覆盖非流式/异常路径。触发条件在 provider 侧(实测重放同一请求即恢复)。
-        from app.core.llm import _looks_like_gateway_error as _is_gw_err
-        if state.answer and _is_gw_err(state.answer):
-            logger.warning("上游网关校验错误被当正文回包,按无效答案重试: %r", state.answer[:120])
-            state.metadata["gateway_error_answer"] = state.answer[:200]
-        # 空答案最终兜底
-        if not state.answer:
-            state.answer = "抱歉,我无法生成有效回答。请简化需求或提供更多背景信息。"
+
+        # 拦截"没解析成功的工具调用块"被当成最终答案(实证见 _looks_like_unparsed_tool_call)
+        if _looks_like_unparsed_tool_call(state.answer):
+            logger.warning("[_node_finalize] 答案为未解析的工具调用块,已替换为提示: %r",
+                           state.answer[:200])
+            state.metadata["unparsed_tool_call"] = True
+            replacement = (
+                "本轮中止：模型输出的工具调用没有带上可执行参数,已拦截以免显示成原始标记。\n\n"
+                "建议:重试一次;若反复出现,把任务拆成更小的步骤描述。"
+            )
+            state.answer = replacement
+            if state.metadata.get("stream"):
+                # token 已逐字发出:复用 guardrail_overwrite 让前端覆盖已渲染正文
+                state.emit({
+                    "type": "guardrail_overwrite",
+                    "content": replacement,
+                    "reasons": ["unparsed_tool_call"],
+                    "stream_replaced": True,
+                })
+
         state.steps.append({"step": step + 1, "type": "answer", "content": state.answer})
 
         # 输出护栏:敏感信息/提示词泄露检测(流式模式也强制拦截, 通过 guardrail_overwrite 事件更正)
         from app.core.guardrails import run_output_guardrails
 
-        out_guard = run_output_guardrails(
-            answer,
-            user_terms=self._rule_terms,
-            user_terms_action=self._rule_terms_action,
-        )
-        # warn-action 规则:仅记录命中,不拦截
-        if self._rule_warn_terms:
-            warn_out = run_output_guardrails(
-                answer, user_terms=self._rule_warn_terms, user_terms_action="warn",
-            )
-            if warn_out.violations:
-                state.metadata.setdefault("guardrail_warn_violations", []).extend(
-                    v.__dict__ for v in warn_out.violations
-                )
+        out_guard = run_output_guardrails(answer)
         if out_guard.blocked:
             sanitized = next((v.sanitized for v in out_guard.violations if v.sanitized), None)
             replacement = sanitized or "回答包含敏感信息, 已由安全护栏拦截并脱敏。"
@@ -1428,12 +1427,32 @@ class Agent:
 
         await self._maybe_auto_memory(state.user_input, state.answer, state.metadata.get("history", []) or [])
 
+        # 成本预算实时状态注入上下文(供下一轮感知)
+        if self._cost_controller:
+            try:
+                task_id = getattr(self, "_current_task_id", "")
+                cost_note = self._cost_controller.build_cost_note(self.session_id, task_id)
+                if cost_note:
+                    # 注入到系统提示或作为 thinking 事件透出
+                    state.emit({"type": "thinking", "content": cost_note, "phase": "cost"})
+            except Exception as e:
+                logger.debug("成本注入失败: %s", e)
+
+        # 记忆固化:每轮对话后提取关键决策/代码片段存入 SQLite + 向量索引
+        if self._memory_consolidator and state.metadata.get("history"):
+            try:
+                history = state.metadata.get("history", [])
+                await consolidate_memory(self.session_id, history, user_id="default")
+                logger.debug("记忆固化完成: session=%s", self.session_id[:8])
+            except Exception as e:
+                logger.warning("记忆固化失败: %s", e)
+
     async def _node_giveup(self, state: AgentState, graph: Graph) -> None:
         """达到步数上限/调用失败等:给出兜底回答,附带失败细节帮助用户重新尝试。
 
-        修复: 旧版一律报"已尝试 {max_steps} 步",即使实际只跑了 1 轮就因
-        LLM 调用失败而中止——对用户是误导。现在按 metadata.giveup_reason
-        区分真实原因,并展示实际执行轮数。
+        旧版一律报"已尝试 {max_steps} 步",即使实际只跑了 1 轮就因 LLM 调用失败
+        而中止——对用户是误导。现按 metadata.giveup_reason 区分真实原因,并展示
+        实际执行轮数。
         """
         reason = state.metadata.get("giveup_reason", "")
         actual_rounds = int(state.metadata.get("llm_rounds", 0) or 0)
@@ -1478,7 +1497,7 @@ class Agent:
                     state.emit({"type": "token", "content": ch})
             return
 
-        # steps_exhausted / tool_failures / 其它: 保留原有"步数"口径,但用实际轮数补充说明
+        # steps_exhausted / tool_failures / 其它:保留"步数"口径,但用实际轮数补充说明
         # 从 _failures 提取失败工具摘要
         failed_tools = []
         for name, count in sorted(state._failures.items(), key=lambda x: -x[1])[:3]:
@@ -1592,15 +1611,6 @@ class Agent:
             results = await asyncio.gather(*[a.run(user_input, history) for _, a in agents])
         except Exception as e:  # noqa: BLE001
             return AgentResult(answer=f"ensemble 执行失败: {e}", steps=[], model=self.llm.info["model"])
-        finally:
-            # 关闭子 Agent 各自构造的 LLM 客户端(含底层 httpx 连接池)。
-            # 修复: 每次 ensemble 运行会 new agent_ensemble_max 个 LLMClient,
-            # 旧实现从不 close,连接池随并发数累积泄漏。
-            for _spec, sub in agents:
-                try:
-                    await sub.llm.aclose()
-                except Exception:  # noqa: BLE001
-                    pass
 
         # 各子 Agent 的轨迹合并为 steps,便于可观测
         # 用配对列表(spec, agent, result)而非 zip(specs, results),避免创建失败跳过导致的下标错位
@@ -1682,11 +1692,6 @@ class Agent:
             return None
         winner = int(verdict.get("winner", 0))
         if not (0 <= winner < len(results)):
-            # 评审模型给出的 winner 越界: 旧实现静默回退到候选 0,
-            # 会让"评审实际选了第 2 名"这个事实被掩盖(用户以为选了最优)。
-            # 现在: 记录越界 + 回退, 便于日志定位"评审输出不稳定"。
-            logger.warning("ensemble winner=%d 越界(候选数=%d),回退到候选 0",
-                         winner, len(results))
             winner = 0
         return results[winner]
 
@@ -1951,24 +1956,13 @@ class Agent:
         })
         if verdict == "rewrite" and issues:
             # 只在实际问题需要修正时才重写，避免对正确答案的过度修改
-            # 截断/不完整类问题也必须重写:模型可能中途停止生成(finish_reason=stop
-            # 但句子戛然而止),唯一发现它的就是本评审层,不能被关键词过滤掉
             critical_issues = [i for i in issues if any(kw in str(i) for kw in
-                ["错误", "幻觉", "不实", "不正确", "矛盾", "缺失关键",
-                 "截断", "不完整", "未完成", "突然停止", "没有回答", "无法回答"])]
-            # 去掉"评分<=3 就当严重问题"的激进分支:评分偏低但只涉及主观建议
-            # (语气/格式/详细程度)时不应触发整段重写——否则每次回答都会被清屏重写,
-            # 前端表现为"答案闪一下又变"(answer_reset),且额外付出一次完整生成。
-            # 只有命中上述确凿关键词(事实错误/幻觉/截断/不完整)才重写。
+                ["错误", "幻觉", "不实", "不正确", "矛盾", "缺失关键"])]
             if not critical_issues:
                 # 只有主观建议时不重写，保持原答案
                 state.metadata["reflect_rewrite"] = False
                 return
             state.metadata["reflect_rewrite"] = True
-            # 流式模式:重写会重新生成完整答案,先通知前端清空已流出的部分答案,
-            # 否则旧截断片段 + 新完整答案会拼接显示(内容重复观感)
-            if state.metadata.get("stream"):
-                state.emit({"type": "answer_reset"})
             state.messages.append({"role": "user", "content":
                 "请根据以下反馈修正回答中的事实错误：\n- "
                 + "\n- ".join(str(i) for i in critical_issues)
@@ -2115,86 +2109,32 @@ class Agent:
             return {"type": "tool_route", "tools": cached.tools, "reason": cached.reason, "cached": True}
 
         # 使用智能路由(关键词+embedding+LLM 三级缓存 + 置信度评分)
-        # 第三级 LLM 路由: 通过 llm_adapter 统一抽象 select_tools 对 LLM 的结构化调用,
-        # 避免 LLMClient.chat_json_schema 回退到 LLMClient.chat(需要真实 client),
-        # 让自定义 LLM(Mock 子类 / LLMClient 子类) 的 chat_json / chat_json_schema
-        # 都能被调用, 同时保留 LLMClient 完整行为。
-        from app.core.smart_router import select_tools_enhanced
-
-        # 优先用底层 LLM 的 chat_json(如果 Mock/自定义 LLM 已覆写),
-        # 否则走 LLMClient 的 chat_json_schema(原生 OpenAI 客户端)。
-        # 这样 select_tools 内部对 llm.chat_json 的 hasattr 判断能命中 Mock 子类,
-        # 而 LLMClient 仍走原生的结构化输出链路(不破坏原生响应)。
-        adapter_llm = self.llm
-        selected: list[str] = []
-        conf = 0.0
-        reason = ""
         try:
+            from app.core.smart_router import select_tools_enhanced
             # 添加超时保护
             route_timeout = 30.0
             selected, conf, reason = await asyncio.wait_for(
                 select_tools_enhanced(
-                    adapter_llm, user_input, self.registry,
+                    self.llm, user_input, self.registry,
                     max_tools=max_tools,
                     min_confidence=min_confidence,
                     user_tech_stack=getattr(self, "_tech_stack", []),
                 ),
                 timeout=route_timeout
             )
+            if selected and conf >= min_confidence:
+                self._active_tools = selected
+                self._schemas_cache = None
+                # 写入缓存
+                await cache.set(user_input, selected, conf, reason)
+                steps.append({"step": step, "type": "tool_route", "tools": selected, "reason": reason})
+                return {"type": "tool_route", "tools": selected, "reason": reason}
         except asyncio.TimeoutError:
             logger.warning("智能工具路由超时，回退到全量工具集")
-            selected, conf, reason = [], 0.0, "route_timeout"
         except Exception as e:  # noqa: BLE001
             logger.warning("智能工具路由失败，回退到全量工具集: %s", e)
-            selected, conf, reason = [], 0.0, f"route_error: {str(e)[:80]}"
 
-        # 改进: 路由结果过少(< 3 个)时自动补充兜底工具,避免模型缺少关键工具
-        # 使用 LLM 路由(LLM 路由是三级兜底的最后一级,结果少通常意味着任务简单)
-        if reason.startswith("llm_fallback") or conf < min_confidence:
-            selected = self._supplement_routing(selected, conf, user_input, max_tools)
-            reason = f"supplemented({reason})"
-            conf = max(conf, 0.5)
-
-        if not selected:
-            return None
-
-        self._active_tools = selected
-        self._schemas_cache = None
-        # 写入缓存
-        await cache.set(user_input, selected, conf, reason)
-        steps.append({"step": step, "type": "tool_route", "tools": selected, "reason": reason})
-        return {"type": "tool_route", "tools": selected, "reason": reason}
-
-    def _supplement_routing(self, selected: list[str], conf: float, user_input: str, max_tools: int) -> list[str]:
-        """路由结果过少时补充兜底工具。
-
-        策略: 优先保留已选工具,补充常用核心工具(read_file/write_file/edit_file/
-        run_code/web_search/search_files 等)至至少 3 个(不超 max_tools)。
-        """
-        from app.tools.categories import get_category
-
-        if len(selected) >= 3:
-            return selected
-        all_tools = self.registry.list_sync()
-        priority = [
-            "read_file", "write_file", "edit_file", "list_directory",
-            "search_files", "run_code", "web_search", "fetch_webpage",
-            "query_sqlite", "generate_image",
-        ]
-        known = {t.name for t in all_tools}
-        active = list(selected)
-        for name in priority:
-            if len(active) >= 3:
-                break
-            if name in known and name not in active and name not in SYSTEM_TOOLS:
-                active.append(name)
-        # 仍不足 3 个:从全部工具中按注册顺序补足
-        for t in all_tools:
-            if len(active) >= 3:
-                break
-            if t.name not in active and t.name not in SYSTEM_TOOLS and t.enabled:
-                active.append(t.name)
-        return active[:max_tools] if max_tools else active
+        return None
 
     async def _call_llm(self, messages: list[dict]) -> tuple[str, str, list[ToolCall]]:
         """调用 LLM。返回 (mode, content, tool_calls)。
@@ -2233,178 +2173,61 @@ class Agent:
         return "text", resp, tool_calls
 
 
-    async def _stream_pass(
-        self,
-        messages: list[dict],
-        state: AgentState,
-        native: bool,
-        sink: list,
-    ) -> tuple[str, str, list["ToolCall"]]:
-        """一遍流式调用:token/思考事件实时 emit,文本片段追加进 sink。
-
-        sink 由调用方持有 —— 流中途抛错时,已实时显示给用户的片段就在里面,
-        供上层做"断点续写"(而不是丢弃重来)。
-        """
-        if native:
-            result_holder: dict = {"result": None}
-            async for item in self.llm.chat_stream_with_tools(
-                messages, tools=self._schemas, temperature=self.temperature,
-                result_holder=result_holder,
-            ):
-                if isinstance(item, dict):
-                    state.emit(item)
-                else:
-                    sink.append(item)
-                    state.emit({"type": "token", "content": item})
-            result = result_holder["result"]
-            full = "".join(sink)
-            if result and result.tool_calls:
-                return "native", result.content or full, result.tool_calls
-            tool_calls = self._parse_tool_calls(full)
-            if not tool_calls:
-                return "native", full, []
-            return "text", full, tool_calls
-
-        async for tok in self.llm.chat_stream(messages, temperature=self.temperature):
-            if isinstance(tok, dict):
-                state.emit(tok)
-                continue
-            sink.append(tok)
-            state.emit({"type": "token", "content": tok})
-        full = "".join(sink)
-        tool_calls = self._parse_tool_calls(full)
-        return "text", full, tool_calls
-
-    async def _stream_round(
-        self, messages: list[dict], state: AgentState, native: bool, prefix: str = ""
-    ) -> tuple[str, str, list["ToolCall"]]:
-        """一"回合"流式调用:逐段产出 + 输出完整性守卫(没写完就自动续写)。
-
-        续写策略(2026-09-20 "输出中断"根因修复):检测到答案没写完时,把**已输出内容**
-        作为 assistant 前缀回灌,附一条"从断点继续"的 user 提示再请求一次;
-        新一轮 token 直接追加渲染(不发 answer_reset,前端不需要清屏),
-        最终返回拼接后的完整文本。最多续写 agent_answer_continue_max 次。
-
-        prefix: 界面上已经显示过的前文(上一轮断流后重入时传入),
-        只用于失败时写回 partial_answer,不参与本次拼接。
-        """
-        max_continue = max(0, int(getattr(settings, "agent_answer_continue_max", 0) or 0))
-        mode = "native" if native else "text"
-        acc = ""
-        round_msgs = list(messages)
-        for attempt in range(max_continue + 1):
-            sink: list = []
-            try:
-                mode, text, tool_calls = await self._stream_pass(round_msgs, state, native, sink)
-            except Exception:
-                # 已在界面上输出的内容存进 metadata,供 _node_llm 续写而非整轮重生成
-                state.metadata["partial_answer"] = prefix + acc + "".join(sink)
-                raise
-            piece = text or "".join(sink)
-            if attempt == 0:
-                acc = piece
-            else:
-                piece = _strip_continuation_overlap(acc, piece)
-                if piece.strip() and piece.strip() in _CONTINUE_DONE_MARKERS:
-                    # 模型确认上一条其实已写完:哨兵内容不追加,直接收尾
-                    return mode, acc, tool_calls
-                acc += piece
-            if tool_calls:
-                return mode, acc, tool_calls
-            truncated, why = _answer_looks_truncated(acc, self.max_output_tokens)
-            if not truncated:
-                return mode, acc, []
-            if attempt >= max_continue:
-                logger.warning("回答疑似未写完(%s),已达自动续写上限 %d 次,按现状收尾", why, max_continue)
-                return mode, acc, []
-            logger.info("回答疑似被截断(%s,len=%d),自动续写第 %d 次", why, len(acc), attempt + 1)
-            state.metadata["answer_continue_count"] = attempt + 1
-            state.emit({
-                "type": "status",
-                "content": f"检测到回答未写完,正在自动续写剩余内容({attempt + 1}/{max_continue})…",
-            })
-            round_msgs = list(messages) + [
-                {"role": "assistant", "content": acc},
-                {"role": "user", "content": _CONTINUE_PROMPT},
-            ]
-        return mode, acc, []
-
     async def _call_llm_stream(
-        self, messages: list[dict], state: AgentState, prefix: str = ""
+        self, messages: list[dict], state: AgentState
     ) -> tuple[str, str, list["ToolCall"]]:
-        """流式调用 LLM:逐 token 发射事件,同时收集完整结果用于路由。
-
-        降级规则(保持原语义):建连前失败(collected 为空)才降级 text 模式;
-        流中途失败(已有 token 输出)直接上抛 —— 降级会重发整个请求导致内容重复。
-        prefix: 界面上已经显示过的前文(断流重入续写时传入)。
-        """
-        state.metadata.pop("partial_answer", None)
+        """流式调用 LLM:逐 token 发射事件,同时收集完整结果用于路由。"""
         if self._native_enabled:
             try:
-                return await self._stream_round(messages, state, native=True, prefix=prefix)
+                result_holder: dict = {"result": None}
+                collected: list = []
+                async for item in self.llm.chat_stream_with_tools(
+                    messages, tools=self._schemas, temperature=self.temperature,
+                    result_holder=result_holder,
+                ):
+                    if isinstance(item, dict):
+                        state.emit(item)
+                    else:
+                        collected.append(item)
+                        state.emit({"type": "token", "content": item})
+                result = result_holder["result"]
+                if result and result.tool_calls:
+                    return "native", result.content or "", result.tool_calls
+                full = "".join(collected)
+                tool_calls = self._parse_tool_calls(full)
+                if not tool_calls:
+                    return "native", full, []
+                return "text", full, tool_calls
             except LLMError as e:
                 # 流中途空闲/总时长超时:此时可能已向用户吐出部分 token,
-                # 降级到 text 模式会重新发起整个 LLM 请求,导致已输出内容重复 + 卡顿翻倍;
-                # 也不能静默吞掉错误(会造成"流正常结束"的假象,用户无法感知超时)。
-                # 区分: 建连前失败(未输出任何内容)可安全降级; 流中途失败直接上抛。
-                if state.metadata.get("partial_answer"):
-                    logger.warning(
-                        "native 流式中途失败(已输出 %d 字符),不再降级: %s",
-                        len(state.metadata.get("partial_answer") or ""), e,
-                    )
+                # 降级到 text 模式会重新发起整个 LLM 请求,导致已输出内容重复 + 卡顿翻倍。
+                # 区分: 建连前失败(collected 为空,未输出任何内容)可安全降级; 流中途失败必须直接上抛。
+                if collected:
+                    logger.warning("native 流式中途失败(已输出 %d 段内容),不再降级: %s", len(collected), e)
                     raise
                 logger.warning("native 模式建连/调用失败,自动降级: %s", e)
                 self._disable_native()
             except Exception as e:  # noqa: BLE001
-                if state.metadata.get("partial_answer"):
-                    raise
                 logger.warning("native 模式调用失败，自动降级: %s", e)
                 self._disable_native()
 
         # 文本模式流式
         try:
-            return await self._stream_round(messages, state, native=False, prefix=prefix)
+            collected: list = []
+            async for tok in self.llm.chat_stream(messages, temperature=self.temperature):
+                if isinstance(tok, dict):
+                    state.emit(tok)
+                    continue
+                collected.append(tok)
+                state.emit({"type": "token", "content": tok})
+            full = "".join(collected)
+            tool_calls = self._parse_tool_calls(full)
+            if not tool_calls:
+                return "text", full, []
+            return "text", full, tool_calls
         except Exception as e:  # noqa: BLE001
             logger.error("文本模式流式调用失败: %s", e)
             raise
-    @staticmethod
-    def _build_rule_blocked_note(rule_blocked_tools) -> str:
-        """构造"用户规则禁用工具"事实声明,追加到系统提示。
-
-        空集合 => 明确告知所有工具可用,且禁止 LLM 在没收到真实拒绝响应时谎称被禁用。
-        """
-        tools = sorted({str(t).strip() for t in (rule_blocked_tools or []) if t and str(t).strip()})
-        if tools:
-            body = (
-                "用户规则当前已禁用以下工具,调用它们会被系统直接拒绝,"
-                "请不要尝试调用,改用其他方式或直接告知用户该操作被禁止: " + "、".join(tools)
-            )
-        else:
-            body = (
-                "当前没有任何工具被用户规则禁用,所有工具均可正常调用。"
-                "若你未实际收到\"已被用户规则禁用\"的拒绝响应,不要向用户谎称某工具被规则禁用。"
-            )
-        return "\n\n[工具禁用状态·实时]" + body
-
-    @staticmethod
-    def _build_web_test_note(project_path) -> str:
-        """若当前项目是 H5/网页,提示 agent 改动前端后主动做冒烟测试(自动触发)。"""
-        try:
-            from app.tools.project_context import detect_project_type
-            info = detect_project_type(project_path)
-        except Exception:  # noqa: BLE001
-            return ""
-        if not info.get("is_web"):
-            return ""
-        fw = info.get("framework") or "web"
-        return (
-            "\n\n[项目类型·实时] 当前项目是 H5/网页项目(" + fw + ")。"
-            "当你完成前端代码改动(页面/组件/样式/路由/接口对接)后,应主动调用 web_auto_test 工具"
-            "(或 web_e2e_test 技能)做冒烟测试,并向上汇报:页面能否正常加载、有无 console 错误 / "
-            "页面异常 / 失败请求。若用户已提供运行中的 dev server 地址,直接传 url 参数;"
-            "否则让工具自动拉起 dev server(需目标机已安装 playwright)。"
-        )
-
     async def _execute_tool(self, name: str, arguments: str) -> str:
         """执行单个工具(带瞬态错误重试/退避),统一返回 JSON 字符串结果。"""
         if name in PLAN_TOOLS:
@@ -2420,11 +2243,13 @@ class Agent:
             return result
 
     async def _execute_tool_once(self, name: str, arguments: str) -> str:
-        # 用户规则硬拦截:被禁工具直接拒绝(优先于危险工具限流;空集合时不触发)
-        if self._rule_blocked_tools and name in self._rule_blocked_tools:
+        # 智能体硬规则:被显式禁止的工具一律拦下(放最前, 不执行任何工具逻辑)。
+        # 词/路径类硬规则(rule_terms/rule_paths)与 warn 类由输入输出护栏(guardrails)统一处理,
+        # 此处只拦"禁止的工具名", 避免和护栏重复实现打架。
+        if self.rule_blocked_tools and name in self.rule_blocked_tools:
+            logger.info("规则拦截工具: %s (rule_blocked_tools)", name)
             return json.dumps(
-                {"error": f"工具 {name} 已被用户规则禁用,请改用其他方式或告知用户该操作被禁止。",
-                 "blocked": True, "fatal": True, "ok": False},
+                {"error": f"工具 {name} 已被规则禁止执行。", "blocked": True},
                 ensure_ascii=False,
             )
         # 确保项目路径上下文在每次工具调用时都已设置(线程安全)
@@ -2465,6 +2290,17 @@ class Agent:
         t0 = time.time()
         tool = self.registry.get(name)
         if tool is None:
+            # 以前这里静默返回,排查"模型点了工具却说未知"时毫无线索。
+            # 记下注册表规模与若干可用工具名,便于定位是"注册表为空/另一实例"还是"名字拼错"。
+            try:
+                _known = [t.name for t in self.registry.list_sync()]
+            except Exception:  # noqa: BLE001
+                _known = []
+            logger.warning(
+                "未知工具: %s (registry=%s, 共 %d 个工具, 近似名: %s)",
+                name, type(self.registry).__name__, len(_known),
+                [k for k in _known if name[:6] in k or k[:6] in name][:10],
+            )
             return json.dumps({"error": f"未知工具: {name}"}, ensure_ascii=False)
 
         # 安全门禁:高风险操作必须等待用户人工批准(硬拦截,模型无法绕过)。
@@ -2504,6 +2340,16 @@ class Agent:
                         "status": status,
                         "ok": False,
                     }, ensure_ascii=False)
+
+        # 工具结果去重缓存:先查缓存,命中则直接返回,避免重复执行
+        # 只有当 cache_size > 0 时才启用缓存查找
+        max_cache_size = int(settings.agent_tool_cache_size or 0)
+        if max_cache_size > 0 and self._tool_cache is not None and name in self._tool_cache_safe:
+            key = (name, self._normalize_tool_args(arguments))
+            async with self._tool_cache_lock:
+                cached_result = self._tool_cache.get(key)
+                if cached_result is not None:
+                    return cached_result
 
         try:
             result = await tool.run(arguments)
@@ -2651,51 +2497,9 @@ class Agent:
 
         d_token = set_delegate_context(self.llm, self.session_id, self._active_tools)
         try:
-            batch_timeout = int(getattr(settings, "agent_tool_timeout", 0) or 0)
-            # 每个工具独立计时:某一路卡死/超时不再连坐整批。
-            # 旧实现用单个 wait_for 包整个 gather,超时后所有未完成任务被一并取消,
-            # 已完成工具的真实结果也被丢弃,统一记成"工具执行超时"——用户看到的
-            # 现象是"一个慢工具拖垮整批,会话卡住后报错"。
-            # 现在:各路独立计时,已完成的保留结果,超时的记成该工具的超时错误。
-            #
-            # ⚠ 语义修正(2026-09-23):agent_tool_timeout 的文档语义是「0=不限制」
-            # (见 config.py),旧实现却写成 `or 300` —— 0 被当成 300s,而且这个
-            # 外层上限会盖过工具自身声明的 timeout(generate_video=900 /
-            # generate_image=660),长耗时生成(视频动辄 300s+)因此在 300s 被判死。
-            # 更关键的是:被取消的只是 asyncio.to_thread 的 await,底层线程仍在后台
-            # 跑 —— 用户看到的现象正是「生成还在后台跑,但工具不等结果就结束了」。
-            # 现改为:0/负数 = 不套外层超时,由 registry.Tool.run 里各工具自身的
-            # timeout 兜底(工具内部超时能优雅返回,不会被硬取消);>0 才设上限。
-            if batch_timeout > 0:
-                results = await asyncio.gather(
-                    *[
-                        asyncio.wait_for(
-                            self._execute_tool(tc.name, tc.arguments),
-                            timeout=batch_timeout,
-                        )
-                        for tc in tool_calls
-                    ],
-                    return_exceptions=True,
-                )
-            else:
-                results = await asyncio.gather(
-                    *[self._execute_tool(tc.name, tc.arguments) for tc in tool_calls],
-                    return_exceptions=True,
-                )
-            normalized = []
-            for tc, r in zip(tool_calls, results):
-                if isinstance(r, asyncio.TimeoutError):
-                    logger.warning("工具 %s 执行超时(%ds)", tc.name, batch_timeout)
-                    normalized.append(json.dumps(
-                        {"error": f"工具 {tc.name} 执行超时({batch_timeout}s)"},
-                        ensure_ascii=False))
-                elif isinstance(r, BaseException):
-                    normalized.append(json.dumps(
-                        {"error": f"工具 {tc.name} 执行异常: {r}"},
-                        ensure_ascii=False))
-                else:
-                    normalized.append(r)
-            results = normalized
+            results = await asyncio.gather(
+                *[self._execute_tool(tc.name, tc.arguments) for tc in tool_calls]
+            )
         finally:
             _current_session.reset(token)
             from app.tools.delegation_tool import _delegate_parent
@@ -2712,6 +2516,40 @@ class Agent:
                 "result": result_str,
             })
             batch.append((tc, result_str, is_err))
+
+        # 自动验证钩子:文件写入类工具成功后触发 pytest/ruff/mypy
+        if self._verification_hook and not any(is_err for _, _, is_err in batch):
+            file_write_tools = {"write_file", "edit_file", "apply_patch", "code_edit_file"}
+            for tc, result_str, is_err in batch:
+                if tc.name in file_write_tools and not is_err:
+                    try:
+                        # 从参数中提取文件路径
+                        args = json.loads(tc.arguments) if isinstance(tc.arguments, str) else tc.arguments
+                        file_path = args.get("file_path") or args.get("path") or args.get("file")
+                        if file_path:
+                            logger.info("触发自动验证: %s -> %s", tc.name, file_path)
+                            verification_result = await run_verification_hook(file_path, self.project_path)
+                            if not verification_result.success:
+                                logger.warning(
+                                    "验证失败: pytest=%s ruff=%s mypy=%s",
+                                    verification_result.checks.get("pytest"),
+                                    verification_result.checks.get("ruff"),
+                                    verification_result.checks.get("mypy"),
+                                )
+                                # 将验证失败信息回喂给模型,触发自愈/反思
+                                steps.append({
+                                    "step": step + 1,
+                                    "type": "verification",
+                                    "tool": "auto_verify",
+                                    "result": {
+                                        "success": False,
+                                        "checks": verification_result.checks,
+                                        "stdout": verification_result.stdout[:2000],
+                                        "stderr": verification_result.stderr[:2000],
+                                    },
+                                })
+                    except Exception as e:
+                        logger.debug("验证钩子解析参数失败: %s", e)
         return batch
 
     # ---- 代码级自愈 ----
@@ -2735,11 +2573,6 @@ class Agent:
         max_rounds = max(1, int(settings.agent_code_heal_rounds or 1))
         # 带"修复后仍失败"标记的结果不再重复自愈(收敛),原样交给后续反思
         for tc, result_str, is_err in batch:
-            # 代码被输出上限截断:LLM 拿到的也只是残片,自愈修复不了(只会白烧一轮),
-            # 直接把"改用 write_file 分段写"的指引原样回给模型。
-            if _looks_truncated(result_str):
-                out.append((tc, result_str, is_err))
-                continue
             if not is_err or tc.name not in ("run_code", "run_terminal") \
                     or heal_rounds >= max_rounds or "heal_still_failing" in result_str:
                 out.append((tc, result_str, is_err))
@@ -2813,10 +2646,7 @@ class Agent:
                 return terminal
             stubborn = [n for n in set(error_names) if failures[n] >= 2]
             if stubborn:
-                hint = (
-                    "以下工具多次失败,请先用 list_directory/read_file 确认正确路径和文件内容,"
-                    "再用正确参数重试,不要重复相同的调用:" + "、".join(stubborn)
-                )
+                hint = "以下工具已连续失败,请不要再使用它们,改用其他工具或方案:" + "、".join(stubborn)
             else:
                 hint = (
                     "以下工具执行失败:" + "、".join(error_names)
@@ -3082,7 +2912,7 @@ class Agent:
         routed = build_routed_llm(user_input)
         if routed is not None:
             self.llm = routed
-            self._native_enabled = settings.agent_native_tools and hasattr(self.llm, "chat_with_tools")
+        self._native_enabled = settings.agent_native_tools and callable(getattr(self.llm, "chat_with_tools", None))
 
     async def _prepare_history(self, history: list[dict]) -> list[dict]:
         """历史超预算时,用摘要压缩旧消息(替代粗暴截断)。
@@ -3528,15 +3358,15 @@ class Agent:
             return None
         depth = 0
         in_string = False
+        escape = False
         i = start
         while i < len(text):
             ch = text[i]
-            if in_string and ch == "\\":
-                # 字符串内反斜杠转义:连同下一个字符一起跳过(必须跳 2 位,
-                # 否则循环尾部的 i += 1 会把转义目标也吞掉)
-                i += 2
-                continue
-            if ch == '"':
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
                 in_string = not in_string
             elif not in_string:
                 if ch == "{":

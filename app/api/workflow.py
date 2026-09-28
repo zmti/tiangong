@@ -4,8 +4,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -124,15 +126,39 @@ _workflows: dict[str, Workflow] = {}
 _executors: dict[str, WorkflowExecutor] = {}
 _runs: dict[str, dict[str, WorkflowRun]] = {}
 
-# SSE 实时事件缓冲
-_run_events: dict[str, list] = {}
-
 
 def _get_agent() -> Agent:
     global _agent
     if _agent is None:
         _agent = Agent()
     return _agent
+
+
+# 共享的 Checkpoint 管理器:所有工作流运行都持久化到 data/workflow_checkpoints.db。
+# 这是"断点续跑 / 跳过已成功节点"功能真正生效的前提——早期实现全传
+# WorkflowCheckpointManager("") (空路径),导致所有 save/load 都是 no-op。
+_checkpoint_mgr: Optional["WorkflowCheckpointManager"] = None
+
+
+def _get_checkpoint_mgr() -> "WorkflowCheckpointManager":
+    """返回(懒初始化)共享的节点级 Checkpoint 管理器。"""
+    global _checkpoint_mgr
+    if _checkpoint_mgr is None:
+        from app.core.workflow.checkpoint import WorkflowCheckpointManager
+        data_dir = Path(__file__).resolve().parents[2] / "data"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        _checkpoint_mgr = WorkflowCheckpointManager(str(data_dir / "workflow_checkpoints.db"))
+    return _checkpoint_mgr
+
+
+def _make_executor(on_node_event=None) -> "WorkflowExecutor":
+    """构造带 Checkpoint 持久化的执行器。
+
+    注意:agent 不通过构造器传入(早期代码误把 agent 当 on_node_event 传,
+    导致非流式运行每次发事件都调用 Agent 对象并抛出被吞掉的异常)。
+    agent 由 run() 显式接收。
+    """
+    return WorkflowExecutor(on_node_event=on_node_event, checkpoint_mgr=_get_checkpoint_mgr())
 
 
 # ============================================================
@@ -149,10 +175,9 @@ async def startup():
     init_db()
     db = get_db()
     workflows = db.load_all_workflows()
-    agent = _get_agent()
     for wf in workflows.values():
         _workflows[wf.id] = wf
-        _executors[wf.id] = WorkflowExecutor(agent)
+        _executors[wf.id] = _make_executor()
     logger.info(f"已加载 {len(workflows)} 个工作流")
 
 
@@ -178,16 +203,14 @@ def _load_workflow(workflow_id: str) -> Optional[Workflow]:
     wf = db.load_workflow(workflow_id)
     if wf:
         _workflows[workflow_id] = wf
-        agent = _get_agent()
         if workflow_id not in _executors:
-            _executors[workflow_id] = WorkflowExecutor(agent)
+            _executors[workflow_id] = _make_executor()
     return wf
 
 
 def _ensure_executor(workflow_id: str) -> WorkflowExecutor:
-    agent = _get_agent()
     if workflow_id not in _executors:
-        _executors[workflow_id] = WorkflowExecutor(agent)
+        _executors[workflow_id] = _make_executor()
     return _executors[workflow_id]
 
 
@@ -309,7 +332,7 @@ async def create_workflow(req: WorkflowCreateRequest):
         raise HTTPException(400, "; ".join(errors))
 
     _workflows[wf_id] = workflow
-    _executors[wf_id] = WorkflowExecutor(_get_agent())
+    _executors[wf_id] = _make_executor()
     _runs[wf_id] = {}
     get_db().save_workflow(workflow)
 
@@ -437,7 +460,7 @@ async def generate_workflow(req: WorkflowGenerateRequest):
         raise HTTPException(400, "; ".join(errors))
 
     _workflows[wf_id] = workflow
-    _executors[wf_id] = WorkflowExecutor(_get_agent())
+    _executors[wf_id] = _make_executor()
     _runs[wf_id] = {}
     get_db().save_workflow(workflow)
 
@@ -525,7 +548,7 @@ async def update_workflow(workflow_id: str, req: WorkflowUpdateRequest):
 
     wf.updated_at = time.time()
     _workflows[workflow_id] = wf
-    _executors[workflow_id] = WorkflowExecutor(_get_agent())
+    _executors[workflow_id] = _make_executor()
     get_db().save_workflow(wf)
     return {"id": workflow_id, "message": "工作流已更新"}
 
@@ -631,7 +654,7 @@ async def add_node(workflow_id: str, req: NodeCreateRequest):
     wf.add_node(node)
     wf.updated_at = time.time()
     _workflows[workflow_id] = wf
-    _executors[workflow_id] = WorkflowExecutor(_get_agent())
+    _executors[workflow_id] = _make_executor()
     get_db().save_workflow(wf)
     return {"id": req.node_id, "message": "节点已添加"}
 
@@ -686,7 +709,7 @@ async def update_node(workflow_id: str, node_id: str, req: NodeUpdateRequest):
 
     wf.updated_at = time.time()
     _workflows[workflow_id] = wf
-    _executors[workflow_id] = WorkflowExecutor(_get_agent())
+    _executors[workflow_id] = _make_executor()
     get_db().save_workflow(wf)
     return {"id": node_id, "message": "节点已更新"}
 
@@ -724,7 +747,7 @@ async def delete_node(workflow_id: str, node_id: str):
 
     wf.updated_at = time.time()
     _workflows[workflow_id] = wf
-    _executors[workflow_id] = WorkflowExecutor(_get_agent())
+    _executors[workflow_id] = _make_executor()
     get_db().save_workflow(wf)
     return {"deleted_node": node_id, "removed_edges": removed_edges, "message": f"节点 {node_id} 已删除"}
 
@@ -774,7 +797,7 @@ async def add_edge(workflow_id: str, req: EdgeCreateRequest):
     wf.add_edge(edge)
     wf.updated_at = time.time()
     _workflows[workflow_id] = wf
-    _executors[workflow_id] = WorkflowExecutor(_get_agent())
+    _executors[workflow_id] = _make_executor()
     get_db().save_workflow(wf)
     return {"id": edge.id, "message": "边已添加", "existing": False}
 
@@ -793,7 +816,7 @@ async def delete_edge(workflow_id: str, edge_id: str):
 
     wf.updated_at = time.time()
     _workflows[workflow_id] = wf
-    _executors[workflow_id] = WorkflowExecutor(_get_agent())
+    _executors[workflow_id] = _make_executor()
     get_db().save_workflow(wf)
     return {"message": "边已删除"}
 
@@ -843,17 +866,38 @@ async def run_workflow_stream(workflow_id: str, req: WorkflowRunStreamRequest):
         if existing_run.status == "running":
             raise HTTPException(409, "该工作流已有正在进行的运行,请等待完成或取消后重试")
 
-    # 清空并创建事件缓冲
-    _run_events[run_id] = []
+    # 实时事件队列(替代原来的 list 缓冲)。
+    # 原实现把事件 append 到 list,再用 `await wait_for(run_task)` 等整个工作流跑完才统一
+    # 吐出 —— async generator 在 await 期间一个字节都不会 yield,前端全程收不到任何节点事件,
+    # 只能在最后一刻哗地全涌出来(实测 8 条节点事件集中在 1ms 内到达,而运行耗时 6s)。
+    # 现改为队列驱动:节点事件一产生就入队,生成器边等边推。
+    event_queue: asyncio.Queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def _enqueue(evt: dict) -> None:
+        """节点事件入队。
+
+        回调可能来自非事件循环线程(如 script 节点跑在 to_thread 里),统一走
+        call_soon_threadsafe 保证线程安全;它的 FIFO 顺序同时保证了下面"终止负载
+        一定排在所有节点事件之后",不会丢事件。
+        """
+        try:
+            loop.call_soon_threadsafe(event_queue.put_nowait, evt)
+        except RuntimeError:
+            pass  # 事件循环已关闭(客户端断开),丢弃即可
 
     # 创建带回调的执行器
-    realtime_executor = WorkflowExecutor(on_node_event=lambda rid, nid, status, result=None, error=None: _run_events.get(rid, []).append({
-        "event": f"node_{status}",
-        "node_id": nid,
-        "status": status,
-        "result": result,
-        "error": error,
-    }))
+    realtime_executor = _make_executor(
+        on_node_event=lambda rid, nid, status, result=None, error=None: _enqueue({
+            "event": f"node_{status}",
+            "node_id": nid,
+            "status": status,
+            "result": result,
+            "error": error,
+        })
+    )
+
+    _TERMINAL = "__terminal__"
 
     async def _event_stream():
         # 启动运行任务
@@ -861,78 +905,107 @@ async def run_workflow_stream(workflow_id: str, req: WorkflowRunStreamRequest):
             realtime_executor.run(wf, req.inputs or {}, run_id=run_id, session_id=req.session_id, agent=_get_agent())
         )
 
-        # 发送运行开始事件
-        yield f"id: {run_id}\n"
-        yield f"event: run_start\n"
-        yield f"data: {json.dumps({'run_id': run_id, 'status': 'running'})}\n\n"
+        async def _await_run() -> dict:
+            """在后台等待运行结束并算出终止负载。
+
+            成功/超时/异常三条路径都会返回一个 dict,调用方把它放进队列。
+            它同时充当"收尾哨兵":因为它在 await 结束之后才入队,而所有节点事件在
+            await 结束之前就已请求入队,call_soon_threadsafe 的 FIFO 保证节点事件
+            一定排在它前面被取出,因此不需要 sleep 轮询,也不会丢最后的事件。
+            """
+            try:
+                run = await asyncio.wait_for(run_task, timeout=wf.timeout or 1800)
+                _runs.setdefault(workflow_id, {})[run_id] = run
+                get_db().save_run(run)
+                return {
+                    "event": "run_done",
+                    "data": {
+                        "run_id": run_id,
+                        "status": run.status,
+                        "duration": run.duration,
+                        "output": run.output,
+                        "error": run.error,
+                        "node_states": run.node_states,
+                        "history": run.history,
+                        "terminal": True,
+                    },
+                }
+            except asyncio.TimeoutError:
+                # 运行任务因超时被 wait_for 取消,把超时也记录进 run,便于前端/历史面板看到真实状态
+                run_task.cancel()
+                failed_run = WorkflowRun(
+                    run_id=run_id,
+                    workflow_id=wf.id,
+                    status="failed",
+                    session_id=req.session_id,
+                    error=f"运行超时({int(wf.timeout or 1800)}s)",
+                    started_at=time.time(),
+                    finished_at=time.time(),
+                )
+                _runs.setdefault(workflow_id, {})[run_id] = failed_run
+                get_db().save_run(failed_run)
+                return {
+                    "event": "run_error",
+                    "data": {"run_id": run_id, "error": "运行超时", "status": "failed", "terminal": True},
+                }
+            except Exception as e:
+                run_task.cancel()
+                failed_run = WorkflowRun(
+                    run_id=run_id,
+                    workflow_id=wf.id,
+                    status="failed",
+                    session_id=req.session_id,
+                    error=str(e),
+                    started_at=time.time(),
+                    finished_at=time.time(),
+                )
+                _runs.setdefault(workflow_id, {})[run_id] = failed_run
+                get_db().save_run(failed_run)
+                return {
+                    "event": "run_error",
+                    "data": {"run_id": run_id, "error": str(e), "status": "failed", "terminal": True},
+                }
+
+        async def _pump_terminal() -> None:
+            """等待运行结束后把终止负载放入队列,让主循环能收尾。"""
+            terminal = await _await_run()
+            await event_queue.put({_TERMINAL: True, "terminal": terminal})
+
+        awaiter = asyncio.create_task(_pump_terminal())
 
         try:
-            run = await asyncio.wait_for(run_task, timeout=wf.timeout or 1800)
-        except asyncio.TimeoutError:
-            # 运行任务因超时被 wait_for 取消,把超时也记录进 run,便于前端/历史面板看到真实状态
-            run_task.cancel()
-            run = WorkflowRun(
-                run_id=run_id,
-                workflow_id=wf.id,
-                status="failed",
-                session_id=req.session_id,
-                error=f"运行超时({int(wf.timeout or 1800)}s)",
-                started_at=time.time(),
-                finished_at=time.time(),
-            )
-            _runs.setdefault(workflow_id, {})[run_id] = run
-            get_db().save_run(run)
-            yield f"event: run_error\n"
-            yield f"data: {json.dumps({'run_id': run_id, 'error': '运行超时', 'status': 'failed', 'terminal': True})}\n\n"
-            return
-        except Exception as e:
-            run_task.cancel()
-            failed_run = WorkflowRun(
-                run_id=run_id,
-                workflow_id=wf.id,
-                status="failed",
-                session_id=req.session_id,
-                error=str(e),
-                started_at=time.time(),
-                finished_at=time.time(),
-            )
-            _runs.setdefault(workflow_id, {})[run_id] = failed_run
-            get_db().save_run(failed_run)
-            yield f"event: run_error\n"
-            yield f"data: {json.dumps({'run_id': run_id, 'error': str(e), 'status': 'failed', 'terminal': True})}\n\n"
-            return
+            # 发送运行开始事件
+            yield f"id: {run_id}\n"
+            yield f"event: run_start\n"
+            yield f"data: {json.dumps({'run_id': run_id, 'status': 'running'})}\n\n"
 
-        # 发送所有中间节点事件(跳过运行级 __run__ 事件,前端只关心具体节点状态,
-        # 避免历史面板把每次运行级事件也当成"节点失败"重复入栈)
-        events = _run_events.pop(run_id, [])
-        for evt in events:
-            if evt.get('node_id') == '__run__':
-                continue
-            yield f"event: {evt['event']}\n"
-            yield f"data: {json.dumps({
-                'run_id': run_id,
-                'node_id': evt['node_id'],
-                'status': evt['status'],
-                'result': evt.get('result'),
-                'error': evt.get('error'),
-            })}\n\n"
+            # 主泵:节点事件随到随推,直到拿到终止负载
+            while True:
+                evt = await event_queue.get()
+                if evt.get(_TERMINAL):
+                    terminal = evt["terminal"]
+                    break
+                # 跳过运行级 __run__ 事件,前端只关心具体节点状态,
+                # 避免历史面板把每次运行级事件也当成"节点失败"重复入栈
+                if evt.get("node_id") == "__run__":
+                    continue
+                yield f"event: {evt['event']}\n"
+                yield f"data: {json.dumps({
+                    'run_id': run_id,
+                    'node_id': evt['node_id'],
+                    'status': evt['status'],
+                    'result': evt.get('result'),
+                    'error': evt.get('error'),
+                })}\n\n"
 
-        # 发送最终状态(带 terminal=true 标记,前端据此只入栈一次运行历史)
-        yield f"event: run_done\n"
-        yield f"data: {json.dumps({
-            'run_id': run_id,
-            'status': run.status,
-            'duration': run.duration,
-            'output': run.output,
-            'error': run.error,
-            'node_states': run.node_states,
-            'history': run.history,
-            'terminal': True,
-        })}\n\n"
-
-        # 保存到内存和数据库
-        _runs.setdefault(workflow_id, {})[run_id] = run
-        get_db().save_run(run)
+            # 发送最终状态(带 terminal=true 标记,前端据此只入栈一次运行历史)
+            yield f"event: {terminal['event']}\n"
+            yield f"data: {json.dumps(terminal['data'])}\n\n"
+        finally:
+            # 客户端断开/生成器被取消时清理后台任务,避免留下孤儿 task 继续跑工作流
+            awaiter.cancel()
+            if not run_task.done():
+                run_task.cancel()
 
     return StreamingResponse(
         _event_stream(),
@@ -958,7 +1031,9 @@ async def run_workflow(workflow_id: str, req: WorkflowRunRequest):
         _runs[workflow_id] = {}
 
     executor = _ensure_executor(workflow_id)
-    run = await executor.run(wf, req.inputs or {}, run_id=run_id, session_id=req.session_id)
+    # 同步路径也必须传 agent,否则 Agent 节点会因拿不到 agent 实例报"Agent 未初始化"
+    # (与流式 /run/stream 一致)。这是此前遗留的 bug:脚本/第三方走同步接口调用工作流必挂。
+    run = await executor.run(wf, req.inputs or {}, run_id=run_id, session_id=req.session_id, agent=_get_agent())
 
     if workflow_id not in _runs:
         _runs[workflow_id] = {}
@@ -1203,7 +1278,7 @@ async def instantiate_template(template_id: str, req: TemplateInstantiateRequest
     workflow.updated_at = now
 
     _workflows[wf_id] = workflow
-    _executors[wf_id] = WorkflowExecutor(_get_agent())
+    _executors[wf_id] = _make_executor()
     _runs[wf_id] = {}
     get_db().save_workflow(workflow)
 
@@ -1321,8 +1396,7 @@ async def get_orchestration_status():
 @router.get("/{workflow_id}/runs/{run_id}/checkpoints")
 async def list_run_checkpoints(workflow_id: str, run_id: str):
     """获取运行的检查点列表。"""
-    from app.core.workflow.checkpoint import WorkflowCheckpointManager
-    mgr = WorkflowCheckpointManager("")
+    mgr = _get_checkpoint_mgr()
 
     checkpoints = mgr.get_all_checkpoints(run_id)
     return {
@@ -1339,8 +1413,7 @@ async def resume_workflow_run(workflow_id: str, run_id: str):
     if not wf:
         raise HTTPException(404, "工作流不存在")
 
-    from app.core.workflow.checkpoint import WorkflowCheckpointManager
-    mgr = WorkflowCheckpointManager("")
+    mgr = _get_checkpoint_mgr()
     skippable = mgr.get_skippable_nodes(run_id)
 
     if not skippable:
@@ -1382,8 +1455,7 @@ async def get_saga_status(run_id: str):
 @router.post("/cleanup/checkpoints")
 async def cleanup_checkpoints(max_age_hours: float = 24.0):
     """清理过期的检查点。"""
-    from app.core.workflow.checkpoint import WorkflowCheckpointManager
-    mgr = WorkflowCheckpointManager("")
+    mgr = _get_checkpoint_mgr()
     deleted = mgr.cleanup_old_checkpoints(max_age_hours=max_age_hours)
     return {"deleted": deleted, "max_age_hours": max_age_hours}
 
@@ -1505,7 +1577,7 @@ async def rollback_to_version(workflow_id: str, version_id: str):
     wf.edges = edges
     wf.updated_at = now
     _workflows[workflow_id] = wf
-    _executors[workflow_id] = WorkflowExecutor(_get_agent())
+    _executors[workflow_id] = _make_executor()
     get_db().save_workflow(wf)
     logger.info(f"工作流已回滚到版本: {version_id}")
     return {"message": f"已回滚到版本 {version_id}", "backup_version": backup_version}
@@ -1619,7 +1691,7 @@ async def import_workflow(req: WorkflowImportRequest):
         raise HTTPException(400, "; ".join(errors))
 
     _workflows[wf_id] = wf
-    _executors[wf_id] = WorkflowExecutor(_get_agent())
+    _executors[wf_id] = _make_executor()
     _runs[wf_id] = {}
     get_db().save_workflow(wf)
     logger.info(f"工作流已导入: {wf_id} ({wf.name})")

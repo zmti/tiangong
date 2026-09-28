@@ -192,11 +192,43 @@ App.Workflow = (() => {
     };
   }
 
-  function _snapToPort(cx, cy) {
+  const PORT_SNAP = 32;      // 端口吸附半径
+  const NODE_DROP_PAD = 12;  // 连线落点放宽到"节点整体"时的额外容差
+
+  /**
+   * 找出落点命中的节点 ID。
+   *
+   * 修复前只匹配"输出端口"(右缘中点) 32px 以内 —— 但连线时用户是往目标节点身上、
+   * 或它的左缘(输入口)拖放。NODE_W=140 时,节点中心距右缘有 70px,远超 32px;
+   * 落在左缘更是相距 140px。结果是:除了把光标精确丢在目标节点最右侧那条边上,
+   * 其它任何落点都连不上 —— 表现为"节点之间不能连接"。
+   *
+   * 现在:①优先命中输入/输出端口;②连线过程中(forConnect)放宽到整个节点范围。
+   */
+  function _snapToPort(cx, cy, forConnect = false) {
+    let best = null;
+    let bestDist = Infinity;
     for (const n of nodes) {
-      const px = n._x + NODE_W;
       const py = n._y + NODE_H / 2;
-      if (Math.hypot(cx - px, cy - py) < 32) return n.id;
+      // 输入端口(左缘)优先 —— 连线最常见的落点
+      const dIn = Math.hypot(cx - n._x, cy - py);
+      const dOut = Math.hypot(cx - (n._x + NODE_W), cy - py);
+      const d = Math.min(dIn, dOut);
+      if (d < PORT_SNAP && d < bestDist) {
+        best = n.id;
+        bestDist = d;
+      }
+    }
+    if (best) return best;
+
+    if (forConnect) {
+      // 拖到对方节点身上即视为连到该节点
+      for (const n of nodes) {
+        if (cx >= n._x - NODE_DROP_PAD && cx <= n._x + NODE_W + NODE_DROP_PAD &&
+            cy >= n._y - NODE_DROP_PAD && cy <= n._y + NODE_H + NODE_DROP_PAD) {
+          return n.id;
+        }
+      }
     }
     return null;
   }
@@ -341,7 +373,7 @@ App.Workflow = (() => {
       if (_tempLine) { _tempLine.remove(); _tempLine = null; }
       if (!svgEl) { _edgeDraw = null; return; }
       const c = _svgCoord(e);
-      const targetId = _snapToPort(c.x, c.y);
+      const targetId = _snapToPort(c.x, c.y, true);
       if (targetId && targetId !== _edgeDraw.sourceId) {
         _addEdge(_edgeDraw.sourceId, targetId);
       }
@@ -372,11 +404,11 @@ App.Workflow = (() => {
     }
     if ((e.ctrlKey || e.metaKey) && e.key === 's') {
       e.preventDefault();
-      saveWorkflow();
+      if (!e.repeat) saveWorkflow();   // 长按会连发 keydown,不加 e.repeat 会被反复保存
     }
     if ((e.ctrlKey || e.metaKey) && e.key === 'r') {
       e.preventDefault();
-      run(currentWorkflow?.id);
+      if (!e.repeat) run(currentWorkflow?.id);  // 同上:否则长按 Ctrl+R 一秒能连跑十几次
     }
     if (e.key === 'Escape') {
       selectedNodeId = null;
@@ -386,9 +418,12 @@ App.Workflow = (() => {
   });
 
   function _updateHoveredPort(e) {
-    if (!svgEl || _dragNode || _edgeDraw) return;
+    // 连线过程中也要高亮:让用户看得出"现在松手会连到哪个节点"
+    if (!svgEl || _dragNode) return;
     const c = _svgCoord(e);
-    const newHover = _snapToPort(c.x, c.y);
+    let newHover = _snapToPort(c.x, c.y, !!_edgeDraw);
+    // 连线时源节点自身不该显示为可连目标(自连会被 _addEdge 前的守卫拒绝)
+    if (_edgeDraw && newHover === _edgeDraw.sourceId) newHover = null;
     if (newHover !== _hoveredPort) {
       if (_hoveredPort) {
         const g = nodeElements.get(_hoveredPort);
@@ -428,8 +463,16 @@ App.Workflow = (() => {
   function renderNodes(svg, wf) {
     svg.querySelectorAll('.wf-node-group').forEach(el => el.remove());
     nodeElements.clear();
-    const total = (wf.nodes || []).length;
-    (wf.nodes || []).forEach((node, idx) => {
+    // 注意:必须遍历模块级 nodes(renderDesigner 里由 wf.nodes 克隆而来),而不是 wf.nodes。
+    // _layoutPosition 只在这里被调用,坐标 _x/_y 写在谁身上,谁才有坐标。以前这里传 wf.nodes,
+    // 于是 _x/_y 被写到"原始对象"上,而 renderEdges / _snapToPort / _getSnapOffset /
+    // _capturePositions 一律读模块级 nodes(克隆对象, _x 是 undefined)——结果:
+    //   ① renderEdges 算出 M NaN NaN 的路径 => 连线永远不可见(表现为"节点之间连不上");
+    //   ② _snapToPort 里 Math.hypot(cx - undefined) 恒为 NaN,任何比较都不成立 => 拖拽永远连不上;
+    //   ③ 拖完鼠标松开 _capturePositions 存进 _posCache 的也是空值 => 位置不落盘。
+    // 统一到同一批对象后,三处一起恢复。
+    const total = nodes.length;
+    nodes.forEach((node, idx) => {
       _layoutPosition(node, idx, total);
       const style = nodeStyle(node.type);
       const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
@@ -617,7 +660,14 @@ App.Workflow = (() => {
 
   document.addEventListener('click', e => {
     if (e.target.closest('.wf-node-group')) return;
-    if (e.target.closest('.wf-node-panel')) return;
+    /* 修复"点节点信息里的输入框,面板就消失":
+       面板实际类名是 .wf-properties(id=wfProperties), 而这里白名单写的却是历史遗留的
+       .wf-node-panel(页面里已经不存在)。于是点面板内任何控件,事件冒泡到 document 都被
+       判为"点了空白处" → closeNodePanel()。现直接按"事件目标是否在面板内"判定。 */
+    if (e.target.closest('.wf-properties')
+      || e.target.closest('.wf-node-panel')          /* 历史遗留类名,保留兼容 */
+      || e.target.closest('.wf-secondary-panels')    /* 版本/调度侧栏,点它不该顺带关掉节点面板 */
+      || e.target.closest('.wf-run-panel')) return;  /* 运行详情面板,同上 */
     selectedNodeId = null;
     nodeElements.forEach(g => g.querySelector('.node-rect')?.classList.remove('selected'));
     closeNodePanel();
@@ -936,9 +986,23 @@ App.Workflow = (() => {
     const name = await App.prompt?.('工作流名称:', '新建工作流');
     if (!name) return;
     try {
+      // 后端 create_workflow 有两道校验: ①entry_node 必须存在于 nodes 里;
+      // ②除 start 外的节点必须已有入边。所以旧的 { nodes: [], entry_node: '' } 必然 400
+      // ("入口节点  不存在"),表现为点"新建"永远创建失败。
+      // 最少合法形态就是"只带一个 start 节点",顺带让新画布自带"开始"节点。
+      const startId = 'start';
       const data = await _fetch('/v1/workflows', {
         method: 'POST',
-        body: JSON.stringify({ name, description: '', nodes: [], edges: [], entry_node: '' }),
+        body: JSON.stringify({
+          name,
+          description: '',
+          entry_node: startId,
+          edges: [],
+          nodes: [{
+            id: startId, type: 'start', name: '开始',
+            config: { timeout: 60 }, position: { x: 80, y: 80 },
+          }],
+        }),
       });
       App.toast?.('工作流已创建', 'ok');
       await load(data.id);

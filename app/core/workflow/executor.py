@@ -81,6 +81,11 @@ class WorkflowExecutor:
         Returns:
             WorkflowRun 运行结果
         """
+        # 每个 run() 复用同一个 executor 实例,必须在运行开始时重置 SAGA 状态,
+        # 否则上一轮已执行节点的补偿登记会残留,导致补偿误触发。
+        if self._saga_mgr:
+            self._saga_mgr.reset()
+
         effective_run_id = run_id or f"run_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
         resolved_inputs = self._resolve_resume_inputs(effective_run_id, inputs)
         run = WorkflowRun(
@@ -134,8 +139,17 @@ class WorkflowExecutor:
         self._emit_event(run.run_id, "__run__", "running", None, None)
 
         try:
+            # 收集被循环节点托管的子图节点,将其排除出顶层拓扑执行
+            # (这些节点只在循环体内部由 LoopController 驱动执行,避免被顶层重复/越序执行)
+            loop_managed = set()
+            for _n in workflow.nodes.values():
+                if _n.type == NodeType.LOOP:
+                    _sids = (_n.loop_config or {}).get("subgraph_ids") or _n.subgraph_ids or []
+                    loop_managed.update(_sids)
+            self._loop_managed_ids = loop_managed
+
             # 拓扑排序,构建执行层次
-            layers = self._topological_layers(workflow)
+            layers = self._topological_layers(workflow, exclude=loop_managed)
             if layers is None:
                 run.set_error("工作流存在循环依赖")
                 self._emit_event(run.run_id, "__run__", "failed", None, "循环依赖")
@@ -160,9 +174,24 @@ class WorkflowExecutor:
                     return run
 
                 # 收集本层需要执行的节点
-                nodes_to_run = [n for n in layer if n.id not in skippable_nodes]
+                # 1) 跳过已成功的节点(断点续跑)
+                # 2) 根据上游边的激活状态做动态路由门控(条件分支/默认分支真正生效)
+                nodes_to_run = []
+                for n in layer:
+                    if n.id in skippable_nodes:
+                        continue
+                    if not self._is_node_active(workflow, run, n):
+                        run.node_states[n.id] = {
+                            "status": NodeStatus.SKIPPED.value,
+                            "result": None, "error": None,
+                            "started_at": None, "ended_at": None,
+                            "skipped_by_routing": True,
+                        }
+                        self._emit_event(run.run_id, n.id, "skipped", None, None)
+                        continue
+                    nodes_to_run.append(n)
                 if not nodes_to_run:
-                    logger.debug(f"第 {layer_idx + 1} 层全部节点已跳过")
+                    logger.debug(f"第 {layer_idx + 1} 层全部节点已跳过/未激活")
                     continue
 
                 # 并行执行本层节点(带并发限制)
@@ -171,9 +200,9 @@ class WorkflowExecutor:
                     workflow, run, nodes_to_run, semaphore, agent
                 )
 
-                # 处理本层结果
+                # 处理本层结果(layer_results 与 nodes_to_run 一一对应)
                 failed_nodes = []
-                for node, result in zip(layer, layer_results):
+                for node, result in zip(nodes_to_run, layer_results):
                     if result is None:
                         continue
                     if isinstance(result, Exception):
@@ -272,10 +301,15 @@ class WorkflowExecutor:
         workflow: Workflow,
         run: WorkflowRun,
         node: WorkflowNode,
+        force: bool = False,
     ) -> Optional[dict]:
-        """执行单个节点,支持错误恢复和 Checkpoint。"""
-        # 检查是否已执行(跳过逻辑)
-        if run.node_states.get(node.id, {}).get("status") in (
+        """执行单个节点,支持错误恢复和 Checkpoint。
+
+        Args:
+            force: 为 True 时跳过"已执行"缓存短路(用于循环体节点,每轮迭代需重新执行)。
+        """
+        # 检查是否已执行(跳过逻辑);force 模式下忽略缓存,确保循环体每轮都真实重跑
+        if (not force) and run.node_states.get(node.id, {}).get("status") in (
             NodeStatus.SUCCESS.value, NodeStatus.FAILED.value, NodeStatus.SKIPPED.value
         ):
             return run.node_states[node.id].get("result")
@@ -354,6 +388,12 @@ class WorkflowExecutor:
                         duration=duration,
                         attempt=attempt + 1,
                     )
+
+                # 登记 SAGA 补偿:节点声明了 compensation 时才登记,失败时逆序回滚
+                if self._saga_mgr and node.compensation:
+                    async def _comp(**kwargs):
+                        return await self._run_compensation(node, run)
+                    self._saga_mgr.register_compensation(node.id, compensation=_comp)
 
                 return result
 
@@ -583,7 +623,7 @@ class WorkflowExecutor:
             variables=run.variables,
             node_results={nid: state.get("result") for nid, state in run.node_states.items()
                          if state.get("status") == NodeStatus.SUCCESS.value},
-            execute_node_func=lambda n: self._execute_node(agent, workflow, run, n),
+            execute_node_func=lambda n: self._execute_node(agent, workflow, run, n, force=True),
             save_checkpoint_func=lambda node_id, status, variables, result=None:
                 self._checkpoint_mgr.save_checkpoint(run.run_id, node_id, status, variables, result) if self._checkpoint_mgr else None,
         )
@@ -715,11 +755,64 @@ class WorkflowExecutor:
                 return result.get("result")
         return result
 
-    def _topological_layers(self, workflow: Workflow) -> Optional[list[list[WorkflowNode]]]:
-        """Kahn's algorithm: 返回层次列表,每层内的节点可并行执行。"""
-        in_degree = {nid: 0 for nid in workflow.nodes}
+    def _is_node_active(
+        self,
+        workflow: Workflow,
+        run: WorkflowRun,
+        node: WorkflowNode,
+    ) -> bool:
+        """判断节点在当前阶段是否应当被激活(动态路由门控)。
+
+        规则:
+        - 无任何入边的节点(根节点/START)始终激活;
+        - 否则,只要存在一条「源节点已成功执行 且 该边条件表达式为真」的入边即激活;
+        - 否则视为未激活,跳过执行 —— 条件分支 / 默认分支由此真正生效。
+        """
+        incoming = [e for e in workflow.edges if e.target == node.id]
+        if not incoming:
+            return True
+
+        success_results = {
+            nid: s.get("result")
+            for nid, s in run.node_states.items()
+            if s.get("status") == NodeStatus.SUCCESS.value
+        }
+        for edge in incoming:
+            src_state = run.node_states.get(edge.source, {})
+            if src_state.get("status") != NodeStatus.SUCCESS.value:
+                continue
+            cond = getattr(edge, "condition_expr", None) or getattr(edge, "condition", None)
+            if not cond or not cond.strip():
+                return True
+            try:
+                ev = DynamicEdgeEvaluator(variables=run.variables, node_results=success_results)
+                if ev.evaluate(cond):
+                    return True
+            except Exception:
+                # 条件评估异常时保守地视为不激活,避免误执行
+                continue
+        # 默认分支:所有条件边均不激活时,若存在标记为默认的入边则激活之
+        for edge in incoming:
+            src_state = run.node_states.get(edge.source, {})
+            if src_state.get("status") != NodeStatus.SUCCESS.value:
+                continue
+            if getattr(edge, "is_default", False):
+                return True
+        return False
+
+    def _topological_layers(
+        self, workflow: Workflow, exclude: Optional[set] = None
+    ) -> Optional[list[list[WorkflowNode]]]:
+        """Kahn's algorithm: 返回层次列表,每层内的节点可并行执行。
+
+        Args:
+            exclude: 需要排除在拓扑排序之外的节点 ID 集合(例如被循环节点托管的子图节点)。
+                     这些节点不进入执行层次,也不会影响下游节点的入度计算(避免误判循环依赖)。
+        """
+        exclude = exclude or set()
+        in_degree = {nid: 0 for nid in workflow.nodes if nid not in exclude}
         for edge in workflow.edges:
-            if edge.target in in_degree:
+            if edge.target in in_degree and edge.source not in exclude:
                 in_degree[edge.target] += 1
 
         layers = []
@@ -736,7 +829,8 @@ class WorkflowExecutor:
                     layer.append(node)
 
                 for edge in workflow.edges:
-                    if edge.source == nid and edge.target in in_degree:
+                    if (edge.source == nid and edge.source not in exclude
+                            and edge.target in in_degree):
                         in_degree[edge.target] -= 1
                         if in_degree[edge.target] == 0:
                             next_ready.append(edge.target)
@@ -746,8 +840,8 @@ class WorkflowExecutor:
             ready = next_ready
 
         processed = sum(len(layer) for layer in layers)
-        if processed < len(workflow.nodes):
-            return None  # 存在循环
+        if processed < len(in_degree):
+            return None  # 存在循环(排除节点之外的节点未全部排入层次)
 
         return layers
 
@@ -812,3 +906,42 @@ class WorkflowExecutor:
             logger.info(f"SAGA 补偿完成: 补偿了 {len(compensated)} 个节点")
         except Exception as e:
             logger.error(f"SAGA 补偿失败: {e}")
+
+    async def _run_compensation(self, node: WorkflowNode, run: WorkflowRun) -> dict:
+        """执行单个节点的补偿动作(SAGA 补偿)。
+
+        支持两种声明方式:
+        - {"type": "script", "code": "..."}:在沙箱中执行回滚脚本(复用 _exec_script)
+        - {"type": "http", "http_config": {...}} 或 {"type": "http", "url": ...}:发起回滚请求(复用 _exec_http)
+        未声明 type 时默认按 script 处理。
+        """
+        comp = node.compensation or {}
+        ctype = (comp.get("type") or "script").lower()
+        try:
+            if ctype == "http":
+                http_node = WorkflowNode(
+                    id=f"_comp_{node.id}",
+                    type=NodeType.HTTP,
+                    http_config=comp.get("http_config") or comp,
+                )
+                result = await self._exec_http(http_node, run)
+            else:
+                script_node = WorkflowNode(
+                    id=f"_comp_{node.id}",
+                    type=NodeType.SCRIPT,
+                    script_code=comp.get("code") or comp.get("script") or "",
+                )
+                result = await self._exec_script(script_node, run)
+            status = "success" if (isinstance(result, dict) and result.get("status") == "success") else "error"
+        except Exception as e:
+            result = {"status": "error", "error": str(e)}
+            status = "error"
+
+        run.history.append({
+            "node_id": node.id,
+            "action": "compensate",
+            "status": status,
+            "result": result,
+            "timestamp": time.time(),
+        })
+        return result

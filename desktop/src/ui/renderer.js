@@ -228,10 +228,8 @@
   }
   
   // 侧边栏按钮打开设置
-  const sidebarModelSetting = document.getElementById('sidebarModelSetting');
-  const sidebarAdvancedSetting = document.getElementById('sidebarAdvancedSetting');
-  if (sidebarModelSetting) sidebarModelSetting.addEventListener('click', () => openSettingsModal());
-  if (sidebarAdvancedSetting) sidebarAdvancedSetting.addEventListener('click', () => openSettingsModal());
+  const sidebarSetting = document.getElementById('sidebarSetting');
+  if (sidebarSetting) sidebarSetting.addEventListener('click', () => openSettingsModal());
   // 关闭弹窗
   document.querySelectorAll('.close-modal').forEach(btn => {
     btn.addEventListener('click', () => {

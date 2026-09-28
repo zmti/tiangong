@@ -14,14 +14,29 @@ import requests
 from pydantic import Field
 
 from app.config import settings
-from app.core.config_runtime import resolve, resolve_value
 from app.tools.registry import tool
 
 
 def _video_enabled() -> bool:
-    """无任意生成端点时自动禁用视频工具(按 provider 路由后,compat/自定义均可)。"""
+    """无任意生成端点时自动禁用视频工具(按 provider 路由后,compat/自定义均可)。
+
+    设置页的「生成模型」开关**不**在这里摘除工具:关掉表示"不用专门配的视频模型,
+    改用当前对话所选的模型",视频能力本身照常可用。
+    """
     from app.api.config_models import _any_gen_base_url
     return _any_gen_base_url()
+
+
+def _resolve_model(model: str = "") -> tuple[str, str]:
+    """解析本次实际要用的视频模型,返回 (模型, 来源)。
+
+    优先级:桌面端覆盖 > 跟随对话模型(该模型带 video 能力时)> .env/VIDEO_MODEL > 代码默认。
+    """
+    from app.api.config_models import resolve_gen_model
+    m = (model or "").strip()
+    if m:
+        return m, "explicit"
+    return resolve_gen_model("video", settings.video_model)
 
 
 def _video_endpoint(model: str = "") -> tuple[str, str]:
@@ -31,7 +46,7 @@ def _video_endpoint(model: str = "") -> tuple[str, str]:
     的端点,而不再硬编码 openai_compat_*(apihub)。
     """
     from app.api.config_models import gen_endpoint_for_model
-    model = (model or "").strip() or resolve_value("video_model", settings.video_model)
+    model, _src = _resolve_model(model)
     ep = gen_endpoint_for_model(model, "video")
     return ep["base_url"], (ep["api_key"] or "")
 
@@ -245,8 +260,8 @@ async def _create_video(
     按模型契约组织候选请求体,依次尝试;只有 400「校验不过」才换下一个
     (官方说明:校验失败直接 400,不建任务、不产生费用),429/5xx 直接抛出让上层看到。
     """
-    # 模型可配置:桌面端覆盖 > .env/VIDEO_MODEL > 代码默认值 agnes-video-v2.0
-    model = resolve_value("video_model", settings.video_model)
+    # 模型优先级:桌面端覆盖 > 跟随对话模型(该模型带 video 能力时)> .env/VIDEO_MODEL > 代码默认
+    model, model_src = _resolve_model()
     # 按 provider 路由:请求发到该模型所属 provider 的端点(不再硬编码 compat)
     base_url, api_key = _video_endpoint(model)
     if not base_url:
@@ -393,7 +408,10 @@ async def _poll_video(task_id: str, model: str = "", timeout: float = 600) -> di
     "传入 image 即以该图片为首帧/参考图生成视频(图片续写);不传则为纯文生视频。"
     "注意:视频生成需要几分钟,请耐心等待结果",
     timeout=900,
-    enabled=_video_enabled(),
+    # 只挂动态开关,不要传 enabled=_video_enabled():静态值会在 import 时固化,
+    # 把"启动时用户恰好关着"变成永久否决(设置页显示已启用、工具却仍下线,
+    # 只能重启后端恢复)。详见 image_tool 的同处注释。
+    enabled_fn=_video_enabled,
     terminal=True,
 )
 def generate_video(
@@ -442,7 +460,8 @@ def generate_video(
         _image_warning = "参考图未被该模型接受,已按纯文生视频生成"
     data = asyncio.run(_poll_video(task_id, model=model))
 
-    _model_source = resolve("video_model", settings.video_model)[1]
+    # 来源:override(设置页指定)/ session(跟随对话模型)/ env / default
+    _model_source = _resolve_model()[1]
     # 时长/尺寸以上游为准:创建响应里有(seconds/size),完成响应里也可能有
     _upstream_seconds = data.get("seconds") or created.get("seconds")
     _upstream_size = data.get("size") or created.get("size")

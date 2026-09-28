@@ -469,11 +469,33 @@ App.Settings._openCustomModelForm = function (p) {
   modelIn.focus();
 };
 
-// 打开表单;p=null 新建,p=条目 编辑(Key 留空沿用旧值)
+// 打开供应商表单(新增/编辑);p=null 新建,p=条目 编辑(Key 留空沿用旧值)
+// 以弹出框(modal)模式呈现,而非内联在设置页
 App.Settings._openProvForm = function (p) {
-  const wrap = document.getElementById('provFormWrap');
-  if (!wrap) return;
-  wrap.textContent = '';
+  // 防重复打开:移除旧弹窗
+  const prev = document.getElementById('provFormModal');
+  if (prev) prev.remove();
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal';
+  overlay.id = 'provFormModal';
+
+  const content = document.createElement('div');
+  content.className = 'modal-content';
+
+  const header = document.createElement('div');
+  header.className = 'modal-header';
+  const title = document.createElement('h3');
+  title.textContent = p ? `编辑供应商 · ${p.name || ''}` : '添加供应商';
+  const closeBtn = document.createElement('button');
+  closeBtn.className = 'modal-close';
+  closeBtn.type = 'button';
+  closeBtn.textContent = '×';
+  closeBtn.setAttribute('aria-label', '关闭');
+  header.append(title, closeBtn);
+
+  const body = document.createElement('div');
+  body.className = 'modal-body';
 
   const form = document.createElement('div');
   form.className = 'prov-form';
@@ -514,9 +536,6 @@ App.Settings._openProvForm = function (p) {
   const status = document.createElement('div');
   status.className = 'prov-status muted';
 
-  const ops = document.createElement('div');
-  ops.className = 'prov-form-ops';
-
   const fetchBtn = document.createElement('button');
   fetchBtn.type = 'button';
   fetchBtn.textContent = '🔄 获取模型列表';
@@ -536,7 +555,6 @@ App.Settings._openProvForm = function (p) {
     if (u && !/^https?:\/\//i.test(u)) u = 'https://' + u;
     return u.replace(/\/+$/, '');
   };
-  const apiKey = () => keyIn.value.trim() || (p ? '' : '');
 
   let fetchedModels = [];
 
@@ -596,7 +614,7 @@ App.Settings._openProvForm = function (p) {
     status.className = 'prov-status ok';
   });
 
-  cancelBtn.addEventListener('click', () => { wrap.textContent = ''; });
+  cancelBtn.addEventListener('click', () => closeModal());
 
   saveBtn.addEventListener('click', async () => {
     const name = nameIn.value.trim();
@@ -628,11 +646,10 @@ App.Settings._openProvForm = function (p) {
       status.className = 'prov-status err';
       return;
     }
-    wrap.textContent = '';
+    closeModal();
     App.Settings.refreshProvidersUI();
   });
 
-  ops.append(fetchBtn, testBtn, saveBtn, cancelBtn);
   form.append(
     mkField('名称', nameIn),
     mkField('Base URL(OpenAI 兼容)', urlIn),
@@ -640,9 +657,27 @@ App.Settings._openProvForm = function (p) {
     mkField('默认模型', modelIn),
     dl,
     status,
-    ops,
   );
-  wrap.appendChild(form);
+
+  const footer = document.createElement('div');
+  footer.className = 'modal-footer';
+  footer.append(fetchBtn, testBtn, saveBtn, cancelBtn);
+
+  body.appendChild(form);
+  content.append(header, body, footer);
+  overlay.appendChild(content);
+  document.body.appendChild(overlay);
+
+  // 关闭逻辑(定义在底部,供上方按钮回调引用)
+  const onKey = (e) => { if (e.key === 'Escape') closeModal(); };
+  const closeModal = () => {
+    document.removeEventListener('keydown', onKey);
+    overlay.remove();
+  };
+  closeBtn.addEventListener('click', closeModal);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) closeModal(); });
+  document.addEventListener('keydown', onKey);
+
   nameIn.focus();
 };
 
@@ -665,7 +700,24 @@ const RULE_TYPES = ['instruction', 'tool_block', 'term_block', 'path_block'];
  */
 App.Settings._genModels = null;
 
-const _GEN_SRC_TEXT = { override: '桌面端覆盖', env: '环境变量', default: '代码默认' };
+// 来源徽章文案:session = 跟随当前对话所用的模型
+const _GEN_SRC_TEXT = {
+  override: '桌面端覆盖',
+  env: '环境变量',
+  default: '代码默认',
+  session: '跟随对话模型',
+};
+
+// 「跟随对话模型」在后端覆盖值里的哨兵值,须与 app/api/config_models.py 一致
+const _GEN_SESSION_MARK = '@session';
+
+// 当前对话所用的模型(与后端「生成模型跟随对话模型」同一口径)
+App.Settings._currentChatModel = function () {
+  try {
+    if (App.ModelPicker) return (App.ModelPicker.get() || {}).model || '';
+  } catch (_) { /* 忽略 */ }
+  return '';
+};
 
 /* ---------- 生成模型「可搜索组合框」 ----------
  * 原生 <select> 在候选有几十个模型时:样式不可控(Windows 原生下拉很"老气"),
@@ -767,6 +819,29 @@ function _genComboRows(c) {
     kind: 'opt', value: '', name: '跟随默认',
     sub: info.code_default || '', inherit: true, usable: true,
   }];
+  // 跟随对话模型:生成模型没专门配置时就用这一条。
+  // can_inherit 由后端判定(打了能力标记 tagged / 按模型 id 推断 inferred)。
+  // 判不出来时仍可选,但后端会回落到专用生成模型(不会把纯对话模型丢给生成端点,
+  // 那样会被上游 400 "is a chat model"),故标 ⚠ 并说明实际会用的模型。
+  const chat = App.Settings._currentChatModel();
+  const reason = info.inherit_reason || '';
+  const cap = c.key === 'genVideoModel' ? 'video' : 'image';
+  const subText = !chat
+    ? '未选择对话模型'
+    : (reason === 'inferred'
+      ? chat + ' · 清单未标生成能力,按模型名推断继承'
+      : chat);
+  rows.push({
+    kind: 'opt', value: _GEN_SESSION_MARK, name: '跟随对话模型',
+    sub: subText, inherit: true,
+    usable: info.can_inherit !== false,
+    badTitle: !chat
+      ? '尚未选择对话模型,无法跟随'
+      : '当前对话模型「' + chat + '」不是生成模型(多模态只表示能看懂图,不代表能生成)'
+        + (cap === 'video' ? '(视频是专属契约,纯对话模型必然失败)' : '')
+        + ';选中后会回落到专用生成模型' + (info.code_default ? '「' + info.code_default + '」' : '')
+        + ',要真正跟随请换用带生成能力的对话模型,或显式指定一个生成模型',
+  });
   const order = [];
   const buckets = Object.create(null);
   cands.forEach((x) => {
@@ -815,7 +890,7 @@ function _genOptEl(r, idx, selected) {
     const bad = document.createElement('span');
     bad.className = 'gen-opt-bad';
     bad.textContent = '⚠ 不可用';
-    bad.title = '该模型所属提供商无法承接此生成能力,选中后调用会失败';
+    bad.title = r.badTitle || '该模型所属提供商无法承接此生成能力,选中后调用会失败';
     btn.appendChild(bad);
   }
   const ck = document.createElement('span');
@@ -870,6 +945,13 @@ function _genComboUpdateTrigger(key) {
   if (!val) {
     const def = info.code_default || '';
     c.textEl.textContent = '跟随默认' + (def ? '（' + def + '）' : '');
+    c.textEl.classList.add('is-inherit');
+    return;
+  }
+  if (val === _GEN_SESSION_MARK) {
+    // 本地模型选择器没值时,退回后端算出的会话模型(后端口径更权威)
+    const chat = App.Settings._currentChatModel() || (info.session_model || '');
+    c.textEl.textContent = '跟随对话模型' + (chat ? '（' + chat + '）' : '');
     c.textEl.classList.add('is-inherit');
     return;
   }
@@ -997,12 +1079,30 @@ App.Settings.loadGenModels = async function () {
     if (!c || !info) return;
 
     c.info = info;
-    // 有覆盖则选中覆盖值,否则停在「跟随默认」
-    c.hidden.value = info.overridden ? (info.value || '') : '';
+    // 回填选中项:生效来源是 session 时(无论是显式选的哨兵,还是"没配置自动
+    // 继承到对话模型"),下拉都显示「跟随对话模型(模型名)」—— 必须与实际生效值
+    // 对得上,否则就会出现"界面说用默认、实际用的是对话模型"这种错觉。
+    // 代价是:此时点保存会把哨兵写成显式覆盖;服务端对哨兵的处理与"没配"一致
+    // (都是跟随对话模型,拿不到对话模型时才回退默认),所以语义无损。
+    if (info.source === 'session' || info.inherit_session) c.hidden.value = _GEN_SESSION_MARK;
+    else c.hidden.value = info.overridden ? (info.value || '') : '';
     _genComboUpdateTrigger(key);
     if (!c.pop.hidden) _genComboRenderList(key, c.search.value);
 
-    if (ui.value) ui.value.textContent = info.value || '-';
+    if (ui.value) {
+      // 开关关闭 = 不用专门配的模型,改用当前对话模型:标出来,免得"关了还显示某个生成模型"
+      ui.value.textContent = (info.value || '-') + (info.disabled_fallback ? '（跟随对话模型）' : '');
+      ui.value.title = info.disabled_fallback
+        ? '已关闭「使用专门配的生成模型」,改为用当前对话模型 ' + (info.value || '-') + ' 生成'
+        : '';
+    }
+
+    // 启用开关:关掉后整张卡片灰显且不可再选模型(能力被摘除,不只是"不生效")
+    if (ui.enabledToggle) {
+      ui.enabledToggle.classList.toggle('on', info.enabled !== false);
+      ui.enabledToggle.setAttribute('aria-checked', info.enabled !== false ? 'true' : 'false');
+    }
+    if (ui.card) ui.card.classList.toggle('off', info.enabled === false);
 
     // 覆盖值不在候选里(用户手填/旧配置):组合框仍能显示该值,但要留个说明
     const known = (info.candidates || []).some((x) => x.id === info.value);
@@ -1025,7 +1125,10 @@ App.Settings.loadGenModels = async function () {
   };
 
   try {
-    const res = await App.apiJSON('/v1/config/models');
+    // 带上当前对话模型,后端才能算出"跟随对话模型"的真实生效值
+    const chat = App.Settings._currentChatModel();
+    const qs = chat ? ('?session_model=' + encodeURIComponent(chat)) : '';
+    const res = await App.apiJSON('/v1/config/models' + qs);
     if (!res.success) throw new Error(res.detail || ('HTTP ' + res.status));
     const data = res.data || {};
     const m = data.models || {};
@@ -1037,11 +1140,15 @@ App.Settings.loadGenModels = async function () {
       badge: document.getElementById('genImageModelBadge'),
       value: document.getElementById('genImageModelValue'),
       warn: document.getElementById('genImageModelWarn'),
+      card: document.getElementById('genImageCard'),
+      enabledToggle: document.getElementById('genImageEnabledToggle'),
     });
     fill('genVideoModel', m.video_model, {
       badge: document.getElementById('genVideoModelBadge'),
       value: document.getElementById('genVideoModelValue'),
       warn: document.getElementById('genVideoModelWarn'),
+      card: document.getElementById('genVideoCard'),
+      enabledToggle: document.getElementById('genVideoEnabledToggle'),
     });
     if (note) {
       // 按 provider 路由后端点随模型所属提供商而变;这里只说明"回退端点"与优先级
@@ -1081,13 +1188,25 @@ App.Settings.saveGenModels = async function () {
   if (!imgSel || !vidSel) return;
   try {
     if (status) status.textContent = '保存中...';
-    const res = await App.apiJSON('/v1/config/models', {
+    // 开关状态直接取自 DOM 的 .on(与主题开关同一套约定)
+    const _swOn = (id) => {
+      const el = document.getElementById(id);
+      return el ? el.classList.contains('on') : true;
+    };
+    const imgOn = _swOn('genImageEnabledToggle');
+    const vidOn = _swOn('genVideoEnabledToggle');
+    // 关掉的那一能力不要提交模型字段:关闭状态下生效值只是"改用当前对话模型",
+    // 并不代表用户改了选择(下拉此时也不可点)。若跟着回填的哨兵一起提交,会把用户
+    // 原先显式配置的生成模型悄悄覆盖成「跟随对话模型」,重新打开开关就找不回来了。
+    const body = { image_enabled: imgOn, video_enabled: vidOn };
+    if (imgOn) body.image_model = (imgSel.value || '').trim();
+    if (vidOn) body.video_model = (vidSel.value || '').trim();
+    const chat = App.Settings._currentChatModel();
+    const qs = chat ? ('?session_model=' + encodeURIComponent(chat)) : '';
+    const res = await App.apiJSON('/v1/config/models' + qs, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        image_model: (imgSel.value || '').trim(),
-        video_model: (vidSel.value || '').trim(),
-      }),
+      body: JSON.stringify(body),
     });
     if (!res.success) throw new Error(res.detail || ('HTTP ' + res.status));
     // 顺序要紧:loadGenModels 结尾会清空状态栏,所以"已保存"必须写在它之后,
@@ -1099,6 +1218,20 @@ App.Settings.saveGenModels = async function () {
     if (status) status.textContent = '保存失败: ' + e.message;
   }
 };
+
+// 生成能力开关的本地翻转(真正的持久化在点「保存」时随 body 一起提交)。
+// 只切 UI 状态 + 灰显卡片,不立刻写后端 —— 保持与页面其余设置一致的"编辑→保存"节奏。
+function _genToggleEnabled(toggleId, cardId) {
+  const el = document.getElementById(toggleId);
+  const card = document.getElementById(cardId);
+  if (!el) return;
+  const on = !el.classList.contains('on');
+  el.classList.toggle('on', on);
+  el.setAttribute('aria-checked', on ? 'true' : 'false');
+  if (card) card.classList.toggle('off', !on);
+  const status = document.getElementById('genModelsStatus');
+  if (status) status.textContent = on ? '' : '已改用当前对话模型(需点保存生效)';
+}
 
 // 收起生成模型下拉弹层。弹层挂在 document.body(传送门),不随设置弹窗的
 // hidden 一起消失,故关闭弹窗时需显式调用(见 renderer.js 的 .close-modal/overlay)。
@@ -1115,6 +1248,31 @@ App.Settings.bindGenModels = function () {
   if (reload && !reload._bound) {
     reload._bound = true;
     reload.addEventListener('click', () => App.Settings.loadGenModels());
+  }
+  // 生成能力开关:图片 / 视频各自一个
+  [['genImageEnabledToggle', 'genImageCard'], ['genVideoEnabledToggle', 'genVideoCard']]
+    .forEach(([tid, cid]) => {
+      const el = document.getElementById(tid);
+      if (!el || el._bound) return;
+      el._bound = true;
+      el.addEventListener('click', (e) => {
+        e.stopPropagation();
+        _genToggleEnabled(tid, cid);
+      });
+      // 键盘可达:Space / Enter 等价于点击
+      el.addEventListener('keydown', (e) => {
+        if (e.key === ' ' || e.key === 'Enter') {
+          e.preventDefault();
+          e.stopPropagation();
+          _genToggleEnabled(tid, cid);
+        }
+      });
+    });
+  // 用户在模型选择器里换了对话模型 → 「跟随对话模型」的实际生效值随之变化,
+  // 设置面板开着时立刻刷新(弹窗没开时 loadGenModels 会因找不到元素直接返回)
+  if (App.ModelPicker && App.ModelPicker.onChange && !App.Settings._genModelWatchBound) {
+    App.Settings._genModelWatchBound = true;
+    App.ModelPicker.onChange(() => { App.Settings.loadGenModels(); });
   }
   App.Settings.loadGenModels();
 };

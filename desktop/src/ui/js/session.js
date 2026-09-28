@@ -89,6 +89,12 @@ App.Session.park = function (sid) {
   App._planCard = null;
   App._currentGroup = null;
   App.streaming = false;
+  // 切走的是前台会话 → 全局"执行中"视觉状态必须随之复位:否则新前台仍残留旧会话的
+  // stopBtn(.show) / 禁用 sendBtn / body.streaming,表现为"切到别的会话按钮却卡在执行中"。
+  // 被切走会话自身的 streaming 已存入 r.streaming(上面),切回时由 unpark 恢复视觉。
+  if (sid === App.sessionId && App.Chat && App.Chat.applyStreamingVisual) {
+    App.Chat.applyStreamingVisual();
+  }
 };
 
 /* 切回某会话:把内容搬回 live,恢复它自己的流式状态 */
@@ -118,7 +124,9 @@ App.Session.unpark = function (sid) {
   }
   if (r.streaming) {
     App.streaming = true;
-    document.body.classList.add('streaming');
+    // 切回仍在后台生成的会话 → 恢复"执行中"全局视觉(stopBtn/sendBtn/状态条),
+    // 与 park 时清掉的视觉对称,否则切回后看不到停止按钮、输入被锁死却无指示。
+    if (App.Chat && App.Chat.applyStreamingVisual) App.Chat.applyStreamingVisual();
   }
   if (!r.streaming) App.Session._runs.delete(sid);
   return restored;

@@ -260,7 +260,7 @@
       // 阈值可从 App.Confirmation 上覆盖(便于测试按秒级验证看门狗行为)
       const IDLE_LIMIT = this._idleLimitMs || RESUME_IDLE_LIMIT_MS;
       const TICK = this._watchdogTickMs || 15000;
-      if (App.Chat && App.Chat.setStreaming) App.Chat.setStreaming(true);
+      if (App.Chat && App.Chat.setStreaming) App.Chat.setStreaming(true, sessionId);
       if (App.ExecTrace && App.ExecTrace.start) App.ExecTrace.start();
       // 立即给反馈:旧实现点完"批准"后界面几十分钟没有任何动静(用户观感=卡顿)
       App.appendMessage('▶ 已批准,继续执行…', 'system');
@@ -354,8 +354,9 @@
           let interrupted = false;
           let interruptData = null;
           let gotCancelled = false;
-          let lastErrMsg = '';
-          while (true) {
+      let lastErrMsg = '';
+      let finished = false;
+      while (true) {
             const { done, value } = await reader.read();
             if (done) break;
             lastEventAt = Date.now();
@@ -428,8 +429,14 @@
                     App.ExecTrace.addStep(st.tool || st.name || 'tool', st.arguments || '', 'done');
                   }
                 }
+                // 【修复】后端任务已完成(done 已到达)即主动结束流并复位 UI,
+                // 不再傻等 reader.read() 的连接关闭 —— 后端有时发完 done 不立即关闭连接,
+                // 否则按钮会卡在"执行中"直到 3 分钟看门狗超时(本就与"任务已完成"矛盾)。
+                // 嵌套确认(interrupted)不 break:需继续等待用户再次批准。
+                if (!interrupted && !gotCancelled) finished = true;
               }
             }
+            if (finished) break;
           }
           stopMdTimer();
           if (interrupted) {
@@ -472,7 +479,7 @@
           try { App.ExecTrace.finish(answerDiv ? (answerDiv.textContent || '') : null); } catch (_) {}
         }
         if (App.removeTyping) App.removeTyping();
-        if (App.Chat && App.Chat.setStreaming) App.Chat.setStreaming(false);
+        if (App.Chat && App.Chat.setStreaming) App.Chat.setStreaming(false, sessionId);
       }
     },
 

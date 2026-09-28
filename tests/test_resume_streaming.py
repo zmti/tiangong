@@ -232,16 +232,16 @@ def test_reverse_control_batched_stream_stays_silent(tmp_path, interrupt_setting
         collected = []
 
         # 旧行为等价物:先用非流式 graph.arun 把整轮跑完,再回放事件
-        # (旧实现 resume(stream=True) 走的就是 _run_state → graph.arun)
-        async def batched_stream_state(state, history, event_name="run_stream"):
-            state.metadata["history"] = history
-            state.metadata["stream"] = True
-            graph = agent2._build_graph()
+        # (旧实现 resume(stream=True) 走的就是 _run_state → graph.arun,而非流式)
+        # 注意:实现机制已从 _stream_state 改名为 _resume_stream,这里 monkeypatch
+        # 真实被调用的方法,才能正确模拟"批量(非流式)"以做反向对照。
+        async def batched_resume_stream(self, state):
+            graph = self._build_graph()
             _state, events = await graph.arun(state)  # ← 会卡在答案生成(闸门)上
             for evt in events:
                 yield evt
 
-        agent2._stream_state = batched_stream_state
+        agent2._resume_stream = batched_resume_stream
 
         async def collect():
             gen = await agent2.resume(run_id, resume_value={conf_id: {"approved": True}}, stream=True)

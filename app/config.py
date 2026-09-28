@@ -158,6 +158,55 @@ class Settings(BaseSettings):
     agent_code_self_heal: bool = True
     agent_code_heal_rounds: int = 2
 
+    # ---- Token预算 + 模型分级路由 + 语义缓存 ----
+    # 请求级 token 上限(0=不限制)
+    agent_token_budget_request: int = 0
+    # 会话累计 token 上限(0=不限制)
+    agent_token_budget_session: int = 0
+    # 任务累计 token 上限(0=不限制)
+    agent_token_budget_task: int = 0
+    # 预算告警阈值(0-1),超过比例记警告日志
+    agent_token_budget_warn_threshold: float = 0.8
+    # 超预算是否硬拦截(True=拦截并报错, False=仅告警放行)
+    agent_token_budget_hard_stop: bool = True
+    # 模型分级配置(JSON 字符串,留空用内置默认)
+    # 格式: {"simple": {"provider": "...", "model": "...", "cost_per_1k_input": 0.001, ...}, ...}
+    agent_model_tiers: str = ""
+    # 语义缓存相似度阈值(0-1),超过此值命中缓存
+    agent_semantic_cache_threshold: float = 0.95
+    # 语义缓存最大条目数
+    agent_semantic_cache_max_entries: int = 10000
+
+    # ---- 自动验证钩子 ----
+    # 开启后,write_file/edit_file/apply_patch 等文件写入工具成功后自动运行 pytest/ruff/mypy
+    agent_verification_enabled: bool = True
+    # 验证超时(秒)
+    agent_verification_timeout: int = 120
+    # 验证冷却期(秒),防止短时间内重复触发
+    agent_verification_cooldown: float = 5.0
+
+    # ---- 记忆固化(跨会话知识积累) ----
+    # 开启后,每轮对话结束自动提取关键决策/代码片段/错误修复存入 SQLite + 向量索引
+    agent_memory_consolidation_enabled: bool = True
+    # 每次固化处理的最近对话轮数
+    agent_memory_consolidation_turns: int = 6
+
+    # ---- 记忆生命周期管理 ----
+    # 启用记忆生命周期管理(TTL/衰减/分层/冲突解决/版本控制)
+    agent_memory_lifecycle_enabled: bool = True
+    # 工作记忆层 TTL(天):未访问超过此天数降级到语义层
+    agent_memory_working_ttl_days: int = 7
+    # 语义记忆层 TTL(天):未访问超过此天数降级到情节层
+    agent_memory_semantic_ttl_days: int = 90
+    # 情节记忆层 TTL(天):未访问超过此天数标记归档
+    agent_memory_episodic_ttl_days: int = 365
+    # 冲突检测相似度阈值(0-1)
+    agent_memory_conflict_threshold: float = 0.85
+    # 自动冲突解决策略: merge/keep_latest/keep_highest/version/manual
+    agent_memory_conflict_resolution: str = "version"
+    # 后台清理间隔(秒),0=禁用
+    agent_memory_lifecycle_cleanup_interval: int = 3600
+
     # ---- Agent ----
     agent_max_steps: int = 0
     # 0 = 不设步骤上限(由 agent_replan_max_times 收敛控制:重新规划耗尽后,
@@ -275,6 +324,21 @@ class Settings(BaseSettings):
     # 单次运行最多重新规划次数(防止死循环)
     agent_replan_max_times: int = 3
 
+    # ---- Planner-Executor-Critic 三角色分离 ----
+    # 开启 PEC 模式:Planner/Executor/Critic 三角色分离协作
+    agent_pec_enabled: bool = False
+    # Critic 最低通过分数(0-1),低于此分触发重新执行
+    agent_critic_min_score: float = 0.7
+    # PEC 并发执行器数量
+    agent_pec_max_concurrent: int = 3
+    # 是否使用独立模型给三角色(留空则复用主模型)
+    agent_pec_planner_provider: str = ""
+    agent_pec_planner_model: str = ""
+    agent_pec_executor_provider: str = ""
+    agent_pec_executor_model: str = ""
+    agent_pec_critic_provider: str = ""
+    agent_pec_critic_model: str = ""
+
     # ---- 工具执行重试(瞬态错误指数退避) ----
     # 工具返回超时/网络/限流等瞬态错误时,自动重试次数(0 = 不重试)
     agent_tool_retries: int = 2
@@ -367,12 +431,21 @@ class Settings(BaseSettings):
     # ---- 可观测性 ----
     # 记录 trace(JSONL 文件 data/traces/<date>.jsonl + 内存缓冲),供 /v1/traces 查询
     agent_tracing_enabled: bool = True
+    # 追踪采样率(0-1)
+    agent_tracing_sample_rate: float = 1.0
+    # 单次追踪最大 span 数
+    agent_tracing_max_spans: int = 1000
 
     # OTLP 导出(可选):配置端点后,事件同步转发到 OTLP 兼容后端
     # (Langfuse / OpenTelemetry Collector / 自建网关)。留空则仅本地 JSONL+内存。
     otel_exporter_otlp_endpoint: str = ""
     # 是否带 token/成本属性的 LLM 调用细节(大流量时可关)
     otel_export_llm_details: bool = True
+
+    # 告警配置
+    agent_alerts_enabled: bool = True
+    # 告警检查间隔(秒)
+    agent_alerts_check_interval: int = 60
 
     # ---- 安全 ----
     # 非空时所有 API 路由需携带 Authorization: Bearer <key>
@@ -421,6 +494,46 @@ class Settings(BaseSettings):
     # 开启后,除关键词匹配外,额外调用 LLM 做语义级 Prompt 注入/提示词泄露检测
     # (性能敏感场景建议关闭,会增加约 1 次 LLM 调用)
     guardrail_semantic_enabled: bool = False
+    # 护栏使用的独立模型(留空则复用主模型)
+    guardrail_semantic_provider: str = ""
+    guardrail_semantic_model: str = ""
+    # 护栏检测阈值配置
+    guardrail_pii_action: str = "sanitize"  # allow / warn / sanitize / block
+    guardrail_injection_action: str = "block"
+    guardrail_harmful_action: str = "block"
+
+    # ---- 人工介入断点系统 ----
+    # 启用人工介入断点(计划/工具/决策/代码审查/部署)
+    agent_human_in_the_loop_enabled: bool = True
+    # 默认审批超时(秒)
+    agent_hitl_default_timeout: int = 300
+    # 超时后自动决策: reject/approve/escalate
+    agent_hitl_timeout_action: str = "reject"
+    # 审批模式: single/sequential/parallel/quorum/any
+    agent_hitl_approval_mode: str = "single"
+    # 会签模式下所需票数
+    agent_hitl_quorum_count: int = 2
+    # 会签模式下所需比例
+    agent_hitl_quorum_ratio: float = 0.5
+    # 通知渠道: webhook/email/dingtalk/slack/feishu
+    agent_hitl_notification_channels: str = "webhook"
+    # 默认审批人列表(JSON: [{"id": "", "name": "", "role": "", "contact": ""}])
+    agent_hitl_default_approvers: str = ""
+
+    # ---- 技能/工具市场 ----
+    # 启用技能市场
+    agent_skill_marketplace_enabled: bool = True
+    # 技能仓库 URL(逗号分隔,支持 http/git/local)
+    agent_skill_registry_url: str = ""
+    # 技能签名信任锚点文件路径
+    skill_trust_anchors_file: str = ""
+    # 沙箱强制使用 Docker
+    sandbox_force_docker: bool = False
+    # 技能默认资源限制
+    skill_default_memory_mb: int = 512
+    skill_default_cpu_percent: int = 50
+    skill_default_timeout_seconds: int = 60
+    skill_default_network_allowed: bool = False
 
     # ---- 文件写权限 ----
     # write_file 工具允许写入的根目录白名单(逗号分隔,可用相对路径);空则仅允许数据目录

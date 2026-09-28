@@ -71,27 +71,36 @@ class TestLoopController:
     async def test_while_loop(self):
         from app.core.workflow.loop_controller import LoopController
 
-        call_count = 0
+        from app.core.workflow.models import WorkflowNode, NodeType
+
+        body_node = WorkflowNode(id="counter", type=NodeType.SCRIPT, name="counter",
+                                 script_code="count = count + 1")
 
         async def mock_execute(node):
-            nonlocal call_count
-            call_count += 1
-            return {"count": call_count}
+            # 模拟循环体:每轮自增。结果按 node_id 回写(_execute_body),
+            # 所以条件里用 counter.count 读取本轮产出
+            prev = controller.variables.get("counter", {}).get("count", 0)
+            return {"count": prev + 1}
 
         controller = LoopController(
             loop_config={
                 "type": "while",
-                "while_condition": "count < 3",
+                "while_condition": "counter.count < 3",
                 "max_iterations": 10,
+                "subgraph_ids": ["counter"],
             },
-            workflow_nodes={},
-            variables={"count": 0},
+            workflow_nodes={"counter": body_node},
+            # 计数器需有初值:while 是先求条件再执行体,首轮求值必须能读到 counter
+            # (未定义变量按安全默认判 False,循环会一次都不跑)
+            variables={"counter": {"count": 0}},
             node_results={},
             execute_node_func=mock_execute,
         )
 
         from app.core.workflow.dynamic_router import DynamicEdgeEvaluator
-        evaluator = DynamicEdgeEvaluator(variables={"count": 0})
+        # 必须传 controller 的活引用:循环体每轮产出会回写,评估器按最新值求值
+        evaluator = DynamicEdgeEvaluator(variables=controller.variables,
+                                         node_results=controller.node_results)
         result = await controller.execute(evaluator)
 
         assert result["iterations"] == 3
@@ -155,8 +164,10 @@ class TestSagaOrchestrator:
         saga.register("node_1", action, compensation, description="创建")
         saga.register("node_2", action, compensation, description="处理")
 
-        await saga.execute("node_1", node_id="node_1")
-        await saga.execute("node_2", node_id="node_2")
+        # node_id 由 execute() 自动注入 kwargs,不能重复以关键字传入
+        # (原写法 execute("node_1", node_id="node_1") 会因位置+关键字重复而 TypeError)
+        await saga.execute("node_1")
+        await saga.execute("node_2")
 
         assert executed == ["node_1", "node_2"]
 

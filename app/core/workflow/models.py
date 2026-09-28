@@ -84,6 +84,10 @@ class WorkflowNode:
     loop_mode: LoopMode = LoopMode.SEQUENTIAL
     subgraph_ids: list[str] = field(default_factory=list)  # 循环内执行的节点 ID
 
+    # SAGA 补偿:节点成功执行后登记补偿动作,工作流失败时逆序回滚。
+    # 形如 {"type": "script", "code": "..."} 或 {"type": "http", "http_config": {...}}
+    compensation: Optional[dict] = None
+
     # 输出 schema 校验
     output_schema: Optional[dict] = None
 
@@ -108,6 +112,9 @@ class WorkflowEdge:
 
     # 动态条件（运行时计算）
     condition_expr: Optional[str] = None
+
+    # 默认分支:当同一源节点所有条件边均不激活时,该边作为兜底目标被激活
+    is_default: bool = False
 
 
 @dataclass

@@ -16,6 +16,11 @@ from typing import Any, Callable, Optional
 logger = logging.getLogger(__name__)
 
 
+async def _noop_action(**kwargs) -> dict:
+    """正向动作占位:节点实际执行由工作流执行器完成,SAGA 只负责登记与补偿。"""
+    return {}
+
+
 @dataclass
 class SagaAction:
     """SAGA 事务动作。"""
@@ -79,6 +84,26 @@ class SagaOrchestrator:
         """注销节点。"""
         self._actions.pop(node_id, None)
 
+    def register_compensation(
+        self,
+        node_id: str,
+        compensation: Optional[Callable] = None,
+        timeout: float = 60.0,
+    ) -> None:
+        """登记某节点已执行并附带补偿动作(供失败回滚)。
+
+        正向动作使用空操作占位——该节点的真实执行由工作流执行器负责,
+        SAGA 编排器只负责在失败时逆序触发 compensation。
+
+        关键:必须同时把节点记入 _executed。_executed 原本只在 execute() 中
+        追加,而执行器是自己跑节点、从不调 execute(),导致 get_executed_nodes()
+        恒为空、_compensate_failed_run 直接 return —— 补偿永不触发。
+        由于调用本方法时该节点已经真实执行成功了,这里标记为已执行是准确的。
+        """
+        self.register(node_id, _noop_action, compensation=compensation, timeout=timeout)
+        if node_id not in self._executed:
+            self._executed.append(node_id)
+
     async def execute(self, node_id: str, **kwargs) -> dict:
         """执行节点的正向操作。
 
@@ -97,8 +122,11 @@ class SagaOrchestrator:
             raise RuntimeError(f"未注册节点动作: {node_id}")
 
         try:
+            # 把 node_id 注入调用参数,便于动作/补偿函数识别自身所属节点
+            call_kwargs = dict(kwargs)
+            call_kwargs.setdefault("node_id", node_id)
             result = await asyncio.wait_for(
-                action.action(**kwargs),
+                action.action(**call_kwargs),
                 timeout=action.timeout,
             )
             self._executed.append(node_id)
@@ -171,7 +199,12 @@ class SagaOrchestrator:
         return self._results.get(node_id)
 
     def reset(self) -> None:
-        """重置 SAGA 状态(新运行开始时调用)。"""
+        """重置 SAGA 状态(新运行开始时调用)。
+
+        必须连同 _actions 一起清空:执行器是缓存复用的,不清会让上一次运行
+        登记的动作泄漏到下一次运行,造成跨运行的误补偿。
+        """
+        self._actions.clear()
         self._executed.clear()
         self._results.clear()
         self._compensating = False

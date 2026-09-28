@@ -28,3 +28,32 @@ NO_RETRY_TOOLS = frozenset({
     "run_terminal",
     "read_file", "write_file", "edit_file",
 })
+
+# ---- 上下文超长错误的判定(agent.py 与 agent_impl.py 共用) ----
+# 白名单式特征词,避免误伤其他错误。
+CONTEXT_LENGTH_MARKERS = (
+    "context_length", "context length", "context window", "context limit",
+    "maximum context", "max context", "too long",
+    "reduce the length", "maximum token", "token limit exceeded",
+)
+
+# 限流/配额类错误特征:命中即排除"上下文超长"判定。
+# 上游 429 原文 "You've reached the API rate limit for free users. Upgrade to a
+# Token Plan to unlock higher limits..." 同时含 "token" 与 "limit";旧写法
+# `"token" in err and ("limit" in err or "exceed" in err)` 会把它误判成上下文超长
+# → 白白修剪历史消息再打一次 LLM(2026-09-28 实测于 backend.log)。
+RATE_LIMIT_MARKERS = (
+    "rate limit", "429", "too many requests", "频率", "限流", "请求过快", "配额", "quota",
+)
+
+
+def is_context_length_error(error: str) -> bool:
+    """判断是否为"上下文超长"错误。
+
+    先排除限流/配额类错误(其文案里也可能出现 token/limit 字样),再做特征词匹配。
+    """
+    err = (error or "").lower()
+    if any(m in err for m in RATE_LIMIT_MARKERS):
+        return False
+    return any(m in err for m in CONTEXT_LENGTH_MARKERS)
+

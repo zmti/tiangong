@@ -2,12 +2,28 @@
 (function () {
   const DEFAULT_TIMEOUT = 60000; // 60s 默认超时
 
+  // 这些 body 类型必须由浏览器设置 Content-Type(带 boundary),代码不能代劳
+  function _needsBrowserContentType(body) {
+    if (body == null) return false;
+    if (typeof FormData !== 'undefined' && body instanceof FormData) return true;
+    if (typeof Blob !== 'undefined' && body instanceof Blob) return true;
+    if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) return true;
+    if (typeof ArrayBuffer !== 'undefined' && body instanceof ArrayBuffer) return true;
+    if (ArrayBuffer.isArrayBuffer && body.buffer instanceof ArrayBuffer) return true; // TypedArray
+    return false;
+  }
+
   async function api(path, opts = {}) {
     opts = opts || {};
     const headers = opts.headers || {};
 
     // POST/PUT 有 body 时自动加 Content-Type（除非调用方已指定）
-    if (opts.body && !headers['Content-Type'] && !headers['content-type']) {
+    // ⚠️ FormData / Blob / URLSearchParams 必须让浏览器自己带
+    //    multipart/form-data; boundary=xxx —— 手动写成 application/json 会让
+    //    后端整个 body 解析失败(实测 /v1/vision 返回 422 "body.file Field required"),
+    //    影响全部上传类接口:附件、知识库、视频、语音、图片识别。
+    if (opts.body && !headers['Content-Type'] && !headers['content-type']
+        && !_needsBrowserContentType(opts.body)) {
       headers['Content-Type'] = 'application/json';
     }
 
@@ -82,8 +98,28 @@
     }
   }
 
+  /* 把 FastAPI 的错误响应体转成人话:
+   * - {"detail":"文本"}            → 文本
+   * - {"detail":[{"loc":[...],"msg":"..."}]} → "body.file: Field required"
+   * - 其它 / 空                    → 紧凑 JSON,绝不出现 [object Object]
+   */
+  function formatApiDetail(data) {
+    const d = (data && data.detail !== undefined) ? data.detail : data;
+    if (typeof d === 'string') return d;
+    if (Array.isArray(d)) {
+      return d.map((x) => {
+        if (!x || typeof x !== 'object') return String(x);
+        const loc = Array.isArray(x.loc) ? x.loc.filter((p) => p !== 'body').join('.') : '';
+        return loc ? `${loc}: ${x.msg}` : (x.msg || JSON.stringify(x));
+      }).join('; ');
+    }
+    if (d && typeof d === 'object') return JSON.stringify(d);
+    return d ? String(d) : '';
+  }
+
   window.App = window.App || {};
   App.api = api;
+  App.formatApiDetail = formatApiDetail;
   App.apiJSON = apiJSON;
   App.parseRes = parseRes;
   App.pingBackend = pingBackend;

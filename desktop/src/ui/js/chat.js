@@ -507,6 +507,29 @@ App.Chat.doSend = async function (text, opts = {}) {
     }
   }
 
+  // 内联展示生成结果(图片/视频)。返回 true 表示已展示。
+  // 用于"没有生成中进度卡"的情形:进度卡由 tool_call_start 触发,若该事件缺失
+  // (页面刷新、断线重连、恢复运行等),只调 finishXxxGenerating 会静默什么都不做,
+  // 用户就只看到 agent 那句"结果已展示"却空无一物。
+  function _insertInlineMedia(toolName, resultStr, stepId) {
+    const videoName = toolName === 'generate_video' || toolName === 'enhance_video';
+    const imgUrl = (!videoName && App.parseImageUrl) ? App.parseImageUrl(resultStr) : '';
+    const videoUrl = (videoName && App.parseVideoUrl) ? App.parseVideoUrl(resultStr) : '';
+    if (!imgUrl && !videoUrl) return false;
+    // 同一 step_id 只插一次(tool / tool_done 两个事件都可能触发)
+    if (stepId && App.Chat.pane().querySelector('.tool-inline[data-step-id="' + stepId + '"]')) {
+      return true;
+    }
+    const el = document.createElement('div');
+    el.className = 'tool-inline';
+    if (stepId) el.dataset.stepId = stepId;
+    el.innerHTML = videoUrl
+      ? App.buildVideoHtml(videoUrl, 'tool-result-video')
+      : `<img class="tool-result-img" src="${App.escapeHtml(imgUrl)}" alt="生成图片">`;
+    _insertBeforeAnswer(el);
+    return true;
+  }
+
   // ── 辅助:显示 process-rail ──
   function _showRail() {
     if (App._answerWrap && App._answerWrap._rail) {
@@ -888,6 +911,15 @@ App.Chat.doSend = async function (text, opts = {}) {
               (evt.type === 'tool_route' && _toolNames.indexOf('generate_image') !== -1)) {
             App.showImageGenerating();
           }
+          // 视频生成同样尽早展示"生成中"卡:视频通常要几分钟,没有进度提示时
+          // 用户只会看到界面毫无反应(这正是"怎么没显示"的一半原因)
+          const _vidNames = ['generate_video', 'enhance_video'];
+          const _hasVid = _vidNames.indexOf(_toolName) !== -1 ||
+                          _vidNames.some((n) => (_toolNames || []).indexOf(n) !== -1);
+          if (_hasVid && (evt.type === 'tool_call_start' || evt.type === 'tool_start' ||
+                          evt.type === 'tool_call_delta' || evt.type === 'tool_route')) {
+            App.showVideoGenerating();
+          }
           // 执行轨迹:实时显示每个工具调用
           // tool_call_start: 批量预填充工具开始状态(并行调用时提前显示)
           if (evt.type === 'tool_call_start') {
@@ -931,6 +963,15 @@ App.Chat.doSend = async function (text, opts = {}) {
             // 图片生成完成:立即展示图片到进度卡片
             if (toolName === 'generate_image' && App.finishImageGenerating) {
               App.finishImageGenerating(evt.result || '');
+            }
+            // 视频生成完成:此前**没有**任何实时展示路径(播放器只在后端根本不发的
+            // tool_done 分支和历史渲染里),用户只看到"结果已展示"却什么都没有。
+            if (toolName === 'generate_video' || toolName === 'enhance_video') {
+              if (App._mediaCards && App._mediaCards.video && App.finishVideoGenerating) {
+                App.finishVideoGenerating(evt.result || '');
+              } else {
+                _insertInlineMedia(toolName, evt.result || '', evt.step_id);
+              }
             }
             App.updateRailStatus(App._currentBotMsg, ok ? 'done' : 'error',
               `${toolName} ${ok ? '✓' : '✗'}`);
@@ -976,17 +1017,18 @@ App.Chat.doSend = async function (text, opts = {}) {
                 // 没有重复记录,才显示结果
                 App.ExecTrace.updateStep(doneToolName, 'done', '');
                 const imgUrl = App.parseImageUrl(evt.result);
-                const videoUrl = App.parseVideoUrl ? App.parseVideoUrl(evt.result) : '';
                 if (doneToolName === 'generate_image' && imgUrl) {
                   const toolEl = document.createElement('div');
                   toolEl.className = 'tool-inline';
                   toolEl.innerHTML = `<img class="tool-result-img" src="${App.escapeHtml(imgUrl)}" alt="生成图片">`;
                   _insertBeforeAnswer(toolEl);
-                } else if ((doneToolName === 'generate_video' || doneToolName === 'enhance_video') && videoUrl) {
-                  const toolEl = document.createElement('div');
-                  toolEl.className = 'tool-inline';
-                  toolEl.innerHTML = App.buildVideoHtml(videoUrl, 'tool-result-video');
-                  _insertBeforeAnswer(toolEl);
+                } else if (doneToolName === 'generate_video' || doneToolName === 'enhance_video') {
+                  // 走统一的插入函数:带 step_id 去重,避免与 tool 事件重复插播放器
+                  if (!_insertInlineMedia(doneToolName, evt.result || '', evt.step_id)) {
+                    if (evt.result) {
+                      App.addToolStepIfNew(App._currentBotMsg, doneToolName, evt.arguments || '', 'done', evt.result, evt.step_id);
+                    }
+                  }
                 } else if (evt.result) {
                   // 统一使用 addStep 渲染,保持与历史消息一致(带 step_id 供去重)
                   App.addToolStepIfNew(App._currentBotMsg, doneToolName, evt.arguments || '', 'done', evt.result, evt.step_id);
@@ -1585,7 +1627,17 @@ App.Chat.doSend = async function (text, opts = {}) {
        状态 —— 这正是"再次发送后停止按钮消失、不知可否发送"的根因。 */
     const isStale = (App.Chat._sendSeq || 0) !== mySeq;
     App.Chat._streamingStart = null;
-    if (streamingSet && !isStale) App.Chat.setStreaming(false);
+    /* 多会话并行: 无论是否 stale, 本轮所属会话自己的 streaming 标记都必须清除,
+       否则后台会话的流结束后其 r.streaming 永久残留 —— 侧边栏"后台生成中"呼吸点错乱,
+       且切回时误判仍在生成。全局/前台 UI 仍受 isStale 保护: 被更新的发送取代的旧流
+       不得复位前台状态(否则会把新流的 stopBtn/输入锁定覆盖掉)。 */
+    if (streamingSet) {
+      if (!isStale) {
+        App.Chat.setStreaming(false, mySid);
+      } else if (App.Session && App.Session._runs && App.Session._runs.has(mySid)) {
+        App.Session._runs.get(mySid).streaming = false;
+      }
+    }
     clearTimeout(connectTimer); // 兜底清理建连超时(仅本轮 timer, 幂等)
     // 确保分组被关闭
     if (App._currentGroup) {
@@ -1669,40 +1721,48 @@ App.Chat.stop = function (silent) {
   App.abortController = null;
 };
 
-App.Chat.setStreaming = function (val) {
-  App.streaming = val;
-  /* 修复"发送后不能停止/不知道是否可发送": 旧实现用
-     document.body.className = className.replace(...) 同步 class,
-     会把 body 上所有其他 class(sidebar-collapsed/side-open/has-messages 等)全部清掉,
-     导致布局塌掉且后续 class 判断失效。现改用 classList 精确增删, 绝不动其他 class */
-  if (val) {
+/* 多会话并行: streaming 状态改为"每会话一份 + 全局仅代表前台"。
+   - 传入 sid 时同步该会话自己的 r.streaming(仅当该会话已 parked/在 _runs 中才写,
+     避免给前台活跃会话注入多余 _runs 条目)。
+   - 全局 App.streaming 始终只代表"当前前台会话"是否在生成,供输入锁定 / UI 使用。
+   这样后台会话的流结束不会影响前台的可发送判定,真正支持多会话同时运行。 */
+/* 统一刷新"全局流式 UI":body.streaming class / stopBtn(.show) / sendBtn(disabled) /
+   状态条。完全由 App.streaming(前台会话是否在生成)驱动,供 setStreaming / park / unpark 共用,
+   避免"切会话后执行中视觉状态残留 / 切回后不恢复"。 */
+App.Chat.applyStreamingVisual = function () {
+  const on = !!App.streaming;
+  /* 修复"发送后不能停止/不知道是否可发送": 用 classList 精确增删 body.streaming,
+     绝不动其他 class(sidebar-collapsed/side-open/has-messages 等),防止布局塌掉。 */
+  if (on) {
     document.body.classList.add('streaming');
   } else {
     document.body.classList.remove('streaming');
   }
-  /* 修复"不能停止": stopBtn 显隐改由 JS 直接控制 .show class, 不依赖 body.streaming,
-     彻底与 body class 同步解耦(旧实现在 streaming class 被清掉后 stopBtn 永远不可见) */
-  if (val) {
-    if (App.els.stopBtn) App.els.stopBtn.classList.add('show');
-  } else {
-    if (App.els.stopBtn) App.els.stopBtn.classList.remove('show');
+  /* 修复"不能停止": stopBtn 显隐由 JS 直接控制 .show class, 与 body class 解耦。 */
+  if (App.els.stopBtn) {
+    if (on) App.els.stopBtn.classList.add('show');
+    else App.els.stopBtn.classList.remove('show');
   }
-  // val=true 时禁用 sendBtn + 显示 stopBtn; val=false 时按输入内容启用 sendBtn + 隐藏 stopBtn
+  // on=true 时禁用 sendBtn; on=false 时按输入内容启用 sendBtn
   const inp = App.els.input;
-  if (val) {
-    if (App.els.sendBtn) App.els.sendBtn.disabled = true;
-  } else {
-    if (App.els.sendBtn) App.els.sendBtn.disabled = !(inp && inp.value.trim());
+  if (App.els.sendBtn) {
+    App.els.sendBtn.disabled = on ? true : !!(inp && inp.value.trim());
   }
-
   // 更新加载状态
   if (App.UI && App.UI.Status) {
-    if (val) {
-      App.UI.Status.showLoading('思考中...');
-    } else {
-      App.UI.Status.clearStatus();
-    }
+    if (on) App.UI.Status.showLoading('思考中...');
+    else App.UI.Status.clearStatus();
   }
+};
+
+App.Chat.setStreaming = function (val, sid) {
+  const targetSid = sid || App.sessionId;
+  if (App.Session && App.Session._runs && App.Session._runs.has(targetSid)) {
+    App.Session._runs.get(targetSid).streaming = val;
+  }
+  if (targetSid !== App.sessionId) return; // 非前台会话:只更新其自身记录,不动全局/UI
+  App.streaming = val;
+  App.Chat.applyStreamingVisual();
 };
 
 /* 输入框自动高度：根据内容行数调整，最多 6 行 */
@@ -1812,18 +1872,32 @@ App.Chat.recognizeImage = async function (file) {
     App.Chat._streamingStart = Date.now();
     App.Chat.setStreaming(true);
     const res = await App.api('/v1/vision', { method: 'POST', body: fd });
-    const data = await res.json();
+    const data = await res.json().catch(() => ({}));
     App.removeTyping();
-    if (data.error) {
+    // ⚠️ 非 2xx 时响应体是 {"detail": "..."},既没有 answer 也没有 error。
+    // 以前一律兜底成"请确认已选择支持视觉的模型",把 401/400/413/422/500
+    // 全部伪装成"模型不支持视觉",误导排查。必须先看 HTTP 状态。
+    if (!res.ok) {
+      // FastAPI 的 422 detail 是数组(每项含 loc/msg),直接进模板会变成 [object Object]
+      const detail = App.formatApiDetail ? App.formatApiDetail(data) : JSON.stringify(data);
+      App.appendMessage(`❌ 图片识别失败(HTTP ${res.status})：${detail || '服务端未给出原因'}`, 'error');
+    } else if (data.error) {
       App.appendMessage(`❌ ${data.error}`, 'error');
     } else if (data.answer) {
       App.appendMessage(data.answer, 'bot');
     } else {
-      App.appendMessage('未能识别图片内容，请确认已选择支持视觉的模型(如 qwen-vl、gpt-4o)', 'bot');
+      const m = data.model ? `（模型 ${data.model}）` : '';
+      App.appendMessage(`未能识别图片内容${m}，请确认已选择支持视觉的模型(如 qwen-vl、gpt-4o)`, 'bot');
     }
   } catch (e) {
     App.removeTyping();
-    App.appendMessage(`图片识别失败: ${e.message}`, 'error');
+    // api.js 有 60s 超时保护,超时会 abort —— 文案要把"超时"说清楚,
+    // 否则用户只看到 "The user aborted a request."(浏览器原生文案)
+    const aborted = e && (e.name === 'AbortError' || /abort/i.test(e.message || ''));
+    App.appendMessage(
+      aborted ? '❌ 图片识别超时(超过 60 秒未返回),请换一张更小的图片或稍后重试'
+              : `❌ 图片识别失败: ${e.message}`,
+      'error');
   } finally {
     // 无论成功/失败都必须重置 streaming 状态,防止按钮卡死
     App.Chat._streamingStart = null;

@@ -11,7 +11,7 @@ import asyncio
 import json
 
 from app.core.agent import Agent
-from app.core.llm import LLMClient, ChatResult
+from app.core.llm import LLMClient, ChatResult, LLMError
 from app.tools.registry import ToolRegistry, _build_params_model, Tool
 
 
@@ -123,3 +123,44 @@ def test_max_steps_zero_hard_cap_bounds_truly_infinite():
     tool_steps = [s for s in result.steps if s.get("type") == "tool"]
     assert "无法完成" not in result.answer, f"50 轮远小于硬兜底 500,不应 giveup: {result.answer}"
     assert len(tool_steps) == 50, f"应跑满 50 轮,实际 {len(tool_steps)}"
+
+
+class FailingMockLLM(UnlimitedMockLLM):
+    """所有 chat 调用都抛 LLMError:模拟第 1 轮就因模型故障中止。"""
+
+    async def chat(self, messages, temperature=0.7):
+        raise LLMError("模拟模型不可用")
+
+    async def chat_stream(self, messages, temperature=0.7):
+        raise LLMError("模拟模型不可用")
+        yield  # pragma: no cover  (使函数成为 async generator)
+
+
+def test_giveup_does_not_blame_step_limit_on_llm_error():
+    """回归:LLM 第 1 轮就失败时,不能报"已尝试 10 步,仍未得到正确结果"。
+
+    旧实现在 _node_giveup 里无条件用 self.max_steps 当已执行步数,导致用户看到
+    与实际完全无关的步数,无法判断真实原因。现按 giveup_reason 报真实原因。
+    """
+    reg = _make_registry()
+    agent = Agent(llm=FailingMockLLM(["x"]), registry=reg, max_steps=10, route=False)
+
+    result = asyncio.run(agent.run("随便问点什么"))
+
+    assert "已尝试 10 步" not in result.answer, \
+        f"模型故障时不该报成步数耗尽,实际: {result.answer}"
+    assert "模型调用出错" in result.answer, \
+        f"应报真实原因(模型调用出错),实际: {result.answer}"
+
+
+def test_giveup_reports_actual_rounds_when_max_steps_zero():
+    """max_steps=0 走到 giveup 时,步数口径用实际执行轮数,而不是 0。"""
+    reg = _make_registry()
+    agent = Agent(llm=FailingMockLLM(["x"]), registry=reg, max_steps=0, route=False)
+
+    result = asyncio.run(agent.run("随便问点什么"))
+
+    assert "已尝试 0 步" not in result.answer, \
+        f"max_steps=0 时不该报'已尝试 0 步',实际: {result.answer}"
+    assert "模型调用出错" in result.answer, \
+        f"应报真实原因(模型调用出错),实际: {result.answer}"

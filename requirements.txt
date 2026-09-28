@@ -9,6 +9,9 @@ faiss-cpu>=1.9; python_version >= "3.9"
 opentelemetry-sdk>=1.25
 opentelemetry-exporter-otlp-proto-http>=1.25
 pytest>=8.0
+# 异步测试必需:缺少它时所有 `async def` 用例会以 "async def functions are not
+# natively supported" 直接失败(即异步测试常年零覆盖),且该失败不体现在报错信息里。
+pytest-asyncio>=0.24
 python-multipart>=0.0.9
 croniter>=1.4
 matplotlib>=3.8

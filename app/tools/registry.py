@@ -33,6 +33,7 @@ class Tool:
         json_schema: Optional[dict] = None,
         enabled: bool = True,
         terminal: bool = False,
+        enabled_fn: Optional[Callable[[], bool]] = None,
     ):
         self.name = name
         self.description = description
@@ -40,9 +41,34 @@ class Tool:
         self.timeout = timeout
         self.params_model = params_model
         self.json_schema = json_schema or {"type": "object", "properties": {}}
-        self.enabled = enabled
+        self._enabled = bool(enabled)
         self.terminal = terminal
         self.is_async = asyncio.iscoroutinefunction(func)
+        # 动态开关求值器(见下方 enabled property)
+        self.enabled_fn = enabled_fn
+
+    @property
+    def enabled(self) -> bool:
+        """是否可用。传了 enabled_fn 时每次读取都会重新求值。
+
+        为什么需要它:`@tool(enabled=...)` 的布尔值在模块导入时就定死了,设置页把
+        某个能力关掉后,不重启后端就纹丝不动。动态求值让"改完立即生效"这件事成立
+        (list_sync 过滤 → LLM 看不到该工具;Tool.run 兜底 → 即使被调用也拒绝)。
+
+        _enabled 是"硬否决":任何代码显式置 False(如 MCP 工具断开)都保持关闭,
+        动态函数说启用也不算数;enabled_fn 抛异常时同样回落到 _enabled,不让
+        一个求值失败把工具意外打开。
+        """
+        if self.enabled_fn is None:
+            return self._enabled
+        try:
+            return bool(self.enabled_fn()) and self._enabled
+        except Exception:  # noqa: BLE001
+            return self._enabled
+
+    @enabled.setter
+    def enabled(self, value: bool) -> None:
+        self._enabled = bool(value)
 
     def __call__(self, *args, **kwargs):
         """让 Tool 实例能像原函数一样被直接调用(转发到 self.func)。
@@ -110,7 +136,16 @@ class Tool:
     async def run(self, arguments: str | dict) -> str:
         """执行工具,统一返回 JSON 字符串结果。"""
         if not self.enabled:
-            return json.dumps({"error": f"工具 {self.name} 已被禁用"}, ensure_ascii=False)
+            # 工具被禁用(如被用户规则拦截、MCP 断开、无可用端点)不该长成一句裸报错:
+            # error 写成人话(前端会原样显示给用户),disabled/model_manual 供前端
+            # 区分"被禁用"与"执行失败"——前者不渲染红色失败卡片,也不重试。
+            # 注:「设置 → 生成模型」的开关不会走到这里,那个开关只是改用当前对话模型。
+            return json.dumps({
+                "error": f"{self.name} 当前不可用(已被禁用)",
+                "disabled": True,
+                "manual": True,
+                "hint": "请勿重试,也不要修改配置文件绕过;直接告知用户该能力当前不可用。",
+            }, ensure_ascii=False, indent=None)
 
         # 参数解析
         if isinstance(arguments, str):
@@ -241,10 +276,17 @@ def _build_params_model(func: Callable) -> tuple[Optional[type[BaseModel]], dict
     return model, simplified
 
 
-def tool(name: Optional[str] = None, description: str = "", timeout: float = 30.0, enabled: bool = True, terminal: bool = False):
+def tool(name: Optional[str] = None, description: str = "", timeout: float = 30.0, enabled: bool = True,
+         terminal: bool = False, enabled_fn: Optional[Callable[[], bool]] = None):
     """工具装饰器:注册到全局默认注册器。支持 @tool 和 @tool(...) 两种用法。
 
     terminal=True 表示工具执行成功后即为最终结果,agent 不再调用 LLM 收尾(适用于图片生成等返回体直接展示的工具)。
+    enabled_fn 是可动态求值的开关(每次读取 t.enabled 都会重新调用);enabled 只作为导入时的静态初值。
+
+    注意(踩过的坑):enabled 与 enabled_fn 是"与"关系,且 enabled 在 import 那一刻
+    就固化了。所以**不要把随用户设置变化的条件写成 enabled=_some_dynamic_check()** ——
+    那个瞬时值会被永久留住(用户后来重新打开开关,工具也回不来了,只能重启后端)。
+    凡是用户可开关的能力,只挂 enabled_fn;enabled 留给"代码层面明确禁用"(如 MCP 断开)。
     """
 
     def _decorate(func: Callable) -> Tool:
@@ -260,6 +302,7 @@ def tool(name: Optional[str] = None, description: str = "", timeout: float = 30.
             json_schema=json_schema,
             enabled=enabled,
             terminal=terminal,
+            enabled_fn=enabled_fn,
         )
         # 使用同步注册，因为装饰器在模块导入时调用
         default_registry.register(t)

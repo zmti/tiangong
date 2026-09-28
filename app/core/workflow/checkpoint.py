@@ -92,6 +92,11 @@ class WorkflowCheckpointManager:
             os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
             self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
+            # WAL 写前日志:降低单连接写锁冲突概率(多运行并发持久化 checkpoint 时)
+            try:
+                self._conn.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.DatabaseError:
+                pass
             self._create_tables()
         return self._conn
 
@@ -433,6 +438,7 @@ class WorkflowCheckpointManager:
         cutoff = time.time() - max_age_hours * 3600
 
         # 清理检查点表
+        before_total = conn.total_changes
         deleted_checkpoints = conn.execute(
             "DELETE FROM checkpoints WHERE timestamp < ?",
             (cutoff,),
@@ -449,7 +455,9 @@ class WorkflowCheckpointManager:
             )
             AND timestamp < ?
         """, (cutoff,))
-        deleted_history = conn.total_changes - deleted_checkpoints
+        # 正确计算本次语句删除的历史行数(conn.total_changes 是连接生命周期累计值,
+        # 必须取差值)
+        deleted_history = (conn.total_changes - before_total) - deleted_checkpoints
 
         conn.commit()
         logger.info(f"清理过期检查点: checkpoints={deleted_checkpoints}, history={deleted_history}")
