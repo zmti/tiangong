@@ -11,28 +11,43 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 
 
-def cleanup_old_sessions(days: int = 30) -> dict:
-    """清理过期会话及其关联数据。
-    
+def cleanup_old_sessions(days: int = 30, checkpoint_days: int = None) -> dict:
+    """清理过期会话及其关联的检查点数据。
+
     Args:
-        days: 保留天数，默认 30 天
-        
+        days: 会话保留天数，默认 30 天
+        checkpoint_days: 检查点保留天数，默认与 days 相同；可单独设更短
+            (如用 settings.checkpoint_ttl_days=7)以更早回收 checkpoint 大 blob
+
     Returns:
-        清理统计信息
+        清理统计信息: {cleaned(会话数), checkpoint_rows, version_rows,
+                       freed_mb, days, checkpoint_days}
     """
     import sqlite3
     import os
-    
+
     data_dir = Path(settings.resolved_data_dir)
     sessions_db = data_dir / "sessions.db"
-    
+    checkpoints_db = data_dir / "checkpoints.db"
+
     if not sessions_db.exists():
         return {"cleaned": 0, "reason": "sessions.db 不存在"}
-    
+
     cutoff = time.time() - (days * 86400)
+    cp_days = checkpoint_days if checkpoint_days else days
+    cp_cutoff = time.time() - (cp_days * 86400)
     cleaned = 0
-    
+    checkpoint_rows = 0
+    version_rows = 0
+    size_before = 0
+    size_after = 0
+
     try:
+        # 记录清理前涉及的两个库体积
+        size_before = sessions_db.stat().st_size
+        if checkpoints_db.exists():
+            size_before += checkpoints_db.stat().st_size
+
         with sqlite3.connect(str(sessions_db)) as conn:
             # 删除过期会话
             result = conn.execute(
@@ -40,19 +55,46 @@ def cleanup_old_sessions(days: int = 30) -> dict:
                 (cutoff,)
             )
             cleaned = result.rowcount
-            
-            # 删除过期检查点
-            checkpoints_db = data_dir / "checkpoints.db"
-            if checkpoints_db.exists():
-                with sqlite3.connect(str(checkpoints_db)) as cp_conn:
-                    cp_conn.execute(
-                        "DELETE FROM checkpoints WHERE updated_at < ?",
-                        (cutoff,)
-                    )
-        
-        logger.info(f"清理 {cleaned} 个过期会话（{days} 天前）")
-        return {"cleaned": cleaned, "days": days}
-        
+            conn.commit()
+            # VACUUM 回收删除后留下的空页(否则只删数据不释放磁盘)
+            conn.execute("VACUUM")
+
+        # 清理过期检查点: checkpoints 表(按 updated_at) + checkpoint_versions 表
+        # (按 created_at; 该表存各节点状态快照的 state blob, 是 checkpoints.db 体积大头)
+        if checkpoints_db.exists():
+            with sqlite3.connect(str(checkpoints_db)) as cp_conn:
+                checkpoint_rows = cp_conn.execute(
+                    "DELETE FROM checkpoints WHERE updated_at < ?",
+                    (cp_cutoff,),
+                ).rowcount
+                try:
+                    version_rows = cp_conn.execute(
+                        "DELETE FROM checkpoint_versions WHERE created_at < ?",
+                        (cp_cutoff,),
+                    ).rowcount
+                except sqlite3.OperationalError:
+                    version_rows = 0  # 旧库可能没有 checkpoint_versions 表
+                cp_conn.commit()
+                cp_conn.execute("VACUUM")
+
+        size_after = sessions_db.stat().st_size
+        if checkpoints_db.exists():
+            size_after += checkpoints_db.stat().st_size
+        freed_mb = max(0.0, round((size_before - size_after) / 1024 / 1024, 2))
+
+        logger.info(
+            f"清理 {cleaned} 个过期会话、{checkpoint_rows} 个检查点、"
+            f"{version_rows} 个检查点版本(会话>{days}d, 检查点>{cp_days}d), 释放 {freed_mb}MB"
+        )
+        return {
+            "cleaned": cleaned,
+            "checkpoint_rows": checkpoint_rows,
+            "version_rows": version_rows,
+            "freed_mb": freed_mb,
+            "days": days,
+            "checkpoint_days": cp_days,
+        }
+
     except Exception as e:
         logger.error(f"清理会话失败: {e}")
         return {"cleaned": 0, "error": str(e)}
@@ -171,22 +213,24 @@ def get_cleanup_stats() -> dict:
     return stats
 
 
-def run_cleanup(days: int = 30) -> dict:
+def run_cleanup(days: int = 30, checkpoint_days: int = None) -> dict:
     """运行完整的清理流程。
-    
+
     Args:
-        days: 会话保留天数
-        
+        days: 会话/日志保留天数
+        checkpoint_days: 检查点保留天数，默认读 settings.checkpoint_ttl_days(=7)，
+            可单独传更短值以更早回收 checkpoints.db 的大 state blob
+
     Returns:
         清理结果汇总
     """
     logger.info(f"开始数据清理（保留 {days} 天）")
-    
+
     results = {
-        "sessions": cleanup_old_sessions(days),
-        "logs": cleanup_old_logs(days),
+        "sessions": cleanup_old_sessions(days, checkpoint_days=checkpoint_days),
+        "logs": cleanup_old_logs(7),
         "temp": cleanup_temp_files(),
     }
-    
+
     logger.info("数据清理完成")
     return results

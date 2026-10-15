@@ -209,7 +209,7 @@ async def run_mcp_server() -> None:
 # ---- HTTP SSE 端点(供 browser-based MCP clients) ----
 
 from fastapi import APIRouter, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 router = APIRouter(prefix="/mcp", tags=["mcp"])
 _mcp_server_instance: MCPServer | None = None
@@ -229,6 +229,80 @@ async def mcp_call(request: Request) -> dict:
     server = _get_server()
     resp = await server.handle_request(body)
     return resp or {"jsonrpc": "2.0", "id": body.get("id"), "result": {}}
+
+
+# ---- 标准 MCP Streamable HTTP 传输端点(2025-03 规范,供标准 MCP 客户端直连) ----
+# 规范核心:同一个端点同时接 POST 与 GET;客户端发 JSON-RPC(单条或 batch),
+# 服务端按 Accept 头返回 application/json 或 text/event-stream;
+# 纯通知/响应(无待回 request)返回 202。MCPServer 是无状态的(不维护会话),
+# 故此处不实现 Mcp-Session-Id(规范允许省略),GET 长连返回 405(规范允许)。
+# 端点路径 = 本 router prefix("/mcp") + "" = "/mcp"。
+
+def _needs_response(obj: Any) -> bool:
+    """该 JSON-RPC 对象是否需要服务端回一个带 id 的 response。"""
+    return (
+        isinstance(obj, dict)
+        and obj.get("method") is not None
+        and obj.get("id") is not None
+    )
+
+
+def _sse_encode(resp: dict) -> str:
+    """把一个 JSON-RPC response 编码成 MCP 约定的 SSE 帧(event: message)。"""
+    return f"event: message\ndata: {json.dumps(resp, ensure_ascii=False)}\n\n"
+
+
+@router.api_route("", methods=["POST", "GET"], name="mcp_streamable")
+async def mcp_streamable(request: Request) -> Response:
+    """标准 MCP Streamable HTTP 端点(外部 MCP 客户端经 HTTP 直连 TianGong)。
+
+    - POST:处理单条/批量 JSON-RPC(initialize / tools/list / tools/call /
+      notifications),按 Accept 返回 application/json 或 text/event-stream;
+      若本请求不含任何"需要回应的 request",返回 202 空 body。
+    - GET:本服务端无状态、不提供 server→client 长连通知流,按规范返回 405。
+    """
+    if request.method == "GET":
+        # 规范:GET 要么开 SSE 流,要么 405。无状态工具服务无需 server→client 推送。
+        return Response(status_code=405, headers={"Allow": "POST"})
+
+    server = _get_server()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "请求体不是合法 JSON"}, status_code=400)
+
+    items = body if isinstance(body, list) else [body]
+    # 逐个处理"需要回应的 request"(initialize/tools/list/tools/call),
+    # 通知类(notifications/*、纯 response)handle_request 返回 None,自然被丢弃。
+    responses = []
+    for item in items:
+        if not _needs_response(item):
+            continue
+        r = await server.handle_request(item)
+        if r is not None:
+            responses.append(r)
+
+    # 无任何需回应的 request(全是通知/响应) → 202 Accepted 空 body
+    if not responses:
+        return Response(status_code=202)
+
+    accept = request.headers.get("accept", "").lower()
+    use_sse = ("text/event-stream" in accept) and ("application/json" not in accept)
+
+    if use_sse:
+        async def _gen():
+            for resp in responses:
+                yield _sse_encode(resp)
+        return StreamingResponse(
+            _gen(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+        )
+
+    # application/json:单条返回对象,batch 返回数组
+    if isinstance(body, list):
+        return JSONResponse(responses)
+    return JSONResponse(responses[0])
 
 
 @router.get("/tools")

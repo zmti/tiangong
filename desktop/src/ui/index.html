@@ -615,6 +615,7 @@
   <script src="js/markdown.js"></script>
   <script src="js/messages.js"></script>
   <script src="js/message-renderer.js"></script>
+  <script src="js/tool-visual.js"></script>
   <script src="js/group.js"></script>
   <script src="js/utils.js"></script>
   <!-- 统一设置弹窗 -->
@@ -633,6 +634,7 @@
           <div class="settings-nav-item" data-section="prompt">提示词</div>
           <div class="settings-nav-item" data-section="rules">规则</div>
           <div class="settings-nav-item" data-section="skills">技能</div>
+          <div class="settings-nav-item" data-section="mcp">MCP 服务器</div>
           <div class="settings-nav-item" data-section="backend">后端</div>
           <div class="settings-nav-item" data-section="about">关于</div>
         </div>
@@ -768,9 +770,25 @@
             <div class="settings-section-title">技能</div>
             <div class="setting-row">
               <span class="muted" id="skillsHint">内置多步技能编排,启用后可在对话中用 run_skill 触发</span>
-              <button class="lb-btn" id="refreshSkillsBtn" style="margin-left:auto;">刷新</button>
+              <span style="margin-left:auto; display:flex; gap:8px;">
+                <button class="lb-btn" id="installSkillBtn">＋ 安装</button>
+                <button class="lb-btn" id="refreshSkillsBtn">刷新</button>
+              </span>
             </div>
             <div id="skillsAdmin" class="prov-admin"></div>
+          </div>
+
+          <!-- MCP 服务器管理 -->
+          <div class="settings-section" data-section="mcp">
+            <div class="settings-section-title">MCP 服务器</div>
+            <div class="setting-row">
+              <span class="muted" id="mcpHint">外部工具/资源接入,启用后其工具在对话中可被调用</span>
+              <span style="margin-left:auto; display:flex; gap:8px;">
+                <button class="lb-btn" id="addMcpServerBtn">＋ 新增服务器</button>
+                <button class="lb-btn" id="refreshMcpBtn">刷新</button>
+              </span>
+            </div>
+            <div id="mcpAdmin" class="prov-admin"></div>
           </div>
 
           <!-- 后端设置 -->
@@ -825,8 +843,6 @@
   <script src="js/chat-images.js"></script>
   <script src="js/chat.js"></script>
   <script src="js/workflow-list.js"></script>
-  <script src="js/workflow-designer.js"></script>
-  <script src="js/workflow-ops.js"></script>
   <script src="js/workflow.js?v=9"></script>
   <script src="js/briefing.js"></script>
   <script src="js/projects.js"></script>

@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -281,6 +282,112 @@ class _StreamHeadGuard:
         return _strip_gateway_error_lines(out)
 
 
+class _ThinkingSplitter:
+    """把流式正文里的 <thinking>...</thinking> 段切出来,与正文分离。
+
+    为什么需要:非推理模型(如 agnes-3.0-flash)没有 reasoning_content 字段,
+    思维链只能靠 CoT 提示让它写在 <thinking> 标签里,而这段内容混在 delta.content
+    中一起流式吐回。若不切分,思考内容会直接渲染进答案区。
+
+    chunk 边界可能把标签切断("<thi" + "nk>" + ...),因此必须跨 chunk 缓冲:
+    未闭合的标签开头/结尾留在缓冲区里,等下一个 chunk 到齐再判定。
+    """
+
+    _OPEN_RE = re.compile(r"<thinking[^>]*>", re.IGNORECASE)
+    _CLOSE = "</thinking>"
+    _OPEN_HEAD = "<thinking"
+    # 安全上限:闭合标签丢失(模型跑飞/被截断)时不能把后续正文全吞进思考区,
+    # 否则用户看到的就是"思考一大坨 + 答案为空"。与前端 processTokenChunk 的
+    # 8000 字符兜底保持一致。
+    _MAX_OPEN = 8000
+
+    def __init__(self) -> None:
+        self._buf = ""
+        self._in_thinking = False
+
+    def feed(self, piece: str) -> tuple[str, str]:
+        """吃进一段增量,返回 (thinking_text, answer_text)。"""
+        if not piece:
+            return "", ""
+        self._buf += piece
+        think_parts: list[str] = []
+        ans_parts: list[str] = []
+        while self._buf:
+            if self._in_thinking:
+                idx = self._buf.lower().find(self._CLOSE)
+                if idx >= 0:
+                    think_parts.append(self._buf[:idx])
+                    self._buf = self._buf[idx + len(self._CLOSE):]
+                    self._in_thinking = False
+                    continue
+                # 超过上限仍未闭合:强制退出 thinking 模式,后续内容回归正文
+                if len(self._buf) > self._MAX_OPEN:
+                    logger.warning(
+                        "thinking 块超过 %d 字符仍未闭合,强制退出 thinking 模式", self._MAX_OPEN
+                    )
+                    think_parts.append(self._buf)
+                    self._buf = ""
+                    self._in_thinking = False
+                    continue
+                # 可能是被切断的结束标签,尾部留在缓冲里等下一个 chunk
+                hold = self._tail_partial_close_len()
+                if hold and len(self._buf) > hold:
+                    think_parts.append(self._buf[:-hold])
+                    self._buf = self._buf[-hold:]
+                elif not hold:
+                    think_parts.append(self._buf)
+                    self._buf = ""
+                break
+            m = self._OPEN_RE.search(self._buf)
+            if m:
+                ans_parts.append(self._buf[:m.start()])
+                self._buf = self._buf[m.end():]
+                self._in_thinking = True
+                continue
+            # 没有完整开始标签:可能是被切断的 "<thi",留在缓冲里等下一个 chunk
+            hold = self._tail_partial_open_len()
+            if hold and len(self._buf) > hold:
+                ans_parts.append(self._buf[:-hold])
+                self._buf = self._buf[-hold:]
+            elif not hold:
+                ans_parts.append(self._buf)
+                self._buf = ""
+            break
+        return "".join(think_parts), "".join(ans_parts)
+
+    def flush(self) -> tuple[str, str]:
+        """流结束:把缓冲区里剩下的内容按当前状态吐出(标签未闭合也不丢内容)。"""
+        if not self._buf:
+            return "", ""
+        buf, self._buf = self._buf, ""
+        if self._in_thinking:
+            self._in_thinking = False
+            return buf, ""
+        return "", buf
+
+    def _tail_partial_open_len(self) -> int:
+        """缓冲区尾部疑似未完整的开始标签长度(如 "<thi"、"<thinking x")。"""
+        pos = self._buf.lower().rfind("<")
+        if pos < 0:
+            return 0
+        tail = self._buf[pos:]
+        low = tail.lower()
+        # 尾部是 "<thinking" 的前缀,且还没到 ">" —— 可能是标签被切断
+        if self._OPEN_HEAD.startswith(low):
+            return len(tail)
+        if low.startswith(self._OPEN_HEAD) and ">" not in tail:
+            return len(tail)
+        return 0
+
+    def _tail_partial_close_len(self) -> int:
+        """缓冲区尾部疑似未完整的结束标签长度(如 "</thi")。"""
+        low = self._buf.lower()
+        for k in range(len(self._CLOSE) - 1, 0, -1):
+            if low.endswith(self._CLOSE[:k]):
+                return k
+        return 0
+
+
 def _gateway_error_exc(sample: str) -> LLMError:
     """把"网关校验错误被当正文回包"包装成可重试错误。
 
@@ -294,6 +401,30 @@ def _gateway_error_exc(sample: str) -> LLMError:
 
 # 推理模型:thinking 内容在 reasoning_content 字段,需分离透出
 _REASONING_MODELS = ("deepseek-reasoner", "deepseek-r1", "o1", "o1-", "o3", "o3-", "reasoner")
+
+_THINKING_PAIR_RE = re.compile(r"<thinking[^>]*>([\s\S]*?)</thinking>", re.IGNORECASE)
+_THINKING_OPEN_RE = re.compile(r"<thinking[^>]*>([\s\S]*)$", re.IGNORECASE)
+
+
+def split_thinking_text(content: str) -> tuple[str, str]:
+    """把非流式回复里的 <thinking> 块分离出来。Returns: (thinking, body)。
+
+    流式路径有 _ThinkingSplitter 做跨 chunk 拆分,但非流式(chat / chat_json /
+    chat_json_schema)此前**完全不剥离** —— 而这些入口同样会被
+    _maybe_wrap_with_thinking_prompt 注入 CoT,于是思考明文整段混进最终答案。
+    实证:_node_verify 的内联重写走 chat(),落库 answer 开头就是 `<thinking>\\n1. **分析...`。
+    """
+    if not content or "<thinking" not in content.lower():
+        return "", content
+    blocks = _THINKING_PAIR_RE.findall(content)
+    body = _THINKING_PAIR_RE.sub("", content)
+    # 未闭合的开标签(截断/模型漏写 </thinking>):其后整体视为思考
+    m = _THINKING_OPEN_RE.search(body)
+    if m:
+        blocks.append(m.group(1))
+        body = body[: m.start()]
+    thinking = "\n\n".join(b.strip() for b in blocks if b and b.strip())
+    return thinking, body.strip()
 
 PROVIDER_ALIASES = {
     "deepseek": "deepseek",
@@ -778,16 +909,24 @@ class LLMClient:
             return messages
         if self._is_reasoning_model():
             return messages
-        # 检查是否已有 thinking 提示
-        for m in messages:
-            if m.get("role") == "system" and "think" in str(m.get("content", "")).lower():
-                return messages
         if not messages:
             return messages
-        # 在最后一条 user 消息后追加思考指令
-        last = messages[-1]
-        if last.get("role") != "user":
+        # 在**最后一条 user 消息**尾部追加思考指令。
+        # 旧实现取 messages[-1]:ReAct 第 2 轮起末条是 role=tool(native 模式追加的
+        # 工具结果),role 不是 user 就直接 return,后续轮次永远拿不到 CoT 指令。
+        idx = None
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                idx = i
+                break
+        if idx is None:
             return messages
+        # 旧实现还有一条"system 消息里出现 'think' 子串就跳过"的判重。
+        # SYSTEM_PROMPT 的最终回答规范本身就写了 `<thinking>` 标签(要求分析过程
+        # 走该标签),于是这个判重**恒真** —— 主流程一轮 CoT 都没注入过,
+        # 思考区因此一直是空的(实证:会话 desktop-mu2rgdkv 近 15 条 assistant
+        # 消息里 13 条 meta.thinking 为空)。判重只认本 suffix 即可。
+        last = messages[idx]
         content = last.get("content", "")
         # 多模态内容(content 是 list 时)不注入 CoT 提示
         if isinstance(content, list):
@@ -802,7 +941,7 @@ class LLMClient:
             last = dict(last)
             last["content"] = content.rstrip() + thinking_suffix
             messages = list(messages)
-            messages[-1] = last
+            messages[idx] = last  # 注意:必须是 idx,不是 -1(末条可能是 tool)
         return messages
 
     def _extract_reasoning(self, msg) -> str:
@@ -864,7 +1003,14 @@ class LLMClient:
             logger.warning("上游网关把校验错误当正文回包(chat): %r", content[:120])
             raise _gateway_error_exc(content)
         # 诊断文案混在正文里(独占一行)时剔掉,避免首行露出报错
-        return _strip_gateway_error_lines(content)
+        content = _strip_gateway_error_lines(content)
+        # 非流式同样注入了 CoT,必须把 <thinking> 块剥出来:
+        # 剥出的内容存进 self._reasoning(推理内容通道),调用方按需透出,
+        # 不要让它以明文混在最终答案里。
+        tk, content = split_thinking_text(content)
+        if tk:
+            self._reasoning = ((self._reasoning or "") + "\n\n" + tk).strip()
+        return content
 
     async def chat_stream(self, messages: list[Message], temperature: float = 0.7):
         """流式对话,逐个产出文本增量(str);推理模型先产出 thinking 增量。
@@ -874,6 +1020,9 @@ class LLMClient:
         """
         self._require_key()
         messages = self._prepare_messages(messages)
+        # 与其他 5 个入口保持一致:非推理模型靠 CoT 提示产出 <thinking> 块,
+        # 再由 _ThinkingSplitter 切成 thinking 事件(此前漏了这行 → 桌面端思考区永远为空)
+        messages = self._maybe_wrap_with_thinking_prompt(messages)
         kwargs: dict = {
             "model": self.model,
             "messages": messages,
@@ -892,6 +1041,7 @@ class LLMClient:
         resp = await self._invoke(_fn, "chat_stream")
         reasoning = ""
         head = _StreamHeadGuard()
+        splitter = _ThinkingSplitter()
         idle_timeout = float(getattr(settings, "agent_llm_stream_idle_timeout", 0) or 0)
         total_deadline = (
             time.time() + int(settings.agent_llm_stream_total_timeout)
@@ -918,9 +1068,17 @@ class LLMClient:
                         yield {"type": "thinking", "content": rc}
                         continue
                     if delta and delta.content:
+                        # 非推理模型(或 CoT 注入生效时)把思维链写在 <thinking> 里,
+                        # 先切出来单独当 thinking 事件,剩下的才是正文
+                        tk, ans = splitter.feed(delta.content)
+                        if tk:
+                            reasoning += tk
+                            yield {"type": "thinking", "content": tk}
+                        if not ans:
+                            continue
                         # 前 64 字符先过守卫:整段回包就是网关校验错误时不放行
                         # (见 _StreamHeadGuard),避免错误文案被当正文渲染/落库
-                        out = head.feed(delta.content)
+                        out = head.feed(ans)
                         if out:
                             yield out
                 except LLMError:
@@ -943,6 +1101,15 @@ class LLMClient:
             logger.warning("上游网关把校验错误当正文回包(chat_stream): %r", sample[:120])
             self._trace("chat_stream", time.time(), None, ok=False, error=sample[:300])
             raise _gateway_error_exc(sample)
+        # 收尾:缓冲区里可能还有未闭合标签内的思考内容 / 正文残余
+        tk, ans = splitter.flush()
+        if tk:
+            reasoning += tk
+            yield {"type": "thinking", "content": tk}
+        if ans:
+            out = head.feed(ans)
+            if out:
+                yield out
         tail = head.flush()
         if tail:
             yield tail
@@ -1044,6 +1211,11 @@ class LLMClient:
         else:
             # 诊断文案混在正常正文里(独占一行)时也剔掉,避免首行露出报错
             content = _strip_gateway_error_lines(content)
+            # 非流式同样注入了 CoT:剥出 <thinking> 块,存进 _reasoning 通道,
+            # 不要让它明文混进正文(与 chat() 一致)。
+            _tk, content = split_thinking_text(content)
+            if _tk:
+                self._reasoning = ((self._reasoning or "") + "\n\n" + _tk).strip()
         if not content and not tool_calls and self._reasoning:
             # 推理模型:content 为空但 reasoning 有内容时,用 reasoning 兜底(与 chat() 一致)
             content = _strip_gateway_error_lines(self._reasoning)
@@ -1098,6 +1270,7 @@ class LLMClient:
         resp = await self._invoke(_fn, "chat_stream", tools_n=len(tools or []))
         reasoning = ""
         head = _StreamHeadGuard()
+        splitter = _ThinkingSplitter()
         content_buf = ""
         tool_call_bufs: list[dict] = []  # 每个 tool_call 的累积数据
         finish_reason = ""
@@ -1132,10 +1305,19 @@ class LLMClient:
                         continue
                     # 文本内容
                     if delta and delta.content:
-                        content_buf += delta.content
+                        # 与 chat_stream 同处理:CoT 注入后 <thinking> 混在正文里,
+                        # 先切出来当 thinking 事件,只有正文进 content_buf/答案区
+                        # (否则思考内容会被当成答案渲染,还会污染工具调用解析)
+                        tk, ans = splitter.feed(delta.content)
+                        if tk:
+                            reasoning += tk
+                            yield {"type": "thinking", "content": tk}
+                        if not ans:
+                            continue
+                        content_buf += ans
                         # 前 64 字符先过守卫:整段回包就是网关校验错误时不放行
                         # (content_buf 仍保留全文,仅抑制对外的 yield)
-                        out = head.feed(delta.content)
+                        out = head.feed(ans)
                         if out:
                             yield out
                     # 工具调用增量
@@ -1175,6 +1357,15 @@ class LLMClient:
             self._trace("chat_stream", time.time(), None, ok=False, error=str(e))
             logger.exception("chat_stream_with_tools 流式调用失败")  # 完整 traceback 便于定位yield回灌的异常
             raise LLMError(f"LLM 流式调用失败: {_exc_detail(e)}") from e
+        # 收尾:标签可能刚好卡在流末尾被切断,未闭合的 <thinking> 块也要吐出来(不能丢)
+        tk, ans = splitter.flush()
+        if tk:
+            reasoning += tk
+            yield {"type": "thinking", "content": tk}
+        if ans:
+            out = head.feed(ans)
+            if out:
+                yield out
         logger.debug("[chat_stream_with_tools] stream loop ended, content_len=%d", len(content_buf))
         self._reasoning = reasoning
         self._finish_reason = finish_reason
@@ -1261,7 +1452,8 @@ class LLMClient:
         """
         self._require_key()
         messages = self._prepare_messages(messages)
-        messages = self._maybe_wrap_with_thinking_prompt(messages)
+        # 结构化输出入口**不注入 CoT**:要求 <thinking> 标签与要求返回纯 JSON
+        # 互相打架,会让 _extract_json 拿到带思考前缀的文本。
         kwargs: dict = {
             "model": self.model,
             "messages": messages,
@@ -1320,7 +1512,7 @@ class LLMClient:
         from app.config import settings as _cfg
         self._require_key()
         messages = self._prepare_messages(messages)
-        messages = self._maybe_wrap_with_thinking_prompt(messages)
+        # 同 chat_json:结构化输出不注入 CoT(见 chat_json 注释)
         schema_help = (
             f"你必须严格输出符合以下 JSON Schema 的合法 JSON(不要包裹 markdown):\n"
             f"{json.dumps(schema, ensure_ascii=False)}\n"

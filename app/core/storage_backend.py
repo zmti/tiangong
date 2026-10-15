@@ -131,6 +131,9 @@ class SqliteBackend(StorageBackend):
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=5000")
+        # C 盘空间不足时 SQLite ORDER BY 需要临时文件会报 "database or disk is full"
+        # 设为 MEMORY 后排序/聚合在内存完成，避免依赖系统 TEMP
+        conn.execute("PRAGMA temp_store=MEMORY")
         return conn
 
     def close(self, conn: sqlite3.Connection) -> None:
@@ -249,6 +252,24 @@ class SqliteBackend(StorageBackend):
             try:
                 rows = conn.execute(sql, params).fetchall()
                 return [dict(row) for row in rows]
+            finally:
+                self.close(conn)
+
+    def select_one(self, table: str, where: str = "", where_params: tuple = (),
+                   *, order_by: str = "") -> Optional[dict]:
+        """查询单条记录,无匹配返回 None。等价于 select(..., limit=1) 取首行。"""
+        sql = f'SELECT * FROM "{table}"'
+        params = list(where_params)
+        if where:
+            sql += f" WHERE {where}"
+        if order_by:
+            sql += f" ORDER BY {order_by}"
+        sql += " LIMIT 1"
+        with self._lock:
+            conn = self.connect()
+            try:
+                row = conn.execute(sql, params).fetchone()
+                return dict(row) if row is not None else None
             finally:
                 self.close(conn)
 
@@ -395,12 +416,26 @@ def get_storage_backend(
 
         if backend == "postgresql":
             try:
+                import psycopg  # noqa: F401
                 from app.core.postgres_backend import PostgresBackend
                 from app.config import settings
-                inst = PostgresBackend(settings.pgvector_client_dsn)
+                # 结构化存储优先用 storage_postgres_dsn; 未配则回落向量侧 pgvector DSN
+                dsn = settings.storage_postgres_dsn or settings.pgvector_client_dsn
+                if not dsn:
+                    raise RuntimeError(
+                        "storage_backend=postgresql 但未配置 STORAGE_POSTGRES_DSN / PGVECTOR_CLIENT_DSN, 回退 SQLite"
+                    )
+                inst = PostgresBackend(dsn)
                 _backend_cache[key] = inst
                 logger.info("使用 PostgreSQL 存储后端")
                 return inst
+            except ImportError as e:
+                logger.warning(f"PostgreSQL 不可用(未安装 psycopg)，回退 SQLite: {e}")
+                backend = "sqlite"
+                key = _backend_key(backend, db_path, memory_mode)
+                cached = _backend_cache.get(key)
+                if cached is not None:
+                    return cached
             except Exception as e:
                 logger.warning(f"PostgreSQL 不可用，回退 SQLite: {e}")
                 backend = "sqlite"

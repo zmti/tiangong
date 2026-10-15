@@ -278,6 +278,36 @@ class MemoryStore:
             hits = sum(r.get("hit_count", 0) for r in rows)
         return {"total": total, "manual": manual, "auto": auto, "hits": hits, "tenant_id": tid}
 
+    def count(self, scope: Optional[str] = None, tenant_id: Optional[str] = None) -> int:
+        """同步统计记忆条数(供 memory_manager 等同步调用方使用)。"""
+        from app.core.tenant_context import get_tenant
+        tid = tenant_id or get_tenant() or "default"
+        conditions = ["tenant_id = ?"]
+        params: list = [tid]
+        if scope:
+            conditions.append("scope = ?")
+            params.append(scope)
+        where = " AND ".join(conditions)
+        with _DB_SYNC_LOCK:
+            return self._backend.count("memories", where, tuple(params))
+
+    def list_sync(self, limit: int = 50, scope: Optional[str] = None, tenant_id: Optional[str] = None) -> list[dict]:
+        """同步版 list(供 memory_manager 等同步调用方使用),语义与 async list() 一致。"""
+        from app.core.tenant_context import get_tenant
+        tid = tenant_id or get_tenant() or "default"
+        conditions = ["tenant_id = ?"]
+        params: list = [tid]
+        if scope:
+            conditions.append("scope = ?")
+            params.append(scope)
+        where = " AND ".join(conditions)
+        with _DB_SYNC_LOCK:
+            rows = self._backend.select(
+                "memories", where, tuple(params),
+                order_by="updated_at DESC", limit=limit,
+            )
+        return [self._row_to_dict(r) for r in rows]
+
     def search(
         self,
         query: str,

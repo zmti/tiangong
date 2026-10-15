@@ -489,30 +489,86 @@ class MCPManager:
         """获取指定名称的客户端。"""
         return self._clients.get(name)
     
+    async def _connect_one(self, name: str, client) -> dict:
+        """连接单个 MCP 服务器并把其工具/提示词/资源挂进映射。返回该服务器结果。"""
+        result = await client.connect()
+        result.setdefault("connected", result.get("status") == "connected")
+        if result.get("status") == "connected":
+            tools = await client.list_tools()
+            for tool in tools:
+                tool_name = tool.get("name", "")
+                if tool_name:
+                    self._tools_map[tool_name] = (name, client)
+            prompts = await client.list_prompts()
+            for prompt in prompts:
+                self._prompts_map[prompt.name] = (name, client)
+            resources = await client.list_resources()
+            for resource in resources:
+                self._resources_map[resource.uri] = (name, client)
+            self._save_cache(name, client)
+        else:
+            # 连接失败:记入内存,供 UI 展示原因(不再"静默 60s 后无反馈")
+            client._connect_error = result.get("error", "连接失败")  # noqa: SLF001
+        return result
+
+    async def _auto_disable_failed(self, results: dict) -> None:
+        """自动禁用连不上的服务器(写 enabled:false,下次启动不再尝试 → 消除反复 60s 卡顿)。
+        可在桌面端「MCP 服务器」页重新启用,或在 mcp_servers.json 手改。"""
+        auto_disable = True
+        try:
+            auto_disable = bool(getattr(settings, "mcp_auto_disable_on_failure", True))
+        except Exception:  # noqa: BLE001
+            pass
+        if not auto_disable:
+            return
+        for name, res in results.items():
+            if not isinstance(res, dict) or res.get("status") == "connected":
+                continue
+            try:
+                set_mcp_server_enabled(name, False)
+                res["auto_disabled"] = True
+                res["reason"] = res.get("error", "连接失败")
+                logger.warning("MCP 服务器 %s 连接失败,已自动禁用(可重新启用): %s",
+                               name, res.get("error", ""))
+            except Exception as e:  # noqa: BLE001
+                logger.debug("自动禁用 %s 失败: %s", name, e)
+
     async def connect_all(self) -> dict:
-        """连接所有配置的 MCP 服务器。"""
-        results = {}
-        for name, client in self._clients.items():
-            result = await client.connect()
-            results[name] = result
-            if result.get("status") == "connected":
-                # 连接成功后获取所有能力
-                tools = await client.list_tools()
-                for tool in tools:
-                    tool_name = tool.get("name", "")
-                    if tool_name:
-                        self._tools_map[tool_name] = (name, client)
-                
-                prompts = await client.list_prompts()
-                for prompt in prompts:
-                    self._prompts_map[prompt.name] = (name, client)
-                
-                resources = await client.list_resources()
-                for resource in resources:
-                    self._resources_map[resource.uri] = (name, client)
-                
-                # 保存缓存
-                self._save_cache(name, client)
+        """并行连接所有配置的 MCP 服务器。
+
+        并行是关键:此前是 for 循环逐个 `await`,某个 server 卡 60s 超时会把
+        排在后面的全部堵住(实测 postgres 冷下载+连不上拖慢整个后端启动)。
+        改 `asyncio.gather` 后各 server 同时连,最慢的那个不再拖累其他。
+        """
+        results: dict = {}
+
+        async def _one(name: str, client) -> None:
+            try:
+                results[name] = await self._connect_one(name, client)
+            except Exception as e:  # noqa: BLE001
+                results[name] = {"status": "error", "error": str(e)}
+
+        await asyncio.gather(*(_one(n, c) for n, c in self._clients.items()),
+                             return_exceptions=True)
+        await self._auto_disable_failed(results)
+        return results
+
+    async def connect_named(self, pairs: list[tuple[str, object]]) -> dict:
+        """增量连接:只连 pairs 里指定的服务器(其余已连接的保持不变)。
+
+        供「MCP 保存/增删/启停」的增量刷新用:未变化的服务器不重连,避免每次
+        保存都把全部 stdio 服务器重新 initialize(冷 npx/超时叠加,实测 ~50s)。
+        """
+        results: dict = {}
+
+        async def _one(name: str, client) -> None:
+            try:
+                results[name] = await self._connect_one(name, client)
+            except Exception as e:  # noqa: BLE001
+                results[name] = {"status": "error", "error": str(e)}
+
+        await asyncio.gather(*(_one(n, c) for n, c in pairs), return_exceptions=True)
+        await self._auto_disable_failed(results)
         return results
     
     # ---- Tools ----
@@ -629,17 +685,164 @@ def get_mcp_manager(cache_db_path: Optional[str] = None) -> MCPManager:
     return _mcp_manager
 
 
+def _load_mcp_servers_config() -> Optional[dict]:
+    """读取 MCP 服务器配置(2026-10-01)。
+
+    优先级:
+      1. 数据目录下的 mcp_servers.json(桌面端最方便入口;settings.resolved_data_dir 同级)
+      2. 环境变量 MCP_SERVERS(JSON 字符串)
+
+    容忍两种外壳:
+      - 扁平:  {"name": {"type": "http", "url": ...}, ...}
+      - Claude Desktop 风格:  {"mcpServers": {"name": {...}, ...}}  → 自动拍平
+      - 双层同名嵌套:  {"name": {"name": {"url": ...}}}          → 自动下钻
+      解析失败返回 None(调用方回 "配置格式错误")。
+    """
+    import os
+    from pathlib import Path
+
+    raw: dict = {}
+    p = Path(settings.resolved_data_dir) / "mcp_servers.json"
+    if p.is_file():
+        try:
+            raw = json.loads(p.read_text("utf-8"))
+            logger.info("MCP 配置从文件加载: %s", p)
+        except Exception as e:  # noqa: BLE001
+            logger.error("读取 mcp_servers.json 失败: %s", e)
+            return None
+    else:
+        env_cfg = os.environ.get("MCP_SERVERS", "").strip()
+        if env_cfg:
+            try:
+                raw = json.loads(env_cfg)
+                logger.info("MCP 配置从环境变量加载: MCP_SERVERS")
+            except json.JSONDecodeError:
+                logger.error("环境变量 MCP_SERVERS 不是合法 JSON: %r", env_cfg[:200])
+                return None
+        else:
+            return {}
+
+    if not isinstance(raw, dict):
+        logger.error("MCP 配置顶层必须是对象, 实际: %s", type(raw).__name__)
+        return None
+
+    # 拍平 mcpServers 外壳(Claude Desktop 风格)
+    if "mcpServers" in raw and isinstance(raw.get("mcpServers"), dict):
+        raw = raw["mcpServers"]
+
+    servers: dict = {}
+    for name, cfg in raw.items():
+        if not isinstance(cfg, dict):
+            logger.warning("MCP 服务器 %r 配置必须是对象, 跳过", name)
+            continue
+        # 双层同名嵌套: {"toutiao": {"toutiao": {"url": ...}}} → 下钻
+        if cfg.get(name) is not None and isinstance(cfg.get(name), dict):
+            cfg = cfg[name]
+        servers[name] = cfg
+    return servers
+
+
+def _mcp_config_path():
+    """mcp_servers.json 的绝对路径(数据目录同级)。"""
+    from pathlib import Path
+    return Path(settings.resolved_data_dir) / "mcp_servers.json"
+
+
+def load_mcp_servers_raw() -> dict:
+    """读取并规范化为扁平 {name: config}(纯读文件,不连接、不鉴权)。
+
+    每个 config 可能带 enabled 标志(缺省视为 True)。供桌面端「MCP 服务器管理」
+    展示全部已配置(含被禁用)的服务器,以及增删改查用。
+    """
+    servers = _load_mcp_servers_config()
+    return servers or {}
+
+
+def _write_mcp_servers(servers: dict) -> None:
+    p = _mcp_config_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(servers, ensure_ascii=False, indent=2), "utf-8")
+
+
+def upsert_mcp_server(name: str, config: dict) -> dict:
+    """新增或覆盖一个 MCP 服务器配置(写 mcp_servers.json)。"""
+    if not name or not str(name).strip():
+        raise ValueError("MCP 服务器名不能为空")
+    servers = load_mcp_servers_raw()
+    servers[str(name).strip()] = config or {}
+    _write_mcp_servers(servers)
+    return servers[str(name).strip()]
+
+
+def remove_mcp_server(name: str) -> bool:
+    """从 mcp_servers.json 移除一个 MCP 服务器配置。返回是否删除成功。"""
+    servers = load_mcp_servers_raw()
+    if name not in servers:
+        return False
+    del servers[name]
+    _write_mcp_servers(servers)
+    return True
+
+
+def set_mcp_server_enabled(name: str, enabled: bool) -> bool:
+    """置某个已配置 MCP 服务器的 enabled 标志(禁用后 refresh 会跳过连接)。"""
+    servers = load_mcp_servers_raw()
+    if name not in servers:
+        return False
+    if not isinstance(servers[name], dict):
+        servers[name] = {}
+    servers[name]["enabled"] = bool(enabled)
+    _write_mcp_servers(servers)
+    return True
+
+
+def list_mcp_servers_configured() -> list[dict]:
+    """列出全部已配置 MCP 服务器(含禁用),附 connected/tools_count 实时状态。
+
+    桌面端据此渲染 MCP 管理列表:未连接的显示禁用态,连接的显示工具数。
+    """
+    from app.core.mcp_client import get_mcp_manager
+
+    manager = get_mcp_manager()
+    configured = load_mcp_servers_raw()
+    out = []
+    for name, cfg in configured.items():
+        client = manager.get_client(name)
+        connected = bool(getattr(client, "_connected", False)) if client else False
+        tools = getattr(client, "_tools_cache", []) or [] if client else []
+        # 连接失败原因(连接失败时由 connect_all 写入 client._connect_error)
+        conn_err = getattr(client, "_connect_error", "") if (client and not connected) else ""
+        out.append({
+            "name": name,
+            "type": cfg.get("type", "http"),
+            "enabled": cfg.get("enabled", True),
+            "connected": connected,
+            "tools_count": len(tools),
+            "error": conn_err,   # 未连接时给前端提示根因
+            "config": cfg,
+        })
+    return out
+
+
 async def init_mcp_from_config(cache_db_path: Optional[str] = None) -> dict:
     """
     从配置初始化 MCP 连接(先重置,再按配置重建)。
 
-    配置格式(在 .env 中):
-      HTTP 版(自研 /mcp 协议):
-        MCP_SERVERS={"server1": {"url": "http://localhost:3000", "api_key": "xxx"}}
-      stdio 版(标准 MCP 服务器,npx/uvx/python 等):
-        MCP_SERVERS={"filesystem": {"type": "stdio", "command": "npx",
-                                     "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:/path"]}}
-        MCP_SERVERS={"github": {"type": "stdio", "command": "uvx", "args": ["mcp-server-git"]}}
+    配置来源(优先级从高到低):
+      1. 数据目录下的 mcp_servers.json —— 桌面端最方便的入口
+         (见 _load_mcp_servers_config)。文件存在时优先于环境变量。
+      2. 环境变量 MCP_SERVERS(JSON 字符串)。
+      注:.env 里的 MCP_SERVERS 不会被 pydantic-settings 写进 os.environ,
+         所以"写进 .env 后不生效"是已知坑,统一用文件入口解决。
+
+    配置格式(扁平,顶层 key 即服务器名,不认 mcpServers 外壳——但加载器会容忍并拍平):
+      HTTP 版(自研 /mcp REST 协议,GET {base}/tools、POST {base}/tools/{name}/call):
+        {"toutiao": {"type": "http", "url": "http://localhost:9000/mcp", "api_key": "xxx"}}
+      stdio 版(标准 MCP JSON-RPC 服务器,npx/uvx/python 等):
+        {"windows-mcp": {"type": "stdio",
+                         "command": "C:\\...\\uvx.exe",
+                         "args": ["windows-mcp", "serve"],
+                         "env": {"WINDOWS_MCP_DISABLE_FLASH": "1"}}}
 
     Returns:
         初始化结果(每个服务器的连接状态)
@@ -648,38 +851,109 @@ async def init_mcp_from_config(cache_db_path: Optional[str] = None) -> dict:
 
     manager = get_mcp_manager(cache_db_path=cache_db_path)
     await manager.reset()
-    servers_config = os.environ.get("MCP_SERVERS", "{}")
-
-    try:
-        servers = json.loads(servers_config) if servers_config else {}
-    except json.JSONDecodeError:
+    servers = _load_mcp_servers_config()
+    if servers is None:
         return {"error": "MCP_SERVERS 配置格式错误"}
 
     for name, config in servers.items():
         if not isinstance(config, dict):
             continue
-        mcp_type = config.get("type", "http")
-        if mcp_type == "stdio" and config.get("command"):
-            client = MCPStdioClient(
-                command=config["command"],
-                args=config.get("args") or [],
-                env=config.get("env") or {},
-                timeout=float(config.get("timeout", 60)),
-                cwd=config.get("cwd"),
-                auto_reconnect=True,
-            )
-        else:
-            url = config.get("url", "")
-            if not url:
-                continue
-            # 支持 tenant_id 配置
-            tenant_id = config.get("tenant_id", "default")
-            client = MCPClient(
-                base_url=url,
-                api_key=config.get("api_key"),
-                timeout=float(config.get("timeout", 30)),
-                tenant_id=tenant_id,
-            )
+        # enabled 标志(桌面端「MCP 服务器管理」可禁用):禁用后跳过连接
+        if config.get("enabled") is False:
+            continue
+        client = _build_mcp_client(config)
+        if client is None:
+            continue
+        # 记录"连接定义"签名:增量刷新(refresh_mcp_tools_incremental)靠它判断
+        # 哪些服务器配置没变、可跳过重连(否则首次保存会误判全量重连)
+        client._cfg_key = _mcp_config_key(name, config)  # noqa: SLF001
         manager.add_client(name, client)
 
     return await manager.connect_all()
+
+
+def _mcp_config_key(name: str, cfg: dict) -> tuple:
+    """某服务器的"连接定义"签名:只有这些字段变化才需要重连。"""
+    if (cfg.get("type") or "http") == "stdio":
+        return ("stdio", cfg.get("command", ""), tuple(cfg.get("args") or []),
+                json.dumps(cfg.get("env") or {}, sort_keys=True),
+                float(cfg.get("timeout", 60)), cfg.get("cwd"))
+    return ("http", cfg.get("url", ""), cfg.get("api_key", ""),
+            float(cfg.get("timeout", 30)), cfg.get("tenant_id", "default"))
+
+
+def _build_mcp_client(cfg: dict):
+    """按配置构造一个 MCP 客户端(stdio/http),不连接。返回 None 表示配置不可连。"""
+    mcp_type = cfg.get("type", "http")
+    if mcp_type == "stdio" and cfg.get("command"):
+        return MCPStdioClient(
+            command=cfg["command"],
+            args=cfg.get("args") or [],
+            env=cfg.get("env") or {},
+            timeout=float(cfg.get("timeout", 60)),
+            cwd=cfg.get("cwd"),
+            auto_reconnect=True,
+        )
+    url = cfg.get("url", "")
+    if not url:
+        return None
+    return MCPClient(
+        base_url=url,
+        api_key=cfg.get("api_key"),
+        timeout=float(cfg.get("timeout", 30)),
+        tenant_id=cfg.get("tenant_id", "default"),
+    )
+
+
+async def refresh_mcp_tools_incremental() -> dict:
+    """增量刷新 MCP 工具(2026-10-04):只重连"配置实际变化"的服务器,未变化的
+    保留现有连接与工具映射。
+
+    背景:「MCP 服务器管理」的 保存/增删/启停 此前走全量 _refresh_mcp_tools
+    (unregister → reset+init → register),每次把所有 stdio 服务器重新 initialize
+    一遍(冷 npx 下载/30-60s 超时叠加,实测 ~50s),表现为"保存 MCP 很慢"。
+    增量刷新把未变化的服务器直接跳过,常见"只改一个配置"的保存从 ~50s → ~2s。
+    失败语义与全量一致:本次尝试连接且失败的服务器自动禁用(可重新启用)。
+    """
+    from app.tools.mcp_tool import register_mcp_tools, unregister_mcp_tools
+
+    manager = get_mcp_manager()
+    configured = _load_mcp_servers_config() or {}
+
+    # 1) 移除:配置里已删除(或被禁用)的服务器 → 断开并注销其本地工具
+    for name in [n for n in list(manager._clients)]:  # noqa: SLF001
+        cfg = configured.get(name)
+        if cfg is None or cfg.get("enabled") is False:
+            await manager.remove_client(name)
+
+    # 2) 重连:配置变化、未启用→启用、尚未连接、或上次连接失败的服务器
+    to_connect: list[tuple[str, object]] = []
+    for name, cfg in configured.items():
+        if not isinstance(cfg, dict) or cfg.get("enabled") is False:
+            continue
+        existing = manager.get_client(name)
+        # getattr 兜底:旧连接(未记 _cfg_key)一律视为"需重连"
+        changed = existing is None or getattr(existing, "_cfg_key", None) != _mcp_config_key(name, cfg)
+        # 上次连接失败(_connect_error 非空)的服务器:配置未变也要重试连接。
+        # 覆盖"自动禁用后用户在 UI 重新启用"——若只看 _cfg_key,该 server 会永远
+        # 跳不过去,启用了也连不上(全量刷新时代每次都会重试,这里对齐旧语义)。
+        failed_before = getattr(existing, "_connect_error", None) is not None
+        if existing is not None and (changed or failed_before):
+            await manager.remove_client(name)
+        if changed or failed_before:
+            client = _build_mcp_client(cfg)
+            if client is not None:
+                client._cfg_key = _mcp_config_key(name, cfg)  # noqa: SLF001
+                manager.add_client(name, client)
+                to_connect.append((name, client))
+    results = await manager.connect_named(to_connect) if to_connect else {}
+
+    # 3) 工具注册表重刷:注销旧 mcp_ 工具后按新 _tools_map 重建(工厂闭包绑定)
+    unregister_mcp_tools()
+    registered = register_mcp_tools()
+    return {
+        "init": results,
+        "registered": registered,
+        "reconnected": [n for n, _ in to_connect],
+        "kept": [n for n in manager._clients if n not in dict(to_connect)],  # noqa: SLF001
+    }

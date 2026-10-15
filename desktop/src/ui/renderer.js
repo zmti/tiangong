@@ -204,6 +204,10 @@
     if (App.Settings && App.Settings.loadSkills) {
       App.Settings.loadSkills();
     }
+    // 渲染 MCP 服务器列表(每次打开刷新数据,并绑定「新增服务器」按钮)
+    if (App.Settings && App.Settings.loadMcpServers) {
+      App.Settings.loadMcpServers();
+    }
     // 初始化设置导航
     initSettingsNav();
   }
@@ -223,6 +227,14 @@
         sections.forEach(s => {
           s.classList.toggle('active', s.dataset.section === section);
         });
+        // MCP/技能 列表是「打开设置那一刻」抓的快照:stdio 服务器要 spawn+initialize
+        // 握手几秒,那一刻多半还没连完 → 快照里 connected=false。切到这些分区时
+        // 自动重拉一次,让显示跟上后端真实状态,免得"能用的 MCP 看着未连接"。
+        if (section === 'mcp' && App.Settings && App.Settings.loadMcpServers) {
+          App.Settings.loadMcpServers();
+        } else if (section === 'skills' && App.Settings && App.Settings.loadSkills) {
+          App.Settings.loadSkills();
+        }
       });
     });
   }

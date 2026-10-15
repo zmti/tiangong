@@ -120,9 +120,15 @@ def _answer_looks_truncated(answer: str, min_len: int = 10, max_output_tokens: i
     # 以明显未完成的标点结尾
     if s.endswith(("：", ":", "，", ",", "、", ";", "；", "(", "（", "[", "【", "{", "『", "「", "-", "—", "<=", "要", "的", "与", "和", "及", "或", "但")):
         return True, "以未完成标点结尾"
-    # 若最后一行看起来像列表项开头,可能是正常结尾
     import re
-    if re.search(r"^\s*(\d+[.)、]|[-*+|>#]|```|~~~)", s):
+    # 只看最后一行:原实现用 re.search(r"^\s*...", s) 且未开 MULTILINE,
+    # 实际只匹配了**首行**,末行判断完全失效。
+    last_line = s.rsplit("\n", 1)[-1].strip()
+    # 末行只剩一个 Markdown 标题(标题后没有正文)→ 明显截断
+    if re.match(r"#{1,6}\s*\S", last_line):
+        return True, "以标题结尾(标题后无正文)"
+    # 末行看起来像列表项/代码块开头,可能是正常结尾
+    if re.match(r"(\d+[.)、]|[-*+|>]|```|~~~)", last_line):
         return False, ""
     return False, ""
 
@@ -219,6 +225,160 @@ def _looks_like_unparsed_tool_call(text: str) -> bool:
     s = re.sub(r'\{"tool"\s*:[\s\S]*?\}\s*\}', '', s)
     s = re.sub(r'</?(?:tool_calls?|invoke|parameter)\b[^>]*>', '', s, flags=re.IGNORECASE)
     return len(re.sub(r'[\s\-_*`|\[\]{}<>]+', '', s)) < _UNPARSED_TOOL_CALL_MIN_PROSE
+
+
+# 退化答案的"过渡语"句式:开头是应答词,主体是"继续读取/查看/分析"类动作短语
+_DEGENERATE_TRANSITION_RE = re.compile(r"^(好的|现在|让我|接下来|首先|继续|我)[，,]?")
+_DEGENERATE_ACTION_RE = re.compile(r"(继续|读取|查看|分析|检查|扫描|深入)")
+
+
+def _looks_like_degenerate_repeat(text: str) -> bool:
+    """检出"同一句过渡语重复 N 遍"式退化答案(实证 2026-10-01 12:41/12:44)。
+
+    模型在上下文里失去对话连续性后(见 _build_messages 的时间戳排序修复),
+    会把"好的,我继续深入分析剩余的关键文件。"这类**开场过渡语**反复输出
+    8 遍当成最终答案,finish_reason=stop,没有任何实质内容。
+
+    判定尽量保守,避免误伤正常回答:
+      - 长答案(>2000 字)不判;含标题/代码块/表格结构的不判;
+      - 任一行超过 80 字符不判(退化行都是短句);
+      - 主判定:按行贪心聚类(行间相似度>=0.55 归同簇),最大簇 >=3 行
+        且覆盖 >=60% 的非空行;
+      - 短答案特例(实证 12:44 的 71 字两条):<=200 字、全部行都是
+        "应答词开头 + 继续类动作"的过渡语句式,且行间相似。
+    """
+    import difflib
+
+    t = (text or "").strip()
+    if not t or len(t) > 2000:
+        return False
+    # 有实质结构的答案(标题/代码/表格)不按退化处理
+    if "```" in t or re.search(r"^#{1,6}\s", t, flags=re.MULTILINE) or t.count("|") >= 4:
+        return False
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    if len(lines) < 2 or any(len(ln) > 80 for ln in lines):
+        return False
+    # 结构化列表(每行 -/*/•/数字. 开头)是正常写法,不按退化处理
+    _LIST_MARK = re.compile(r"^((?:[-*•]|\d{1,2}[.)、])\s*)")
+    if sum(1 for ln in lines if _LIST_MARK.match(ln)) >= len(lines) * 0.6:
+        return False
+    clusters: list[list[str]] = []
+    for ln in lines:
+        for c in clusters:
+            if max(difflib.SequenceMatcher(None, ln, x).ratio() for x in c) >= 0.55:
+                c.append(ln)
+                break
+        else:
+            clusters.append([ln])
+    best = max((len(c) for c in clusters), default=0)
+    if best >= 3 and best / len(lines) >= 0.6:
+        return True
+    # 短答案特例(实证 12:44 的 71 字两条,两行相似度只有 0.33 聚不了类):
+    # <=200 字且**每一行**都是"应答词开头 + 继续类动作"的过渡语 —— 整条回答
+    # 没有任何实质内容,判退化。要求每行都命中,正常回答总有一行带实际内容。
+    if len(t) <= 200:
+        return all(
+            _DEGENERATE_TRANSITION_RE.match(ln) and _DEGENERATE_ACTION_RE.search(ln)
+            for ln in lines
+        )
+    return False
+
+# 明文"思考/思路"小标题:模型不按 <thinking> 标签走时,会把推理写成这种段落标题,
+# 直接渲染到答案区会让整条回答变成"过程自述"(实证 09-20 的 "thinking 过程")
+_ANSWER_NOISE_HEADING_RE = re.compile(
+    # 注意:不剥 "# 解题思路" 这类 markdown 标题 —— 它是模型给答案选的结构,
+    # 且正文内容都在这节里,去掉标题反而留下一截没有来历的正文。
+    # 只剥没有 # 前缀的裸标题行(模型没按 <%s> 标签走时写的那种)。
+    r"^(?:thinking[ \t]*过程|思考过程|思考流程|推理过程|分析过程)[ \t]*[:：]?[ \t]*$",
+    re.IGNORECASE,
+)
+
+# 开场自述句首词
+_NARRATION_HEAD_RE = re.compile(
+    r"^(?:好的[、,，]?[ \t]*)?(?:现在|接下来|首先|接着|让我|我(?:来|先|马上|立即|这就|再)|先)"
+)
+# 自述里的动作词(命中才算"过程独白",避免误删正常陈述句)
+_NARRATION_VERB_RE = re.compile(
+    r"(分析|查看|看看|读取|检查|确认|尝试|梳理|跑一|运行|修复|调试|探索|验证|说明|执行|总结|汇总|梳理|定位|拉取|换用)"
+)
+# 答案里出现这些结构标记就当作"有实质内容",不参与自述剥离判断
+_SUBSTANCE_MARK_RE = re.compile(
+    r"(^#{1,6}[ \t]|```|\|.*\||^[-*•][ \t]|^\d{1,2}[.)、][ \t])", re.MULTILINE
+)
+
+_MIN_SUBSTANCE_CHARS = 120
+
+
+def _is_narration_chunk(chunk: str) -> bool:
+    """判断一小段文本是不是"过程自述"(开场白/我要做什么),而非实质内容。"""
+    s = (chunk or "").strip()
+    if not s or len(s) > 120:
+        return False
+    if _SUBSTANCE_MARK_RE.search(s):
+        return False
+    if not _NARRATION_HEAD_RE.match(s):
+        return False
+    # 带"结论"或以冒号引出内容的句子是正常陈述(如"先说结论:…"),不剥
+    if "结论" in s or s.rstrip().endswith(("：", ":")):
+        return False
+    return bool(_NARRATION_VERB_RE.search(s))
+
+
+def _clean_answer_noise(text: str) -> tuple[str, str]:
+    """清洗答案里的"过程自述 + 明文思考段",返回 (清洗后正文, 被剥离的噪音)。
+
+    为什么不只靠 <thinking> 标签:实测(09-20/10-01)模型经常不遵守标签格式,
+    把推理写成 "thinking 过程" 小标题或 "我先分析…。" 这类开头自述,
+    于是答案区变成一整篇自言自语 —— 用户看到的就是"输出信息偏差太大"。
+    被剥离的内容不丢弃,由调用方转成 thinking 事件(用户仍可在思考面板看到)。
+
+    刻意保守:只在"剥离后仍有 >=120 字实质内容"时才动手,且最多剥两段。
+    """
+    t = (text or "").strip()
+    if not t:
+        return "", ""
+
+    # ① 剥掉明文思考小标题本身(正文内容保留 —— 模型常把真正的分析放在这节里)
+    removed: list[str] = []
+    lines = t.split("\n")
+    kept_lines = []
+    for ln in lines:
+        if _ANSWER_NOISE_HEADING_RE.match(ln):
+            removed.append(ln.strip())
+            continue
+        kept_lines.append(ln)
+    if removed:
+        t = "\n".join(kept_lines).strip()
+        t = re.sub(r"\n{3,}", "\n\n", t)
+
+    def _rest_len(parts: list[str]) -> int:
+        return len(re.sub(r"\s+", "", "".join(parts)))
+
+    # ② 剥掉开头的开场自述段落/句子(最多两段)
+    paras = re.split(r"\n\s*\n", t)
+    i = 0
+    while i < len(paras) and i < 2 and paras[i].strip():
+        p = paras[i].strip()
+        rest = paras[:i] + paras[i + 1:]
+        if _is_narration_chunk(p) and _rest_len(rest) >= _MIN_SUBSTANCE_CHARS:
+            removed.append(p)
+            paras.pop(i)
+        else:
+            break
+    t = "\n\n".join(paras).strip()
+
+    # ③ 单段长答案:只剥第一句(仍要求剩余有实质内容)
+    if paras and len(paras) == 1:
+        m = re.match(r"^[^。！？\n]{0,80}[。！？][ \t]*", t)
+        if m:
+            head, tail = m.group(0), t[m.end():]
+            if (_is_narration_chunk(head)
+                    and len(re.sub(r"\s+", "", tail)) >= _MIN_SUBSTANCE_CHARS):
+                removed.append(head.strip())
+                t = tail.strip()
+
+    noise = "\n\n".join(x for x in removed if x).strip()
+    return t, noise
 
 # 历史摘要保留最近消息数
 _MEMORY_RECENT_HISTORY_COUNT = 6
@@ -1019,6 +1179,9 @@ class Agent:
             route_evt = None
         if route_evt:
             state.emit(route_evt)
+        # 路由失败/超时时 _active_tools 仍为 None → _schemas 会回退全量工具集,
+        # 这里兜底剔除付费媒体工具,避免纯文本问答被顺手执行出图/出视频。
+        self._apply_media_tool_gate(user_input, state.metadata.get("history", []) or [])
 
         # 4) 任务规划(1 次 LLM 调用)
         try:
@@ -1079,6 +1242,50 @@ class Agent:
 
         state.active_tools = self._active_tools
 
+    def _apply_media_tool_gate(self, user_input: str, history: list[dict] | None = None) -> None:
+        """付费媒体工具闸门(内核层兜底)。
+
+        图像/视频生成工具一旦被调用就要真实扣费并长时间等待,而 security 层已不再
+        对它们强制确认(security.py: generate_image/generate_video 不再强制确认)。
+        只有当请求里出现明确的多模态生成意图(图片/视频/画/海报/…)时才放行;否则
+        一律从候选集剔除 —— 关键是覆盖"路由失败/未启用 → _active_tools 为 None →
+        _schemas 回退全量工具集"这条路径,否则模型仍能看到并随手调用它们。
+
+        实测事故:"根据当前知识库,分析智能体"(纯文本问答)被模型同时调用了
+        generate_image 与 generate_video,界面出现"AI 正在作画/正在生成视频"。
+        """
+        try:
+            from app.core.smart_router import filter_paid_media_tools
+        except Exception:  # noqa: BLE001
+            return
+        # 多轮续问(如上一轮出图后说"再来一张/换个风格")本轮文本未必带"图片"二字,
+        # 因此把最近几轮用户原话一并作为意图判据,避免误杀合法的多轮出图请求。
+        probe = user_input or ""
+        try:
+            recent = [
+                (m.get("content") or "") for m in (history or [])[-6:]
+                if isinstance(m, dict) and m.get("role") == "user"
+            ]
+            if recent:
+                probe = probe + " " + " ".join(str(c) for c in recent)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            if self._active_tools is None:
+                names = [t.name for t in self.registry.list_sync()]
+            else:
+                names = list(self._active_tools)
+            kept = filter_paid_media_tools(probe, names)
+            if len(kept) != len(names):
+                logger.info(
+                    "无明确多模态生成意图,已剔除付费媒体工具: %s",
+                    sorted(set(names) - set(kept)),
+                )
+                self._active_tools = kept
+                self._schemas_cache = None
+        except Exception:  # noqa: BLE001
+            logger.debug("媒体工具闸门应用失败(忽略)", exc_info=True)
+
     async def _run_prepare(self, state, user_input, history, steps, step):
         """prepare 主体逻辑(兼容旧调用,内部委托 _node_prepare 的逐段流程)。"""
         await self._maybe_route(user_input)
@@ -1088,6 +1295,7 @@ class Agent:
         route_evt = await self._maybe_select_tools(user_input, steps, step)
         if route_evt:
             state.emit(route_evt)
+        self._apply_media_tool_gate(user_input, history)
 
         if await self._plan_task(user_input, steps, step):
             state.emit({"type": "plan", "action": "create",
@@ -1177,15 +1385,54 @@ class Agent:
                     state.metadata["last_llm_error"] = str(e2)
                     return
             else:
-                logger.warning("LLM 调用失败(round=%d): %s", rounds, e)
-                state.emit({"type": "error", "content": f"执行出错: {e}"})
-                state.metadata["tool_call_mode"] = "text"
-                state.metadata["resp"] = ""
-                state.metadata["tool_calls"] = []
-                state.metadata["giveup"] = True
-                state.metadata["giveup_reason"] = "llm_error"
-                state.metadata["last_llm_error"] = str(e)
-                return
+                # 限流/临时错误(429/503/网络抖动):退避重试若干次(根因2 修复),
+                # 避免"模型限流一次就中断整个任务"。仍失败再放弃,并向前端发明确状态。
+                max_rate_retry = int(getattr(settings, "agent_llm_rate_retries", 3) or 3)
+                is_rate = any(
+                    k in err_msg
+                    for k in ("429", "rate", "ratelimit", "rate_limit", "too many requests",
+                              "quota", "限流", "负载", "busy", "503", "502", "504",
+                              "timeout", "timed out", "connection", "连接", "gateway")
+                )
+                if is_rate:
+                    backoff = float(getattr(settings, "agent_llm_retry_delay", 0.5) or 0.5)
+                    last_rate_err: LLMError = e
+                    for _i in range(max_rate_retry):
+                        if is_stream:
+                            state.emit({"type": "status",
+                                        "content": f"模型暂时限流,正在重试({_i + 1}/{max_rate_retry})..."})
+                        await asyncio.sleep(backoff * (2 ** _i))
+                        try:
+                            if is_stream:
+                                tool_call_mode, resp, tool_calls = await self._call_llm_stream(state.messages, state)
+                            else:
+                                tool_call_mode, resp, tool_calls = await self._call_llm(state.messages)
+                            break
+                        except LLMError as e3:
+                            logger.warning("LLM 限流重试(%d/%d)仍失败: %s", _i + 1, max_rate_retry, e3)
+                            last_rate_err = e3
+                    else:
+                        # 重试全部耗尽:明确告知用户是限流/超时,而非笼统的"执行出错"
+                        logger.warning("LLM 限流重试耗尽(round=%d): %s", rounds, last_rate_err)
+                        state.emit({"type": "error", "content": f"模型暂时不可用(限流/超时),请稍后重试: {last_rate_err}"})
+                        state.metadata["tool_call_mode"] = "text"
+                        state.metadata["resp"] = ""
+                        state.metadata["tool_calls"] = []
+                        state.metadata["giveup"] = True
+                        state.metadata["giveup_reason"] = "llm_rate_limited"
+                        state.metadata["last_llm_error"] = str(last_rate_err)
+                        return
+                    # 重试成功 → 落到下方 metadata 赋值,继续正常路由
+                else:
+                    logger.warning("LLM 调用失败(round=%d): %s", rounds, e)
+                    state.emit({"type": "error", "content": f"执行出错: {e}"})
+                    state.metadata["tool_call_mode"] = "text"
+                    state.metadata["resp"] = ""
+                    state.metadata["tool_calls"] = []
+                    state.metadata["giveup"] = True
+                    state.metadata["giveup_reason"] = "llm_error"
+                    state.metadata["last_llm_error"] = str(e)
+                    return
         state.metadata["tool_call_mode"] = tool_call_mode
         state.metadata["resp"] = resp or ""
         state.metadata["tool_calls"] = [tc.to_dict() for tc in tool_calls]
@@ -1201,7 +1448,10 @@ class Agent:
         reasoning = getattr(self.llm, "_reasoning", "") or ""
         if reasoning:
             state.metadata["reasoning"] = reasoning
-            state.emit({"type": "thinking", "content": reasoning, "reasoning": True})
+            # 流式模式下 thinking 已在 _call_llm_stream 里随 chunk 逐段 emit 过,
+            # 这里再发一次整段会让思考内容在界面上显示两遍。
+            if not is_stream:
+                state.emit({"type": "thinking", "content": reasoning, "reasoning": True})
 
         if tool_call_mode == "native" and tool_calls:
             state.messages.append({
@@ -1333,6 +1583,109 @@ class Agent:
                         "plan": self._plan.to_dict() if self._plan else None})
         return None
 
+    async def _try_continue_truncated(self, state: AgentState, graph: Graph) -> str:
+        """答案被 max_tokens 截断时自动续调 LLM 补齐(根因1 修复)。
+
+        触发:finish_reason=='length' 或启发式 _answer_looks_truncated 命中。
+        仅对最终文本答案(tool_call_mode==text 且无待执行工具调用)生效。
+        续写衔接:把当前答案作为上下文追加 _CONTINUE_PROMPT 让模型从断处继续,
+        并用 _strip_continuation_overlap 去除续写内容里与前文重叠的前缀。
+        流式模式会补发续写 token,非流式仅追加到 answer。
+        """
+        answer = state.metadata.get("resp", "") or ""
+        # 仅最终文本答案需要续写;本轮还有待执行的工具调用时不续写。
+        #
+        # 注意:不能按 tool_call_mode == 'native' 排除!native 只表示"本轮走的是
+        # function-calling 协议",当最终轮返回的是纯文本(没有 tool_calls)时
+        # mode 依然残留为 native。旧判断 `mode not in (None, 'text')` 因此会把
+        # native 模式下**所有**截断答案都放过 —— 实测 run 9fc46416:
+        # tool_call_mode=native / tool_calls=0 / finish_reason=stop / resp 以"；"
+        # 结尾(明显截断),却因这个判断直接 return,答案停在 2.3 节中途。
+        # 判断依据只能是"本轮有没有待执行工具调用"。
+        if state.metadata.get("tool_calls"):
+            return answer
+        if not answer:
+            return answer
+        truncated, reason = _answer_looks_truncated(answer, max_output_tokens=self.max_output_tokens)
+        fr = state.metadata.get("finish_reason", "")
+        if not truncated and fr != "length":
+            return answer
+        max_cont = int(getattr(settings, "agent_answer_continue_max", 0) or 0)
+        if max_cont <= 0:
+            logger.warning("[续写] 检测到答案截断(%s/finish_reason=%s)但未启用续写(agent_answer_continue_max=0)", reason, fr)
+            return answer
+        logger.info("[续写] 检测到答案截断(%s/finish_reason=%s),开始自动续写(最多 %d 次)", reason, fr, max_cont)
+        is_stream = state.metadata.get("stream", False)
+        for i in range(max_cont):
+            cont_messages = list(state.messages) + [
+                {"role": "assistant", "content": answer},
+                {"role": "user", "content": _CONTINUE_PROMPT},
+            ]
+            try:
+                # 注意解包顺序:_call_llm*/_call_llm_stream 返回 (mode, content, tool_calls)。
+                # 旧代码写成 `cont, _mode, _calls = ...`,把 mode 字符串("text"/"native")
+                # 当成了续写内容拼到答案尾部 —— 续写等于没有生效还污染了答案。
+                if is_stream:
+                    _mode, cont, _calls = await self._call_llm_stream(cont_messages, state)
+                else:
+                    _mode, cont, _calls = await self._call_llm(cont_messages)
+            except LLMError as e:
+                logger.warning("[续写] 第 %d 次续写调用失败: %s", i + 1, e)
+                break
+            if not cont or not cont.strip():
+                break
+            cont = _strip_continuation_overlap(answer, cont)
+            answer = answer + cont
+            state.metadata["resp"] = answer
+            state.metadata["answer_continue_count"] = i + 1
+            # 续写 token 已由下方 _call_llm_stream 在调用时实时 emit,
+            # 这里不再手动 emit,避免重复渲染(非流式则随最终 answer 在 done 时渲染)。
+            still, r2 = _answer_looks_truncated(answer, max_output_tokens=self.max_output_tokens)
+            if not still:
+                logger.info("[续写] 第 %d 次续写后答案完整,结束", i + 1)
+                break
+            logger.info("[续写] 第 %d 次续写后仍截断(%s),继续", i + 1, r2)
+        return answer
+
+    async def _rewrite_degenerate_answer(self, state: AgentState) -> str:
+        """退化答案重写:明确告知模型上一轮无效,要求基于已有上下文给出实质回答。
+
+        流式模式先发 answer_reset(前端会清空正文缓冲、复位思考状态、保留旧答案
+        避免闪烁),随后重写的 token 正常逐字发出并覆盖正文。
+        """
+        is_stream = bool(state.metadata.get("stream"))
+        state.metadata["degenerate_rewrite"] = True
+        if is_stream:
+            state.emit({"type": "answer_reset"})
+        retry_messages = list(state.messages) + [
+            {"role": "assistant", "content": "(上一条回复无效:只有重复的过渡语,没有实质内容)"},
+            {"role": "user", "content": (
+                "你上一条回复只有重复的过渡句(如「好的,我继续分析...」),没有任何实质内容,不合格。"
+                "请直接给出对用户问题的正式回答:基于上文的工具结果与已有分析,"
+                "输出具体内容(结论/问题清单/代码/步骤),不要再说过渡语。"
+            )},
+        ]
+        try:
+            # 解包顺序同 _try_continue_truncated:(mode, content, tool_calls)
+            if is_stream:
+                _mode, cont, _calls = await self._call_llm_stream(retry_messages, state)
+            else:
+                _mode, cont, _calls = await self._call_llm(retry_messages)
+        except LLMError as e:
+            logger.warning("[_node_finalize] 退化重写调用失败: %s", e)
+            return (
+                "上一轮回复无效(只有重复的过渡语),已拦截。请重试一次;"
+                "若反复出现,请换个问法或新建会话。"
+            )
+        cont = (cont or "").strip()
+        if not cont or _looks_like_degenerate_repeat(cont):
+            logger.warning("[_node_finalize] 退化重写后仍不合格(len=%s),用拦截提示兜底", len(cont))
+            return (
+                "上一轮回复无效(只有重复的过渡语),已拦截。请重试一次;"
+                "若反复出现,请换个问法或新建会话。"
+            )
+        return cont
+
     async def _node_finalize(self, state: AgentState, graph: Graph) -> None:
         """最终回答:更新计划、产出答案、自动沉淀记忆。流式模式逐 token 输出。"""
         logger.info("[_node_finalize] START resp_len=%d", len(state.metadata.get("resp") or ""))
@@ -1361,6 +1714,18 @@ class Agent:
                 except asyncio.TimeoutError:
                     logger.warning("finalize 阶段 LLM 补调用超时")
 
+        # 截断自动续写(根因1 修复):答案被 max_tokens 截断时,自动续调 LLM 补齐
+        state.metadata["resp"] = answer
+        answer = await self._try_continue_truncated(state, graph)
+
+        # 退化输出护栏:同一句过渡语重复 N 遍的"口水话答案"不落库、不展示,
+        # 直接重写一次(根治在 _build_messages 的时间戳排序,这里是兜底)
+        if _looks_like_degenerate_repeat(answer):
+            logger.warning("[_node_finalize] 检出退化重复答案(len=%d),重写一次", len(answer))
+            state.metadata["resp"] = answer
+            answer = await self._rewrite_degenerate_answer(state)
+            state.metadata["resp"] = answer
+
         # 输出 token 配额硬控制
         if self.max_output_tokens > 0 and answer:
             full, truncated = _truncate_to_token_budget(answer, self.max_output_tokens, self.llm)
@@ -1382,6 +1747,25 @@ class Agent:
             state.answer = state.answer.strip()
             state.answer = re.sub(r'[ \t]+', ' ', state.answer)
             state.answer = re.sub(r'\n{3,}', '\n\n', state.answer)
+
+        # 答案去噪:剥掉开场自述与明文思考段(详见 _clean_answer_noise 注释)。
+        # 被剥的内容不丢 —— 转成 thinking 事件透出,用户仍能在思考面板看到;
+        # 流式下正文已渲染,用 guardrail_overwrite 让前端换成清洗后的正文。
+        if state.answer:
+            cleaned, noise = _clean_answer_noise(state.answer)
+            if noise and cleaned != state.answer and len(cleaned.strip()) >= 2:
+                logger.info("[_node_finalize] 答案去噪: 剥离 %d 字自述/思考段(原 %d 字)",
+                            len(noise), len(state.answer))
+                state.metadata["answer_noise"] = noise
+                state.answer = cleaned
+                if state.metadata.get("stream"):
+                    state.emit({"type": "thinking", "content": noise, "phase": "noise"})
+                    state.emit({
+                        "type": "guardrail_overwrite",
+                        "content": cleaned,
+                        "reasons": ["answer_noise"],
+                        "stream_replaced": True,
+                    })
 
         # 拦截"没解析成功的工具调用块"被当成最终答案(实证见 _looks_like_unparsed_tool_call)
         if _looks_like_unparsed_tool_call(state.answer):
@@ -1986,7 +2370,10 @@ class Agent:
         if state.metadata.get("verify_rewritten"):
             return  # 已重写过一次,不再二次重写
 
-        evidence = "\n\n".join(tool_results)[:4000]
+        # 证据上限:原为 4000 字,只够装前几个工具结果。读文件类任务的工具结果
+        # 动辄几万字,评审员看不到后面的证据就把大量真实结论判成"未支撑",
+        # 重写时整段删掉 —— 表现为"答案被削短/信息量骤减"。放宽到 12000。
+        evidence = "\n\n".join(tool_results)[:12000]
         schema = {
             "type": "object",
             "properties": {
@@ -2042,7 +2429,9 @@ class Agent:
                 f"请根据以下工具结果修正回答中的事实错误:\n"
                 f"未支撑断言:\n- " + "\n- ".join(str(u) for u in unsupported) + "\n\n"
                 f"可用证据:\n{evidence}\n\n"
-                f"重写要求:删除或修正所有无法由证据支撑的表述,不引入证据之外的新信息。"
+                f"重写要求:只删除或修正上面列出的未支撑断言，其余内容(结构、章节、"
+                f"已有分析、代码引用)原样保留，不要缩短、不要重写整篇回答、不要改变结论；"
+                f"不引入证据之外的新信息。"
                 f"直接给出修正后的完整回答，不要道歉或重复之前的错误。"
                 f"用户请求: {state.user_input}"
             )
@@ -2058,6 +2447,12 @@ class Agent:
                 logger.warning("校验后 LLM 重写回答失败: %s", e)
                 return
             state.answer = new_answer
+            # 重写走非流式 chat(),CoT 注入产出的 <thinking> 已被 llm 层剥到
+            # self.llm._reasoning。这里补发成 thinking 事件,否则用户看到"思考完成"
+            # 却是空的 —— 重写轮恰好就是最终答案那一轮,没有别的 thinking 来源。
+            _tk = getattr(self.llm, "_reasoning", "") or ""
+            if _tk.strip():
+                state.emit({"type": "thinking", "content": _tk, "phase": "verify"})
             state.steps.append({
                 "step": sum(1 for s in state.steps if s.get("type") == "verify_rewrite") + 1,
                 "type": "verify_rewrite",
@@ -3262,6 +3657,19 @@ class Agent:
             budget = int(settings.agent_token_budget)
             from app.memory.context import budget_messages
 
+            # 关键修复(2026-10-01):先按时间戳排序再裁剪。
+            # 流式路径的 assistant 占位消息在"首个 token"时创建(chat.py),
+            # 位置排在本轮几十条工具消息之前;update_message 结束时只改内容/时间戳
+            # 不改位置 → "最新的最终回答"在列表顺序上反而早于本轮工具消息。
+            # budget_messages 从尾部保留,会把最新回答当旧消息裁掉 → 模型上下文里
+            # 一条 assistant 都没有("继续分析"实测如此)→ 模型失去对话连续性,
+            # 退化输出成排重复的过渡语(实证 12:41 / 12:44 两次)。
+            # 时间戳是可靠的:update_message 每次保存都会刷新为当前时间,
+            # 排序后回答自然落在本轮工具消息之后。稳定排序,时间戳相同保持原序。
+            history = sorted(
+                history,
+                key=lambda m: m.get("timestamp") if isinstance(m.get("timestamp"), (int, float)) else 0,
+            )
             # 兼容新旧格式:先统一转成 OpenAI 合法消息,再按 token 预算裁剪
             clipped = []
             for msg in history:
@@ -3271,6 +3679,10 @@ class Agent:
                 clipped.append(conv)
             messages += budget_messages(clipped, max_tokens=budget, head_tokens=head_tokens, min_keep=4)
         else:
+            history = sorted(
+                history,
+                key=lambda m: m.get("timestamp") if isinstance(m.get("timestamp"), (int, float)) else 0,
+            )
             total_chars = len(system)
             budget = settings.context_char_budget
             for msg in history:

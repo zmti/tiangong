@@ -143,6 +143,27 @@
     return esc(unescaped);
   }
 
+  // 优先用专属工具渲染器(tool-visual.js 的 renderToolVisual)生成结构化卡片:
+  // run_terminal/run_code 显示为带状态徽标/stdout/stderr/退出码/耗时的终端卡,
+  // git_diff 显示为 diff,etc。返回 null 表示该工具无专属渲染,需回落到通用
+  // JSON/文本渲染。
+  //
+  // 修复:此前 renderToolVisual 只被 export、从未被实时消息流调用(死代码),
+  // 导致 run_terminal 等工具的执行结果在会话里只显示一行 JSON 摘要,用户看不到
+  // stdout/stderr,体感"执行了但没显示"。此 helper 把它接进 addStep 的两条渲染路径。
+  function _renderToolResultHtml(name, result) {
+    if (!name || !result || !App.renderToolVisual) return null;
+    let obj = null;
+    const s = String(result).trim();
+    if (s.startsWith('{') || s.startsWith('[')) {
+      try { obj = JSON.parse(s); } catch (_) { return null; }
+    }
+    if (!obj || typeof obj !== 'object') return null;
+    try {
+      return App.renderToolVisual(name, obj);
+    } catch (_) { return null; }
+  }
+
   // ── 消息包装 ──
   function createMessageWrap(type) {
     const wrap = document.createElement('div');
@@ -182,6 +203,7 @@
     wrap.appendChild(createAvatar('user'));
     const content = document.createElement('div');
     content.className = 'msg-content';
+    wrap._content = content;  // 与 bot 气泡一致:暴露 content,供附件卡片等挂进消息体
     const bubble = document.createElement('div');
     bubble.className = 'answer-doc';
     // 用 innerHTML + 转义, 把 \n 转成 <br> 让多行在气泡里逐行显示(与复制内容一致,
@@ -394,9 +416,15 @@
           } else if ((name === 'generate_video' || name === 'enhance_video') && videoUrl) {
             resultEl.innerHTML = App.buildVideoHtml(videoUrl);
           } else {
-            const type = detectResultType(result);
-            resultEl.innerHTML = renderResultContent(result, type);
-            resultEl.dataset.resultType = type;
+            const toolHtml = _renderToolResultHtml(name, result);
+            if (toolHtml !== null) {
+              resultEl.innerHTML = toolHtml;
+              resultEl.dataset.resultType = 'tool';
+            } else {
+              const type = detectResultType(result);
+              resultEl.innerHTML = renderResultContent(result, type);
+              resultEl.dataset.resultType = type;
+            }
           }
         }
         if (detail) {
@@ -474,10 +502,16 @@
       } else if ((name === 'generate_video' || name === 'enhance_video') && videoUrl) {
         resultEl.innerHTML = App.buildVideoHtml(videoUrl);
       } else {
-        const type = detectResultType(result);
-        resultEl.dataset.resultType = type;
-        if (type === 'html') resultEl.classList.add('result-html-code');
-        resultEl.innerHTML = renderResultContent(result, type);
+        const toolHtml = _renderToolResultHtml(name, result);
+        if (toolHtml !== null) {
+          resultEl.innerHTML = toolHtml;
+          resultEl.dataset.resultType = 'tool';
+        } else {
+          const type = detectResultType(result);
+          resultEl.dataset.resultType = type;
+          if (type === 'html') resultEl.classList.add('result-html-code');
+          resultEl.innerHTML = renderResultContent(result, type);
+        }
       }
       detail.appendChild(resultEl);
     }

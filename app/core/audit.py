@@ -210,8 +210,7 @@ class AuditLogger:
                 conditions.append(f"{k} = ?")
                 params.append(v)
         where = " AND ".join(conditions) if conditions else "1=1"
-        row = self._backend.select_one("audit_logs", f"SELECT COUNT(*) as cnt FROM audit_logs WHERE {where}", tuple(params))
-        return row["cnt"] if row else 0
+        return self._backend.count("audit_logs", where, tuple(params))
 
 
 # 全局单例

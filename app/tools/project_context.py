@@ -24,12 +24,35 @@ def resolve_cwd() -> str:
     若这里原样返回未规范化的路径,相对路径写入会被拼成
     "E:/dev/TianGong/MES-System\\frontend/index.html",与白名单
     "E:\\dev\\TianGong\\MES-System" 前缀不匹配 → 误报"路径不在允许写入目录内"。
+
+    失效可观测:路径为空(会话未绑定项目)或目录已失效(项目被移动/改名)时,
+    不再静默退回 os.getcwd(),而是打出 warning 日志,便于定位"在错误目录执行任务"。
     """
+    import logging as _log
+    logger = _log.getLogger("project")
     p = get_project_path()
     if p and os.path.isdir(p):
-        import logging as _log
-        _log.getLogger("project").debug("resolve_cwd -> %s", p)
+        logger.debug("resolve_cwd -> %s", p)
         return os.path.abspath(p)
+    # 项目路径失效:记录明确警告(此前完全静默,导致排障困难)
+    if not p:
+        logger.warning(
+            "resolve_cwd: 项目路径为空(session 未绑定项目),回退到 %s", os.getcwd()
+        )
+    else:
+        logger.warning(
+            "resolve_cwd: 项目路径失效(目录不存在) %r,回退到 %s", p, os.getcwd()
+        )
+    # 兜底:若配置了 terminal_cwd 且存在,优先用它(此前 docstring 写了但从未实现)
+    try:
+        from app.config import settings
+
+        terminal_cwd = getattr(settings, "terminal_cwd", "") or ""
+        if terminal_cwd and os.path.isdir(terminal_cwd):
+            logger.info("resolve_cwd: 使用 terminal_cwd 兜底 %s", terminal_cwd)
+            return os.path.abspath(terminal_cwd)
+    except Exception:  # noqa: BLE001
+        pass
     return os.getcwd()
 
 

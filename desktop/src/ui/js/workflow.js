@@ -70,6 +70,8 @@ App.Workflow = (() => {
   let activeRunId = null;
   let runHistory = [];
   let viewScale = 1;
+  let viewPan = { x: 0, y: 0 };   // 画布平移(拖拽空白区), 与 viewScale 组合成 transform
+  let _panning = null;            // 平移拖拽进行中的状态
   let viewOffset = { x: 0, y: 0 };
   let _posCache = {};
   let _versionHistory = [];
@@ -147,6 +149,10 @@ App.Workflow = (() => {
       container.appendChild(svg);
     }
     svgEl = svg;
+    if (!svgEl._panBound) {
+      svgEl.addEventListener('mousedown', _onSvgPanStart);
+      svgEl._panBound = true;
+    }
     _updateSvgSize();
     return svg;
   }
@@ -155,6 +161,16 @@ App.Workflow = (() => {
     if (!svgEl) return;
     svgEl.style.width = '100%';
     svgEl.style.height = '100%';
+  }
+
+  // 画布平移: 在空白区按下并拖拽即可平移视图(节点上按下走节点拖拽, 不触发平移)
+  function _onSvgPanStart(e) {
+    if (e.button !== 0) return;
+    if (e.target.closest('.wf-node-group')) return;   // 点在节点上 → 节点拖拽, 不平移
+    if (_dragNode || _edgeDraw || _templateDrag) return;
+    _panning = { sx: e.clientX, sy: e.clientY, px: viewPan.x, py: viewPan.y };
+    if (svgEl) svgEl.style.cursor = 'grabbing';
+    e.preventDefault();
   }
 
   function _designerEl() {
@@ -301,6 +317,12 @@ App.Workflow = (() => {
 
   // ── 事件监听 ──────────────────────────────────────────────────
   document.addEventListener('mousemove', e => {
+    if (_panning) {
+      viewPan.x = _panning.px + (e.clientX - _panning.sx);
+      viewPan.y = _panning.py + (e.clientY - _panning.sy);
+      applyZoom();
+      return;
+    }
     if (_templateDrag) {
       if (svgEl && e.target && e.target.closest && (e.target.closest('#wfSvg') || e.target === svgEl)) {
         const c = _svgCoord(e);
@@ -352,6 +374,7 @@ App.Workflow = (() => {
   let _tempGhost = null;
 
   document.addEventListener('mouseup', e => {
+    if (_panning) { _panning = null; if (svgEl) svgEl.style.cursor = ''; }
     if (_templateDrag) {
       if (_tempGhost) { _tempGhost.remove(); _tempGhost = null; }
       const onCanvas = svgEl && e.target && e.target.closest && (e.target.closest('#wfSvg') || e.target === svgEl);
@@ -477,8 +500,15 @@ App.Workflow = (() => {
       const style = nodeStyle(node.type);
       const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
       g.setAttribute('transform', `translate(${node._x}, ${node._y})`);
-      g.setAttribute('class', `wf-node-group node-type-${node.type || ''}`);
+      g.setAttribute('class', `wf-node-group node-type-${node.type || ''} status-${node._lastStatus || 'idle'}`);
       g.dataset.nodeId = node.id;
+
+      // 画布卡片悬浮提示: 显示节点最近一次运行的执行结果(无运行时仅显示名称)
+      const gTitle = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+      const gTitleResult = node._lastResult ? ' · ' + node._lastResult : '';
+      gTitle.textContent = (node.name || style.label)
+        + (node._lastStatus ? ` [${node._lastStatus}]` : '') + gTitleResult;
+      g.appendChild(gTitle);
 
       const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
       rect.setAttribute('width', NODE_W);
@@ -950,7 +980,7 @@ App.Workflow = (() => {
         </div>
       </div>`).join('');
     
-    listEl.addEventListener('click', e => {
+    listEl.onclick = e => {
       const btn = e.target.closest('.wf-item-actions .mini-btn');
       if (!btn) return;
       e.stopPropagation();
@@ -958,7 +988,7 @@ App.Workflow = (() => {
       if (btn.classList.contains('wf-edit-btn')) App.Workflow.load(id);
       else if (btn.classList.contains('wf-run-btn')) App.Workflow.run(id);
       else if (btn.classList.contains('wf-delete-btn')) App.Workflow.deleteWorkflow(id);
-    });
+    };
   }
 
   async function load(id) {
@@ -1010,11 +1040,28 @@ App.Workflow = (() => {
   }
 
   let _runAborter = null;
+  let _runFinished = false;  // run() 流结束标志: 后端未发 terminal 帧时兜底置"完成", 避免状态卡"运行中"
   async function run(id) {
-    if (_runAborter) { _runAborter.abort(); _runAborter = null; showRunStatus('⏹ 已取消', ''); return; }
+    if (_runAborter) {
+      // 取消: 同时通知后端置位取消标记(否则后端任务会继续跑、且无法续跑)
+      const rid = activeRunId;
+      _runAborter.abort();
+      _runAborter = null;
+      if (rid) {
+        try {
+          await fetch(_apiBase() + `/v1/workflows/${id}/runs/${rid}/cancel`, {
+            method: 'POST',
+            headers: { ...(_apiKey() ? { 'Authorization': 'Bearer ' + _apiKey() } : {}) },
+          });
+        } catch (_) {}
+      }
+      showRunStatus('⏹ 已取消', '');
+      return;
+    }
     _runAborter = new AbortController();
     const signal = _runAborter.signal;
     activeRunId = null;
+    _runFinished = false;
     clearNodeStates();
     showRunStatus('▶ 运行中...', 'running');
     try {
@@ -1045,6 +1092,10 @@ App.Workflow = (() => {
           }
         }
       }
+      if (!_runFinished) {
+        // 后端流正常结束但未发 terminal 帧: 兜底标记为完成, 否则状态会卡在"运行中..."
+        showRunStatus('✅ 运行完成', 'success');
+      }
       _runAborter = null;
     } catch (e) {
       _runAborter = null;
@@ -1067,6 +1118,7 @@ App.Workflow = (() => {
       else if (data.status === 'skipped') showRunStatus(`— ${label} 已跳过`, '');
     }
     if (data.terminal) {
+      _runFinished = true;
       if (data.status === 'completed') {
         showRunStatus('✅ 运行完成', 'success');
         if (data.node_states) applyNodeStates(data.node_states);
@@ -1083,6 +1135,7 @@ App.Workflow = (() => {
       return;
     }
     if (data.node_states !== undefined && data.status) {
+      _runFinished = true;
       if (data.status === 'completed') {
         showRunStatus('✅ 运行完成', 'success');
         runHistory.push({ run_id: data.run_id, status: 'completed', duration: data.duration,
@@ -1154,10 +1207,10 @@ App.Workflow = (() => {
         <span class="wf-run-dur">${r.duration != null ? (r.duration * 1000).toFixed(0) + 'ms' : ''}</span>
         <span class="wf-run-status-badge">${r.status === 'completed' ? '成功' : r.status}</span>
       </div>`).join('');
-    el.addEventListener('click', e => {
+    el.onclick = e => {
       const item = e.target.closest('.wf-run-item-clickable');
       if (item) App.Workflow.showRunDetail(item.dataset.runId);
-    });
+    };
   }
 
   function formatTime(ts) {
@@ -1172,7 +1225,19 @@ App.Workflow = (() => {
     try {
       const data = await _fetch(`/v1/workflows/${currentWorkflow.id}/runs/${runId}`);
       renderRunDetail(data);
+      _applyRunToCanvas(data);
     } catch (e) { console.error('加载详情失败:', e); }
+  }
+
+  // 把某次运行的节点状态回放到画布: 状态点着色 + 悬浮提示显示结果
+  function _applyRunToCanvas(run) {
+    if (!run || !run.node_states) return;
+    nodes.forEach(n => {
+      const st = run.node_states[n.id];
+      n._lastStatus = st ? st.status : null;
+      n._lastResult = st ? _fmtResult(st) : null;
+    });
+    if (svgEl) { renderNodes(svgEl, currentWorkflow); renderEdges(); }
   }
 
   function renderRunDetail(run) {
@@ -1184,27 +1249,58 @@ App.Workflow = (() => {
       const color = state.status === 'success' ? 'var(--ok)' : state.status === 'failed' ? 'var(--err)' : 'var(--muted)';
       const icon = state.status === 'success' ? '✓' : state.status === 'failed' ? '✗' : state.status === 'skipped' ? '—' : '?';
       const errText = state.error ? escapeHtml(String(state.error).slice(0, 120)) : '-';
-      return `<tr><td>${escapeHtml(node?.name || nid)}</td><td style="color:${color}">${icon} ${state.status}</td><td>${state.duration != null ? (state.duration*1000).toFixed(0)+'ms' : '-'}</td><td>${errText}</td></tr>`;
+      const resultText = _fmtResult(state);
+      return `<tr><td>${escapeHtml(node?.name || nid)}</td><td style="color:${color}">${icon} ${state.status}</td><td>${state.duration != null ? (state.duration*1000).toFixed(0)+'ms' : '-'}</td><td>${errText}</td><td class="wf-result-cell"><span class="wf-result-text" title="${resultText}">${resultText}</span></td></tr>`;
     }).join('');
     const outputJson = run.output ? escapeHtml(JSON.stringify(run.output, null, 2)) : '-';
+    const canResume = run.status === 'cancelled' || run.status === 'failed';
     panel.innerHTML = `
-      <div class="wf-run-panel-header"><span>📋 运行详情 · ${run.run_id.slice(-8)}</span><button class="np-close wf-close-run-panel-btn">×</button></div>
+      <div class="wf-run-panel-header">
+        <span>📋 运行详情 · ${run.run_id.slice(-8)}</span>
+        <span class="wf-run-header-actions">
+          ${canResume ? '<button class="np-btn wf-resume-run-btn">↻ 从断点继续</button>' : ''}
+          <button class="np-close wf-close-run-panel-btn">×</button>
+        </span>
+      </div>
       <div class="wf-run-detail-tabs">
         <button class="wf-tab wf-run-tab-btn active" data-tab="nodes">节点状态</button>
         <button class="wf-tab wf-run-tab-btn" data-tab="output">输出结果</button>
       </div>
       <div id="wfRunNodes" class="wf-run-tab-content active">
-        <table class="wf-state-table"><thead><tr><th>节点</th><th>状态</th><th>耗时</th><th>错误</th></tr></thead><tbody>${stateRows || '<tr><td colspan="4">无数据</td></tr>'}</tbody></table>
+        <table class="wf-state-table"><thead><tr><th>节点</th><th>状态</th><th>耗时</th><th>错误</th><th>输出</th></tr></thead><tbody>${stateRows || '<tr><td colspan="5">无数据</td></tr>'}</tbody></table>
       </div>
       <div id="wfRunOutput" class="wf-run-tab-content"><pre class="wf-output-pre">${outputJson}</pre></div>`;
     
     // 绑定事件（避免内联onclick被CSP阻止）
     const closeBtn = panel.querySelector('.wf-close-run-panel-btn');
-    if (closeBtn) closeBtn.addEventListener('click', closeRunPanel);
-    panel.addEventListener('click', e => {
+    if (closeBtn) closeBtn.onclick = closeRunPanel;
+    const resumeBtn = panel.querySelector('.wf-resume-run-btn');
+    if (resumeBtn) resumeBtn.onclick = () => resumeRun(currentWorkflow.id, run.run_id);
+    panel.onclick = e => {
       const tabBtn = e.target.closest('.wf-run-tab-btn');
       if (tabBtn) switchRunTab(tabBtn.dataset.tab, tabBtn);
-    });
+    };
+  }
+
+  async function resumeRun(workflowId, runId) {
+    try {
+      App.toast?.('正在从断点继续...', 'info');
+      const resp = await fetch(_apiBase() + `/v1/workflows/${workflowId}/runs/${runId}/resume`, {
+        method: 'POST',
+        headers: { ...(_apiKey() ? { 'Authorization': 'Bearer ' + _apiKey() } : {}) },
+      });
+      const d = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(d.detail || '续跑失败');
+      App.toast?.(`已发起续跑,跳过 ${(d.skipped_nodes || []).length} 个已完成节点`, 'ok');
+      await loadRunHistory();
+      try {
+        const data = await _fetch(`/v1/workflows/${workflowId}/runs/${runId}`);
+        renderRunDetail(data);
+        _applyRunToCanvas(data);
+      } catch (_) {}
+    } catch (e) {
+      App.toast?.('续跑失败: ' + e.message, 'err');
+    }
   }
 
   function switchRunTab(tab, btn) {
@@ -1220,23 +1316,86 @@ App.Workflow = (() => {
     return String(t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
   }
 
+  // 把单个节点的执行结果(可能是对象/字符串)格式化为可读、可截断的文本
+  function _fmtResult(state) {
+    const r = state && state.result;
+    if (r == null) return '-';
+    // 循环节点:聚合显示迭代次数与每轮成功情况,避免直接展开巨大的 results 数组
+    if (r && r.output && typeof r.output.iterations === 'number') {
+      const iters = Array.isArray(r.output.results) ? r.output.results : [];
+      const ok = iters.filter(x => x && (x.status === 'success' || x.error == null)).length;
+      let s = `循环 ${r.output.iterations} 次迭代`;
+      if (iters.length) s += ` (成功 ${ok}/${iters.length})`;
+      if (s.length > 240) s = s.slice(0, 240) + '…';
+      return escapeHtml(s);
+    }
+    let s;
+    try { s = typeof r === 'string' ? r : JSON.stringify(r, null, 2); }
+    catch (e) { s = String(r); }
+    if (s.length > 240) s = s.slice(0, 240) + '…';
+    return escapeHtml(s);
+  }
+
   async function autoLayout() {
     if (!currentWorkflow || nodes.length === 0) return;
-    const count = nodes.length;
-    const cols = count > 4 ? 3 : count > 2 ? 2 : 1;
-    const colW = NODE_W + PAD * 2;
-    const rowH = NODE_H + PAD * 2;
-    nodes.forEach((node, idx) => {
-      node._x = PAD + (idx % cols) * colW;
-      node._y = PAD + Math.floor(idx / cols) * rowH;
+
+    // 1) 构建邻接表 + 入度。循环子图节点没有显式连向循环节点的边,
+    //    这里补一条"隐性布局边",让子图节点自然排在循环节点右侧的分层里。
+    const byId = {};
+    nodes.forEach(n => { byId[n.id] = n; });
+    const outAdj = {};
+    const inDeg = {};
+    nodes.forEach(n => { outAdj[n.id] = []; inDeg[n.id] = 0; });
+    edges.forEach(e => {
+      if (byId[e.source] && byId[e.target]) { outAdj[e.source].push(e.target); inDeg[e.target]++; }
     });
+    nodes.forEach(n => {
+      if (n.type === 'loop') {
+        const sub = (n.loop_config && n.loop_config.subgraph_ids)
+          || (n.config && n.config.loop_config && n.config.loop_config.subgraph_ids)
+          || n.subgraph_ids || [];
+        sub.forEach(sid => {
+          if (byId[sid] && sid !== n.id) { outAdj[n.id].push(sid); inDeg[sid]++; }
+        });
+      }
+    });
+
+    // 2) Kahn 拓扑分层(最长路径 = 该节点所有前驱层的最大值 + 1)
+    const layerOf = {};
+    nodes.forEach(n => { layerOf[n.id] = 0; });
+    const queue = nodes.filter(n => inDeg[n.id] === 0).map(n => n.id);
+    while (queue.length) {
+      const id = queue.shift();
+      outAdj[id].forEach(tid => {
+        if (layerOf[tid] < layerOf[id] + 1) layerOf[tid] = layerOf[id] + 1;
+        inDeg[tid]--;
+        if (inDeg[tid] === 0) queue.push(tid);
+      });
+    }
+    // 残余节点(成环导致入度未归零): 放到当前最大层之后
+    let maxLayer = 0;
+    nodes.forEach(n => { if (layerOf[n.id] > maxLayer) maxLayer = layerOf[n.id]; });
+    nodes.forEach(n => { if (inDeg[n.id] > 0) layerOf[n.id] = maxLayer + 1; });
+
+    // 3) 按层排布: 层与层水平右移, 同层竖直堆叠
+    const colW = NODE_W + PAD * 2;
+    const rowH = NODE_H + PAD;
+    const perLayer = {};
+    nodes.forEach(n => {
+      const l = layerOf[n.id];
+      if (!perLayer[l]) perLayer[l] = 0;
+      const idx = perLayer[l]++;
+      n._x = PAD + l * colW;
+      n._y = PAD + idx * rowH;
+    });
+
     _capturePositions();
     _savePositions();
     renderNodes(svgEl, currentWorkflow);
     renderEdges();
     try {
       await saveWorkflow();
-      App.toast?.('已自动布局并保存', 'ok');
+      App.toast?.('已按拓扑分层自动布局并保存', 'ok');
     } catch (_) {}
   }
 
@@ -1265,8 +1424,10 @@ App.Workflow = (() => {
     const selected = types[idx];
     const name = await App.prompt?.('节点名称:', selected.label + ' ' + (nodes.length + 1));
     if (!name) return;
-    const x = Math.max(60, ...nodes.map(n => n._x || 0)) + NODE_W + 40;
-    const y = Math.max(60, ...nodes.map(n => n._y || 0));
+    const maxX = nodes.reduce((m, n) => Math.max(m, n._x || 0), 60);
+    const maxY = nodes.reduce((m, n) => Math.max(m, n._y || 0), 60);
+    const x = maxX + NODE_W + 40;
+    const y = maxY;
     await _createNode(selected.type, x, y, name.trim());
   }
 
@@ -1337,7 +1498,7 @@ App.Workflow = (() => {
       layout: ['wfLayoutBtn', autoLayout],
       zoomIn: ['wfZoomInBtn', () => { viewScale = Math.min(2, viewScale * 1.2); applyZoom(); }],
       zoomOut: ['wfZoomOutBtn', () => { viewScale = Math.max(0.3, viewScale * 0.8); applyZoom(); }],
-      zoomReset: ['wfZoomResetBtn', () => { viewScale = 1; applyZoom(); }],
+      zoomReset: ['wfZoomResetBtn', () => { viewScale = 1; viewPan = { x: 0, y: 0 }; applyZoom(); }],
       aiGen: ['wfAiGenBtn', generateByDescription],
       runHistoryRefresh: ['wfRunHistoryRefresh', loadRunHistory],
       addNodeAlt: ['wfAddNodeBtn2', addNode],
@@ -1389,9 +1550,9 @@ App.Workflow = (() => {
       });
       chip.addEventListener('click', () => {
         if (!currentWorkflow) { App.toast?.('请先在下方列表选择一个工作流', 'info'); return; }
-        const x = Math.max(60, ...nodes.map(n => n._x || 0)) + NODE_W + 40;
-        const y = Math.max(60, ...nodes.map(n => n._y || 0));
-        _createNode(tpl.type, x, y, null);
+        const cx = nodes.reduce((m, n) => Math.max(m, n._x || 0), 60);
+        const cy = nodes.reduce((m, n) => Math.max(m, n._y || 0), 60);
+        _createNode(tpl.type, cx + NODE_W + 40, cy, null);
       });
       list.appendChild(chip);
     });
@@ -1410,7 +1571,9 @@ App.Workflow = (() => {
 
   function applyZoom() {
     if (svgEl) {
-      svgEl.style.transform = `scale(${viewScale})`;
+      // 平移(translate) + 缩放(scale) 组合; transform-origin=top left 使 _svgCoord 仍可按
+      // (clientX - rect.left)/scale 反推用户坐标(rect 已含 translate 偏移), 无需额外换算。
+      svgEl.style.transform = `translate(${viewPan.x}px, ${viewPan.y}px) scale(${viewScale})`;
       svgEl.style.transformOrigin = 'top left';
       renderEdges();
     }
@@ -1485,10 +1648,10 @@ App.Workflow = (() => {
         <span class="wf-version-time">${formatTime(v.created_at * 1000)}</span>
         <button class="mini-btn wf-rollback-btn" data-version-id="${v.version_id}">回滚</button>
       </div>`).join('');
-    el.addEventListener('click', e => {
+    el.onclick = e => {
       const btn = e.target.closest('.wf-rollback-btn');
       if (btn) App.Workflow.rollbackVersion(btn.dataset.versionId);
-    });
+    };
   }
 
   async function rollbackVersion(versionId) {
@@ -1569,10 +1732,10 @@ App.Workflow = (() => {
           ${s.enabled ? '禁用' : '启用'}
         </button>
       </div>`).join('');
-    el.addEventListener('click', e => {
+    el.onclick = e => {
       const btn = e.target.closest('.wf-toggle-schedule');
       if (btn) App.Workflow.toggleSchedule(btn.dataset.id);
-    });
+    };
   }
 
   async function createSchedule() {

@@ -2,11 +2,13 @@
 
 - 以 session_id 为键,文件保存在 data/attachments/<session_id>/ 下。
 - 每条附件记录 {id, name, size, mime, created_at}。
-- 只读文本注入:聊天时把附件内容拼进用户消息;超大文件截断。
-- 纯内存索引 + 磁盘文件,重启后索引丢失但文件仍在(由清理逻辑兜底)。
+- 索引持久化:每会话 data/attachments/<session_id>/meta.json 为权威,内存 dict
+  仅作缓存;后端重启后自动从磁盘恢复,会话历史附件不再"消失"。
+- 纯文本/文档注入:聊天时把附件内容拼进用户消息;超大文件截断。
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import threading
@@ -35,11 +37,61 @@ class AttachmentStore:
         os.makedirs(d, exist_ok=True)
         return d
 
+    def _meta_path(self, session_id: str) -> str:
+        return os.path.join(self._dir(session_id), "meta.json")
+
+    def _meta_from_disk(self, session_id: str) -> list[dict]:
+        """从磁盘恢复索引:优先读 meta.json,缺失时按目录内 att_id_ 前缀文件重建。"""
+        path = self._meta_path(session_id)
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    items = json.load(f)
+                if isinstance(items, list):
+                    return [it for it in items if isinstance(it, dict) and it.get("id")]
+            except (OSError, json.JSONDecodeError):
+                pass
+        # meta.json 缺失/损坏 → 扫描实际文件重建(att_id_ 前缀,跳过 meta.json 本身)
+        base = self._dir(session_id)
+        items: list[dict] = []
+        hexdigits = set("0123456789abcdef")
+        if os.path.isdir(base):
+            for fn in os.listdir(base):
+                if fn == "meta.json" or not os.path.isfile(os.path.join(base, fn)):
+                    continue
+                # 文件名形如 <12位hex att_id>_<原文件名>;att_id 为 uuid hex 前 12 位
+                prefix, sep, rest = fn.partition("_")
+                if not sep or len(prefix) != 12 or any(c not in hexdigits for c in prefix):
+                    continue
+                p = os.path.join(base, fn)
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                items.append({
+                    "id": prefix,
+                    "name": rest or fn,
+                    "size": st.st_size,
+                    "mime": "application/octet-stream",
+                    "created_at": st.st_mtime,
+                })
+        return items
+
     def _read_meta(self, session_id: str) -> list[dict]:
-        return _index.get(session_id, [])
+        if session_id not in _index:
+            # 懒恢复:内存无缓存时,从磁盘权威层重建(重启后仍能列到历史附件)
+            _index[session_id] = self._meta_from_disk(session_id)
+        return _index[session_id]
 
     def _write_meta(self, session_id: str, items: list[dict]) -> None:
         _index[session_id] = items
+        try:
+            path = self._meta_path(session_id)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(items, f, ensure_ascii=False)
+        except OSError:
+            # 磁盘写失败不阻断内存操作(最坏退化为旧行为:重启丢失)
+            pass
 
     def add(self, session_id: str, filename: str, content: bytes, mime: str = "") -> dict:
         """保存一个附件,返回记录 dict。超限返回 error dict。"""

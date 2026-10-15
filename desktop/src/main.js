@@ -1,4 +1,4 @@
-﻿const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, globalShortcut, nativeImage, desktopCapturer, screen } = require('electron');
+﻿const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, globalShortcut, nativeImage, desktopCapturer, screen, shell } = require('electron');
 const { spawn, execFileSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
@@ -573,6 +573,24 @@ ipcMain.handle('open-folder-dialog', async () => {
   } catch (e) {
     console.error('[open-folder-dialog]', e);
     return { error: e.message };
+  }
+});
+
+// IPC: 打开本地文件(会话附件"用系统程序打开")。
+// 白名单校验:归一化后的路径必须含 data/attachments 段,拒绝诱导渲染进程打开任意系统文件。
+ipcMain.handle('shell-open-file', async (event, filePath) => {
+  try {
+    if (typeof filePath !== 'string' || !filePath) return { ok: false, reason: 'empty' };
+    const norm = path.normalize(filePath).toLowerCase();
+    const segs = norm.split(/[\\/]+/);
+    if (!segs.includes('attachments') || !segs.includes('data')) {
+      return { ok: false, reason: 'not-attachment-path' };
+    }
+    const errMsg = await shell.openPath(filePath);
+    return errMsg ? { ok: false, reason: errMsg } : { ok: true };
+  } catch (e) {
+    console.error('[shell-open-file]', e);
+    return { ok: false, reason: String(e && e.message || e) };
   }
 });
 

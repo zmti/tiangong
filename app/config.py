@@ -143,9 +143,14 @@ class Settings(BaseSettings):
     no_proxy: str = ""
 
     # ---- 数据层后端 ----
-    # 会话/记忆存储:sqlite(默认,零依赖) / redis(需 redis-py + REDIS_URL)
+    # 会话/记忆等结构化存储: sqlite(默认,零依赖) / redis(需 redis-py + REDIS_URL)
+    #   / postgresql(需 psycopg + STORAGE_POSTGRES_DSN; 连接配置缺失或不可达时自动回退 SQLite)
     storage_backend: str = "sqlite"
     redis_url: str = ""
+    # 结构化存储的 Postgres DSN(仅 storage_backend=postgresql 时生效)。
+    # 留空则回落到向量侧的 PGVECTOR_CLIENT_DSN(同一套连接凭据即可复用);
+    # 两者都为空则 postgresql 后端无法启用, 自动回退 SQLite。
+    storage_postgres_dsn: str = ""
     # 向量存储:auto(装了 psycopg 且配置 PGVECTOR_* 则用 pgvector,否则 SQLite+faiss)
     #   / pgvector(强制 pgvector) / sqlite
     vector_store_backend: str = "auto"
@@ -240,6 +245,9 @@ class Settings(BaseSettings):
     agent_llm_retries: int = 2
     # 重试基础延迟(秒),按 2^n 指数退避
     agent_llm_retry_delay: float = 0.5
+    # 限流/临时错误(429/503/网络抖动)在 agent 层额外退避重试的次数;
+    # 与 LLM 层 agent_llm_retries 叠加,用于"模型限流一次就中断整个任务"的兜底
+    agent_llm_rate_retries: int = 3
     # 流式调用空闲超时(秒): 流内相邻 chunk 间隔超过该值视为上游卡死,立即中断
     # 并给出可操作提示;0 = 不限制(不建议,provider 中途停顿会导致前端"一直卡")
     agent_llm_stream_idle_timeout: int = 90
@@ -534,6 +542,9 @@ class Settings(BaseSettings):
     skill_default_cpu_percent: int = 50
     skill_default_timeout_seconds: int = 60
     skill_default_network_allowed: bool = False
+    # 第三方技能定义目录(放 YAML/JSON 工具编排技能,启动时由 load_skills_from_directory 加载)。
+    # 默认 <data_dir>/skills;第三方把技能定义文件丢进这个目录,重启后端即生效。
+    skill_third_party_dir: str = ""
 
     # ---- 文件写权限 ----
     # write_file 工具允许写入的根目录白名单(逗号分隔,可用相对路径);空则仅允许数据目录
@@ -637,6 +648,8 @@ class Settings(BaseSettings):
     mcp_reconnect_max_delay: float = 60.0
     # MCP 连续失败停止重连的阈值
     mcp_reconnect_max_failures: int = 10
+    # 连接失败后是否自动禁用该服务器(写入 enabled:false,下次启动不再尝试)
+    mcp_auto_disable_on_failure: bool = True
 
     # 计算实际数据目录:优先使用可写的工作目录(开发=项目根,打包=exe 旁),
     # 避免 PyInstaller 临时解包目录(_MEIPASS)导致数据丢失

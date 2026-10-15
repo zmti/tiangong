@@ -62,7 +62,8 @@ def _extract_docx_text(data: bytes) -> dict:
     """Word 文档解析。"""
     try:
         from docx import Document
-        doc = Document(stream=data)
+        import io
+        doc = Document(io.BytesIO(data))
         paragraphs = []
         for i, para in enumerate(doc.paragraphs):
             if para.text.strip():
@@ -92,34 +93,75 @@ def _extract_docx_text(data: bytes) -> dict:
         return {"type": "docx", "error": f"Word 解析失败: {e}"}
 
 
-def _extract_excel(data: bytes) -> dict:
-    """Excel 文件解析。"""
+def _extract_xls_legacy(data: bytes) -> dict:
+    """老版 .xls(Excel 97-2003, OLE2/BIFF)解析,用 xlrd(xlrd 2.0 仅支持 .xls)。"""
     try:
-        import openpyxl
-        wb = openpyxl.load_workbook(stream=data, read_only=True)
+        import xlrd
+        book = xlrd.open_workbook(file_contents=data)
         sheets = {}
-        for name in wb.sheetnames:
-            ws = wb[name]
+        for sheet in book.sheets():
             rows = []
-            for row in ws.iter_rows(values_only=True):
-                if any(c is not None for c in row):
-                    rows.append([str(c) if c is not None else "" for c in row])
-                if len(rows) >= 100:
-                    break
-            sheets[name] = {"row_count": len(rows), "data": rows}
-        wb.close()
-        return {"type": "excel", "sheet_count": len(sheets), "sheets": sheets}
+            max_rows = min(sheet.nrows, 100)  # 只取前 100 行,防超大表卡死
+            for r in range(max_rows):
+                row = [sheet.cell_value(r, c) for c in range(sheet.ncols)]
+                if any(v not in (None, "") for v in row):
+                    rows.append([str(v) for v in row])
+            sheets[sheet.name] = {"row_count": sheet.nrows, "data": rows}
+        return {
+            "type": "excel",
+            "format": "xls",
+            "sheet_count": len(sheets),
+            "sheets": sheets,
+        }
     except ImportError:
-        return {"type": "excel", "error": "需要安装 openpyxl: pip install openpyxl"}
-    except Exception as e:
-        return {"type": "excel", "error": f"Excel 解析失败: {e}"}
+        return {"type": "excel", "error": "需要安装 xlrd: pip install xlrd"}
+    except Exception as e:  # noqa: BLE001
+        return {"type": "excel", "error": f"老版 .xls 解析失败: {e}"}
+
+
+def _extract_excel(data: bytes) -> dict:
+    """Excel 文件解析:按**文件魔数**自动分流(而非仅看扩展名)。
+
+    扩展名常被误标(HTML 表格 / CSV 数据库导出另存为 .xls;老 .xls 与 .xlsx 二进制
+    完全不同),只看扩展名会把老 .xls 或伪装文件喂给 openpyxl → 报
+    "File contains no valid workbook part" / BadZipFile。这里:
+      - OLE2/BIFF 老 .xls(魔数 D0CF11E0) → xlrd(xlrd 2.0 仅支持 .xls)
+      - OOXML/ZIP  .xlsx(魔数 PK..)        → openpyxl
+      - 其他(HTML/CSV 等伪装)              → 按文本解析
+    """
+    if data[:4] == b"\xd0\xcf\x11\xe0":  # OLE2 compound doc: 老 .xls
+        return _extract_xls_legacy(data)
+    if data[:2] == b"PK":  # ZIP 容器: .xlsx
+        try:
+            import openpyxl
+            import io
+            wb = openpyxl.load_workbook(io.BytesIO(data), read_only=True)
+            sheets = {}
+            for name in wb.sheetnames:
+                ws = wb[name]
+                rows = []
+                for row in ws.iter_rows(values_only=True):
+                    if any(c is not None for c in row):
+                        rows.append([str(c) if c is not None else "" for c in row])
+                    if len(rows) >= 100:
+                        break
+                sheets[name] = {"row_count": len(rows), "data": rows}
+            wb.close()
+            return {"type": "excel", "format": "xlsx", "sheet_count": len(sheets), "sheets": sheets}
+        except ImportError:
+            return {"type": "excel", "error": "需要安装 openpyxl: pip install openpyxl"}
+        except Exception as e:  # noqa: BLE001
+            return {"type": "excel", "error": f".xlsx 解析失败: {e}"}
+    # 既非 OLE2 也非 ZIP:多为 HTML/CSV 被误标成 .xls,按文本解析
+    return _extract_text_file(data)
 
 
 def _extract_pptx(data: bytes) -> dict:
     """PowerPoint 解析。"""
     try:
         from pptx import Presentation
-        prs = Presentation(stream=data)
+        import io
+        prs = Presentation(io.BytesIO(data))
         slides = []
         for si, slide in enumerate(prs.slides, 1):
             texts = []
@@ -149,7 +191,12 @@ def _extract_text_file(data: bytes, encoding: str = "utf-8") -> dict:
     # 统计结构
     headings = [l for l in lines if l.startswith("#")]
     code_blocks = re.findall(r"```[\s\S]*?```", text)
-    lists = [l for l in lines if l.strip().startswith(("- ", "* ", "+ ", str.isdigit))]
+
+    def _is_list_line(s: str) -> bool:
+        s = s.strip()
+        return s.startswith(("- ", "* ", "+ ")) or s[:1].isdigit()
+
+    lists = [l for l in lines if _is_list_line(l)]
 
     return {
         "type": "text",
@@ -181,7 +228,15 @@ def parse_document(
 
     ext = os.path.splitext(file_path)[1].lower()
     data = _read_file_bytes(file_path)
+    result = _parse_bytes_by_ext(data, ext)
+    result["file_path"] = file_path
+    result["file_size_bytes"] = len(data)
+    return result
 
+
+def _parse_bytes_by_ext(data: bytes, ext: str) -> dict:
+    """按扩展名路由到对应解析器(供 parse_document 与附件链路复用)。"""
+    ext = (ext or "").lower()
     if ext in (".pdf",):
         result = _extract_pdf_text(data)
     elif ext in (".docx", ".doc"):
@@ -190,15 +245,82 @@ def parse_document(
         result = _extract_excel(data)
     elif ext in (".pptx", ".ppt"):
         result = _extract_pptx(data)
-    elif ext in (".md", ".txt", ".csv", ".json", ".yaml", ".yml", ".py", ".js", ".ts", ".go", ".rs", ".java", ".c", ".cpp", ".h", ".css", ".html", ".xml", ".toml"):
-        result = _extract_text_file(data)
     else:
-        # 尝试作为文本读取
+        # 文本/代码/未知:按文本读
         result = _extract_text_file(data)
-
-    result["file_path"] = file_path
-    result["file_size_bytes"] = len(data)
     return result
+
+
+def extract_bytes(file_name: str, content: bytes) -> dict:
+    """附件链路专用:解析上传的二进制文档(PDF/docx/xlsx/pptx),无需落盘。
+
+    供 chat._prepare_attachments 把用户上传的 Office/PDF 转成 LLM 可读的结构化
+    文本(此前这类附件因 utf-8 解码 zip/pdf 二进制失败而被静默丢弃,LLM 看不到)。
+    返回 {ok, type, text, detail, error}:
+      - ok=True: text 为可注入上下文的紧凑文本(失败/二进制无法解析时为 "");
+      - detail 为轻量元信息(如页数/表格数),供日志;
+      - 解析库缺失/文件损坏时 ok=False + error 描述,调用方据此降级。
+    """
+    ext = os.path.splitext(file_name or "")[1].lower()
+    result = _parse_bytes_by_ext(content, ext)
+    rtype = result.get("type", "")
+    if result.get("error"):
+        # 解析库缺失或文件损坏:无法产出文本,交给调用方降级为文件名提示
+        return {"ok": False, "type": rtype, "text": "", "detail": {}, "error": result["error"]}
+
+    text = _format_doc_as_text(rtype, result)
+    detail = _doc_detail(result)
+    return {"ok": bool(text.strip()), "type": rtype, "text": text, "detail": detail, "error": ""}
+
+
+def _doc_detail(result: dict) -> dict:
+    """轻量元信息,便于日志/前端展示。"""
+    t = result.get("type")
+    d: dict = {"type": t}
+    if t == "pdf":
+        d["page_count"] = result.get("page_count", 0)
+    elif t == "docx":
+        d["paragraph_count"] = result.get("paragraph_count", 0)
+        d["table_count"] = result.get("table_count", 0)
+    elif t == "excel":
+        d["sheet_count"] = result.get("sheet_count", 0)
+    elif t == "pptx":
+        d["slide_count"] = result.get("slide_count", 0)
+    elif t == "text":
+        d["line_count"] = result.get("line_count", 0)
+    return d
+
+
+def _format_doc_as_text(rtype: str, result: dict) -> str:
+    """把结构化解析结果拼成紧凑、LLM 友好的纯文本(带截断,避免上下文爆)。"""
+    cap = 12000  # 单文档注入上限
+    if rtype == "pdf":
+        parts = [f"[PDF 第{p['page']}页]\n{p['text']}" for p in result.get("pages", [])]
+        body = "\n\n".join(parts)
+    elif rtype == "docx":
+        body = "\n".join(p["text"] for p in result.get("paragraphs", []))
+        for tb in result.get("tables", []):
+            rows = tb.get("rows", [])
+            if not rows:
+                continue
+            body += "\n\n[表格]" + "\n".join(" | ".join(str(c) for c in r) for r in rows)
+    elif rtype == "excel":
+        blocks = []
+        for sname, s in (result.get("sheets") or {}).items():
+            rows = s.get("data", [])
+            if not rows:
+                continue
+            head = " | ".join(str(c) for c in rows[0]) if len(rows) > 1 else ""
+            data_lines = " | ".join(" | ".join(str(c) for c in r) for r in rows[:50])
+            blocks.append(f"[工作表 {sname}]({s.get('row_count', 0)} 行)\n{head}\n{data_lines}")
+        body = "\n\n".join(blocks)
+    elif rtype == "pptx":
+        body = "\n\n".join(f"[第{s.get('slide')}页]\n{s.get('text','')}" for s in result.get("slides", []))
+    else:  # text
+        body = result.get("preview", "") or result.get("full_text", "")
+    if len(body) > cap:
+        body = body[:cap] + "\n…[内容过长,已截断]"
+    return body
 
 
 @tool(

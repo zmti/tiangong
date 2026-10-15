@@ -575,14 +575,14 @@ class WorkflowDB:
             "SELECT COUNT(*) FROM workflow_runs WHERE workflow_id = ? AND status = 'failed' AND started_at >= ?",
             (workflow_id, cutoff),
         ).fetchone()[0]
-        # 平均耗时
+        # 平均耗时(workflow_runs 无 duration 列,用 finished_at - started_at 推导)
         avg_dur = conn.execute(
-            "SELECT AVG(duration) FROM workflow_runs WHERE workflow_id = ? AND status = 'completed' AND started_at >= ? AND finished_at IS NOT NULL",
+            "SELECT AVG(finished_at - started_at) FROM workflow_runs WHERE workflow_id = ? AND status = 'completed' AND started_at >= ? AND finished_at IS NOT NULL",
             (workflow_id, cutoff),
         ).fetchone()[0] or 0
-        # 最近运行
+        # 最近运行(主键列名是 id,不是 run_id;duration 由 finished_at - started_at 推导)
         latest = conn.execute(
-            "SELECT run_id, status, started_at, duration FROM workflow_runs WHERE workflow_id = ? ORDER BY started_at DESC LIMIT 1",
+            "SELECT id, status, started_at, (CASE WHEN finished_at IS NOT NULL THEN finished_at - started_at ELSE 0 END) AS duration FROM workflow_runs WHERE workflow_id = ? ORDER BY started_at DESC LIMIT 1",
             (workflow_id,),
         ).fetchone()
         return {
@@ -592,7 +592,7 @@ class WorkflowDB:
             "success_rate": round(success / max(1, total) * 100, 1) if total > 0 else 0,
             "avg_duration_sec": round(avg_dur, 2),
             "latest_run": {
-                "run_id": latest["run_id"],
+                "run_id": latest["id"],
                 "status": latest["status"],
                 "started_at": latest["started_at"],
                 "duration": latest["duration"],
@@ -600,28 +600,37 @@ class WorkflowDB:
         }
 
     def get_node_performance(self, workflow_id: str, run_id: str = None) -> list[dict]:
-        """获取节点性能统计(平均耗时、失败率)。"""
+        """获取节点性能统计(平均耗时、失败率)。
+
+        checkpoints 表由独立的 WorkflowCheckpointManager 写入
+        (workflow_checkpoints.db),不一定存在于本 workflow 库。
+        表缺失时优雅返回空列表,而非让接口 500。
+        """
         conn = self.connect()
-        if run_id:
-            rows = conn.execute("""
-                SELECT node_id, AVG(duration) as avg_dur, COUNT(*) as runs,
-                       SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failures
-                FROM checkpoints
-                WHERE run_id = ?
-                GROUP BY node_id
-            """, (run_id,)).fetchall()
-        else:
-            # 最近10次运行的统计
-            rows = conn.execute("""
-                SELECT c.node_id, AVG(c.duration) as avg_dur, COUNT(*) as runs,
-                       SUM(CASE WHEN c.status = 'failed' THEN 1 ELSE 0 END) as failures
-                FROM checkpoints c
-                JOIN workflow_runs r ON c.run_id = r.id
-                WHERE r.workflow_id = ? AND r.finished_at IS NOT NULL
-                GROUP BY c.node_id
-                ORDER BY avg_dur DESC
-                LIMIT 20
-            """, (workflow_id,)).fetchall()
+        try:
+            if run_id:
+                rows = conn.execute("""
+                    SELECT node_id, AVG(duration) as avg_dur, COUNT(*) as runs,
+                           SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failures
+                    FROM checkpoints
+                    WHERE run_id = ?
+                    GROUP BY node_id
+                """, (run_id,)).fetchall()
+            else:
+                # 最近10次运行的统计
+                rows = conn.execute("""
+                    SELECT c.node_id, AVG(c.duration) as avg_dur, COUNT(*) as runs,
+                           SUM(CASE WHEN c.status = 'failed' THEN 1 ELSE 0 END) as failures
+                    FROM checkpoints c
+                    JOIN workflow_runs r ON c.run_id = r.id
+                    WHERE r.workflow_id = ? AND r.finished_at IS NOT NULL
+                    GROUP BY c.node_id
+                    ORDER BY avg_dur DESC
+                    LIMIT 20
+                """, (workflow_id,)).fetchall()
+        except sqlite3.OperationalError:
+            # checkpoints 表尚未在本库创建(独立库 workflow_checkpoints.db 持有),返回空
+            return []
         return [
             {
                 "node_id": r["node_id"],

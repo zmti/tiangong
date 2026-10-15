@@ -33,6 +33,18 @@ logger = logging.getLogger(__name__)
 NodeEventCallback = Callable[[str, str, str, Optional[dict], Optional[str]], Any]
 
 
+# 进行中的运行注册表: run_id -> WorkflowRun。
+# cancel() 借此在运行期间置位取消标记,run() 的层间/节点级检查据此中断;
+# 运行结束后由 run() 的 finally 自动摘除,避免在内存里堆积已完成运行。
+_active_runs: dict[str, "WorkflowRun"] = {}
+
+# 运行结束后的 SAGA 补偿状态快照: run_id -> saga.to_dict()。
+# 执行器实例内的 _saga_mgr 在运行结束后仍会被下一次 run() reset() 清掉,
+# 这里留一份终态快照,供 /v1/workflows/saga/status/{run_id} 查询真实补偿结果
+# (全局 CompensationRegistry 从不被执行器写入,直接查它恒返回空)。
+_run_saga_status: dict[str, dict] = {}
+
+
 class WorkflowExecutor:
     """增强型工作流执行器。
 
@@ -96,6 +108,9 @@ class WorkflowExecutor:
             session_id=session_id,
         )
 
+        # 登记到全局活跃运行表,供 cancel() 在运行期间置位取消标记中断执行
+        _active_runs[effective_run_id] = run
+
         # 检查是否存在可恢复的 checkpoint
         skippable_nodes = set()
         if effective_run_id and self._checkpoint_mgr:
@@ -140,13 +155,14 @@ class WorkflowExecutor:
 
         try:
             # 收集被循环节点托管的子图节点,将其排除出顶层拓扑执行
-            # (这些节点只在循环体内部由 LoopController 驱动执行,避免被顶层重复/越序执行)
+            # (这些节点只在循环体内部由 LoopController 驱动执行,避免被顶层重复/越序执行)。
+            # 注意:用局部变量而非实例属性 —— 同一个 executor 实例可能被并发用于
+            # 多次 run(),实例属性会互相覆盖。
             loop_managed = set()
             for _n in workflow.nodes.values():
                 if _n.type == NodeType.LOOP:
                     _sids = (_n.loop_config or {}).get("subgraph_ids") or _n.subgraph_ids or []
                     loop_managed.update(_sids)
-            self._loop_managed_ids = loop_managed
 
             # 拓扑排序,构建执行层次
             layers = self._topological_layers(workflow, exclude=loop_managed)
@@ -232,6 +248,34 @@ class WorkflowExecutor:
 
                 logger.info(f"工作流 {workflow.id} 第 {layer_idx + 1}/{len(layers)} 层执行完成")
 
+            # 若运行期间被取消,标记为 cancelled 而非 completed(已产出的节点结果仍保留,供续跑)
+            if run.cancelled:
+                run.status = "cancelled"
+                run.finished_at = time.time()
+                outputs = {}
+                for nid, state in run.node_states.items():
+                    if state["status"] == NodeStatus.FAILED.value:
+                        outputs[nid] = {"error": state.get("error")}
+                    else:
+                        outputs[nid] = state.get("result")
+                run.output = {
+                    "nodes": outputs,
+                    "variables": dict(run.variables),
+                    "results": {nid: self._extract_node_output(state.get("result")) for nid, state in run.node_states.items()},
+                }
+                self._emit_event(run.run_id, "__run__", "cancelled", run.output, None)
+                if self._checkpoint_mgr:
+                    self._checkpoint_mgr.update_run_metadata(
+                        run.run_id, "cancelled",
+                        completed_nodes=sum(
+                            1 for s in run.node_states.values()
+                            if s.get("status") == NodeStatus.SUCCESS.value
+                        ),
+                        skipped_nodes=len(skippable_nodes),
+                    )
+                logger.info(f"工作流 {workflow.id} 已取消,耗时 {run.duration:.2f}s")
+                return run
+
             # 标记完成
             run.status = "completed"
             run.finished_at = time.time()
@@ -267,12 +311,33 @@ class WorkflowExecutor:
             self._emit_event(run.run_id, "__run__", "failed", None, str(e))
             if self._checkpoint_mgr:
                 self._checkpoint_mgr.update_run_metadata(run.run_id, "failed", str(e))
+        finally:
+            # 无论成功/失败/取消,运行结束后从活跃表摘除,避免内存堆积
+            _active_runs.pop(effective_run_id, None)
+            # 留存本次运行的 SAGA 终态快照, 供 /saga/status/{run_id} 查询真实补偿结果
+            if self._saga_mgr:
+                try:
+                    _run_saga_status[effective_run_id] = self._saga_mgr.to_dict()
+                except Exception:
+                    pass
 
         return run
 
     async def cancel(self, run_id: str) -> bool:
-        """取消运行。"""
-        logger.info(f"取消运行 {run_id}")
+        """取消运行。
+
+        置位取消标记,run() 的层间循环与 _execute_node 的节点级检查会据此在
+        下一个边界中断执行(已完成的节点结果保留,可直接续跑)。运行已结束(不在
+        活跃注册表中)时返回 False,由调用方决定如何处理历史记录。
+        """
+        run = _active_runs.get(run_id)
+        if run is None:
+            logger.warning(f"取消运行 {run_id} 失败: 未找到进行中的运行(可能已结束)")
+            return False
+        if run.cancelled:
+            return True
+        run.cancel()  # 置位 _cancelled,状态改为 cancelled
+        logger.info(f"已请求取消运行 {run_id}")
         return True
 
     # ============================================================
@@ -609,11 +674,19 @@ class WorkflowExecutor:
         if node.loop_mode and str(node.loop_mode).lower() == "parallel":
             config.setdefault("batch_size", len(config.get("subgraph_ids") or [0]) or 10)
 
+        # 已成功节点的结果快照:evaluator 与 controller 必须共享同一个 dict,
+        # 否则 _execute_body 每轮回写的循环体产出只有 controller 看得到,
+        # evaluator 的条件评估永远读的是循环开始前的旧快照。
+        shared_node_results = {
+            nid: state.get("result")
+            for nid, state in run.node_states.items()
+            if state.get("status") == NodeStatus.SUCCESS.value
+        }
+
         # 构建动态边评估器
         evaluator = DynamicEdgeEvaluator(
             variables=run.variables,
-            node_results={nid: state.get("result") for nid, state in run.node_states.items()
-                         if state.get("status") == NodeStatus.SUCCESS.value},
+            node_results=shared_node_results,
         )
 
         # 创建循环控制器
@@ -621,11 +694,13 @@ class WorkflowExecutor:
             loop_config=config,
             workflow_nodes=workflow.nodes,
             variables=run.variables,
-            node_results={nid: state.get("result") for nid, state in run.node_states.items()
-                         if state.get("status") == NodeStatus.SUCCESS.value},
+            node_results=shared_node_results,
             execute_node_func=lambda n: self._execute_node(agent, workflow, run, n, force=True),
             save_checkpoint_func=lambda node_id, status, variables, result=None:
                 self._checkpoint_mgr.save_checkpoint(run.run_id, node_id, status, variables, result) if self._checkpoint_mgr else None,
+            # 工作流级取消传播:cancel() 只置 run._cancelled,循环控制器若不感知,
+            # 取消后仍会空转完整个 iterable/while(每轮 execute_node 立即返回 None)。
+            cancel_check=lambda: run.cancelled,
         )
 
         # 执行循环
@@ -755,6 +830,37 @@ class WorkflowExecutor:
                 return result.get("result")
         return result
 
+    def _condition_output(self, result) -> Optional[bool]:
+        """从条件节点的执行结果里提取布尔值(兼容多种返回形态)。"""
+        if isinstance(result, dict):
+            out = result.get("output", result.get("result"))
+        else:
+            out = result
+        if isinstance(out, bool):
+            return out
+        if isinstance(out, (int, float)):
+            return bool(out)
+        if isinstance(out, str):
+            return out.strip().lower() in ("true", "1", "yes", "是")
+        return None
+
+    @staticmethod
+    def _branch_targets(branches: dict, cond_out: bool) -> list[str]:
+        """把 node.branches({true/false: 目标 或 [目标...]})归一为节点 ID 列表。"""
+        if not branches:
+            return []
+        val = branches.get("true" if cond_out else "false")
+        if val is None:
+            # 兼容把布尔值当 key 的写法(如 {"True": [...], "False": [...]})
+            val = branches.get(str(cond_out))
+        if val is None:
+            return []
+        if isinstance(val, str):
+            return [val]
+        if isinstance(val, (list, tuple, set)):
+            return [str(v) for v in val]
+        return []
+
     def _is_node_active(
         self,
         workflow: Workflow,
@@ -765,8 +871,12 @@ class WorkflowExecutor:
 
         规则:
         - 无任何入边的节点(根节点/START)始终激活;
-        - 否则,只要存在一条「源节点已成功执行 且 该边条件表达式为真」的入边即激活;
-        - 否则视为未激活,跳过执行 —— 条件分支 / 默认分支由此真正生效。
+        - 条件节点(node.branches 语义):UI 条件面板把 true/false 的目标放在节点级
+          `branches` 上,仅当本节点在「条件结果对应分支的目标列表」中时激活 ——
+          这是修复"条件分支不过滤、true/false 两路都执行"的核心;
+        - 边级条件(condition_expr/condition):源节点成功且表达式为真时激活;
+        - 无条件边:直接激活;
+        - 默认分支(is_default):仅当同一源节点其他条件路径均未激活时才作为兜底激活。
         """
         incoming = [e for e in workflow.edges if e.target == node.id]
         if not incoming:
@@ -777,24 +887,44 @@ class WorkflowExecutor:
             for nid, s in run.node_states.items()
             if s.get("status") == NodeStatus.SUCCESS.value
         }
+
+        # 第一轮:逐条入边判定激活(条件节点 branches / 边级条件 / 无条件)
+        routed_by_branches: set[str] = set()
         for edge in incoming:
             src_state = run.node_states.get(edge.source, {})
             if src_state.get("status") != NodeStatus.SUCCESS.value:
                 continue
-            cond = getattr(edge, "condition_expr", None) or getattr(edge, "condition", None)
-            if not cond or not cond.strip():
-                return True
-            try:
-                ev = DynamicEdgeEvaluator(variables=run.variables, node_results=success_results)
-                if ev.evaluate(cond):
+            src_node = workflow.nodes.get(edge.source)
+            # 节点级 branches 语义(UI 条件节点):仅激活落在对应分支目标里的节点
+            if src_node is not None and src_node.type == NodeType.CONDITION and src_node.branches:
+                cond_out = self._condition_output(src_state.get("result"))
+                if cond_out is None:
+                    continue
+                if node.id in self._branch_targets(src_node.branches, cond_out):
                     return True
-            except Exception:
-                # 条件评估异常时保守地视为不激活,避免误执行
+                routed_by_branches.add(edge.source)
                 continue
-        # 默认分支:所有条件边均不激活时,若存在标记为默认的入边则激活之
+            # 边级条件
+            cond = getattr(edge, "condition_expr", None) or getattr(edge, "condition", None)
+            if cond and cond.strip():
+                try:
+                    ev = DynamicEdgeEvaluator(variables=run.variables, node_results=success_results)
+                    if ev.evaluate(cond):
+                        return True
+                except Exception:
+                    # 条件评估异常时保守地视为不激活,避免误执行
+                    continue
+                continue
+            # 无条件边 → 直接激活
+            return True
+
+        # 默认分支:仅当其他条件路径均未激活时,才走 is_default 边
         for edge in incoming:
             src_state = run.node_states.get(edge.source, {})
             if src_state.get("status") != NodeStatus.SUCCESS.value:
+                continue
+            # 该源节点已通过 branches 完成路由,其 is_default 边不再单独兜底
+            if edge.source in routed_by_branches:
                 continue
             if getattr(edge, "is_default", False):
                 return True

@@ -95,6 +95,9 @@ class WorkflowCheckpointManager:
             # WAL 写前日志:降低单连接写锁冲突概率(多运行并发持久化 checkpoint 时)
             try:
                 self._conn.execute("PRAGMA journal_mode=WAL")
+                # C 盘空间不足时 ORDER BY 需临时文件 → "database or disk is full"
+                # MEMORY 模式让排序/聚合在内存完成,避免依赖系统 TEMP
+                self._conn.execute("PRAGMA temp_store=MEMORY")
             except sqlite3.DatabaseError:
                 pass
             self._create_tables()

@@ -553,6 +553,101 @@ async def update_workflow(workflow_id: str, req: WorkflowUpdateRequest):
     return {"id": workflow_id, "message": "工作流已更新"}
 
 
+# ============================================================
+# 工作流模板
+# ============================================================
+
+class TemplateListResponse(BaseModel):
+    templates: list[dict]
+    total: int
+
+
+class TemplateInstantiateRequest(BaseModel):
+    instance_id: str = Field(..., description="实例 ID(唯一标识)")
+    inputs: dict = Field(default_factory=dict, description="输入变量")
+
+
+class TemplateSearchRequest(BaseModel):
+    keyword: str = ""
+    limit: int = Field(20, ge=1, le=100)
+
+
+@router.get("/templates")
+async def list_templates() -> TemplateListResponse:
+    """列出所有可用模板。"""
+    from app.core.workflow.templates import get_template_registry
+    registry = get_template_registry()
+    templates = [t.to_dict() for t in registry.list_all()]
+    return TemplateListResponse(templates=templates, total=len(templates))
+
+
+@router.get("/templates/search")
+async def search_templates(q: str = "", limit: int = 20):
+    """搜索模板。"""
+    from app.core.workflow.templates import get_template_registry
+    registry = get_template_registry()
+    templates = registry.search(q, limit=limit)
+    return {
+        "query": q,
+        "templates": [t.to_dict() for t in templates],
+        "total": len(templates),
+    }
+
+
+@router.get("/templates/{template_id}")
+async def get_template(template_id: str):
+    """获取模板详情。"""
+    from app.core.workflow.templates import get_template_registry
+    registry = get_template_registry()
+    template = registry.get(template_id)
+    if not template:
+        raise HTTPException(404, f"模板不存在: {template_id}")
+    return template.to_dict()
+
+
+@router.post("/templates/{template_id}/instantiate")
+async def instantiate_template(template_id: str, req: TemplateInstantiateRequest):
+    """从模板实例化工作流。"""
+    from app.core.workflow.templates import get_template_registry
+    registry = get_template_registry()
+    template = registry.get(template_id)
+    if not template:
+        raise HTTPException(404, f"模板不存在: {template_id}")
+
+    try:
+        workflow = registry.instantiate(
+            template_id=template_id,
+            instance_id=req.instance_id,
+            inputs=req.inputs,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"实例化失败: {e}")
+
+    # 验证并保存
+    errors = workflow.validate()
+    if errors:
+        raise HTTPException(400, "; ".join(errors))
+
+    now = time.time()
+    wf_id = f"wf_inst_{req.instance_id}"
+    workflow.id = wf_id
+    workflow.created_at = now
+    workflow.updated_at = now
+
+    _workflows[wf_id] = workflow
+    _executors[wf_id] = _make_executor()
+    _runs[wf_id] = {}
+    get_db().save_workflow(workflow)
+
+    logger.info(f"从模板实例化工作流: {template_id} -> {wf_id}")
+    return {
+        "id": wf_id,
+        "template_id": template_id,
+        "name": workflow.name,
+        "message": "工作流实例化成功",
+    }
+
+
 @router.get("/{workflow_id}")
 async def get_workflow(workflow_id: str):
     """获取工作流详情。"""
@@ -861,9 +956,13 @@ async def run_workflow_stream(workflow_id: str, req: WorkflowRunStreamRequest):
     if workflow_id not in _runs:
         _runs[workflow_id] = {}
 
-    # 同一时刻只允许一个流式运行,避免并发跑同一个工作流导致事件缓冲互相串台
-    for existing_run_id, existing_run in list(_runs.get(workflow_id, {}).items()):
-        if existing_run.status == "running":
+    # 同一 workflow 同一时刻只允许一个在飞运行,避免并发跑同一个工作流导致
+    # 事件缓冲互相串台。在飞运行的权威源是 executor 模块级 _active_runs
+    # (run() 开始写入、结束 pop) —— 旧实现查 _runs,而 _runs 只在运行结束后
+    # 才登记,运行中的 run 根本不在里面,互斥检查完全失效(两个流式运行可同时开跑)。
+    from app.core.workflow import executor as _executor_mod
+    for active_run in list(_executor_mod._active_runs.values()):
+        if active_run.workflow_id == workflow_id:
             raise HTTPException(409, "该工作流已有正在进行的运行,请等待完成或取消后重试")
 
     # 实时事件队列(替代原来的 list 缓冲)。
@@ -1052,6 +1151,46 @@ async def run_workflow(workflow_id: str, req: WorkflowRunRequest):
     }
 
 
+# ============================================================
+# 运行状态查询
+# ============================================================
+
+# 注意:本端点必须注册在 "/{workflow_id}/runs/{run_id}" 之前 —— FastAPI/Starlette
+# 按注册顺序匹配路径,若排在后面,"running" 会被当成 run_id 匹配到
+# get_run_detail,本端点永远不可达(GET /runs/running 返回 404 运行记录不存在)。
+
+@router.get("/{workflow_id}/runs/running")
+async def list_running_workflows(workflow_id: str):
+    """查询指定工作流当前正在运行的运行。
+
+    在飞运行的权威源是 executor 模块级 _active_runs(run() 开始写入、结束 pop);
+    _runs 只在运行结束后才登记,查它永远看不到运行中的 run(旧实现的缺陷)。
+    """
+    from app.core.workflow import executor as _executor_mod
+
+    active = []
+    seen: set[str] = set()
+    for run in _executor_mod._active_runs.values():
+        if run.workflow_id == workflow_id and run.status == "running":
+            seen.add(run.run_id)
+            active.append({
+                "workflow_id": run.workflow_id,
+                "run_id": run.run_id,
+                "session_id": run.session_id,
+                "started_at": run.started_at,
+            })
+    # 兜底:_runs 中仍标记 running 的历史记录(如异常路径未及时更新状态)
+    for run_id, run in _runs.get(workflow_id, {}).items():
+        if run.status == "running" and run_id not in seen:
+            active.append({
+                "workflow_id": workflow_id,
+                "run_id": run_id,
+                "session_id": run.session_id,
+                "started_at": run.started_at,
+            })
+    return {"active_runs": active}
+
+
 @router.get("/{workflow_id}/runs/{run_id}")
 async def get_run_detail(workflow_id: str, run_id: str):
     """获取单次运行详情。"""
@@ -1108,26 +1247,6 @@ async def clear_workflow_runs(workflow_id: str):
         _runs[workflow_id].clear()
     get_db().delete_runs(workflow_id)
     return {"message": "运行记录已清空"}
-
-
-# ============================================================
-# 运行状态查询
-# ============================================================
-
-@router.get("/{workflow_id}/runs/running")
-async def list_running_workflows():
-    """查询当前正在运行的工作流。"""
-    active = []
-    for wf_id, runs in _runs.items():
-        for run_id, run in runs.items():
-            if run.status == "running":
-                active.append({
-                    "workflow_id": wf_id,
-                    "run_id": run_id,
-                    "session_id": run.session_id,
-                    "started_at": run.started_at,
-                })
-    return {"active_runs": active}
 
 
 # ============================================================
@@ -1196,100 +1315,6 @@ async def get_run_performance(workflow_id: str, run_id: str):
     return generate_performance_report(run)
 
 
-# ============================================================
-# 工作流模板
-# ============================================================
-
-class TemplateListResponse(BaseModel):
-    templates: list[dict]
-    total: int
-
-
-class TemplateInstantiateRequest(BaseModel):
-    instance_id: str = Field(..., description="实例 ID(唯一标识)")
-    inputs: dict = Field(default_factory=dict, description="输入变量")
-
-
-class TemplateSearchRequest(BaseModel):
-    keyword: str = ""
-    limit: int = Field(20, ge=1, le=100)
-
-
-@router.get("/templates")
-async def list_templates() -> TemplateListResponse:
-    """列出所有可用模板。"""
-    from app.core.workflow.templates import get_template_registry
-    registry = get_template_registry()
-    templates = [t.to_dict() for t in registry.list_all()]
-    return TemplateListResponse(templates=templates, total=len(templates))
-
-
-@router.get("/templates/search")
-async def search_templates(q: str = "", limit: int = 20):
-    """搜索模板。"""
-    from app.core.workflow.templates import get_template_registry
-    registry = get_template_registry()
-    templates = registry.search(q, limit=limit)
-    return {
-        "query": q,
-        "templates": [t.to_dict() for t in templates],
-        "total": len(templates),
-    }
-
-
-@router.get("/templates/{template_id}")
-async def get_template(template_id: str):
-    """获取模板详情。"""
-    from app.core.workflow.templates import get_template_registry
-    registry = get_template_registry()
-    template = registry.get(template_id)
-    if not template:
-        raise HTTPException(404, f"模板不存在: {template_id}")
-    return template.to_dict()
-
-
-@router.post("/templates/{template_id}/instantiate")
-async def instantiate_template(template_id: str, req: TemplateInstantiateRequest):
-    """从模板实例化工作流。"""
-    from app.core.workflow.templates import get_template_registry
-    registry = get_template_registry()
-    template = registry.get(template_id)
-    if not template:
-        raise HTTPException(404, f"模板不存在: {template_id}")
-
-    try:
-        workflow = registry.instantiate(
-            template_id=template_id,
-            instance_id=req.instance_id,
-            inputs=req.inputs,
-        )
-    except Exception as e:
-        raise HTTPException(500, f"实例化失败: {e}")
-
-    # 验证并保存
-    errors = workflow.validate()
-    if errors:
-        raise HTTPException(400, "; ".join(errors))
-
-    now = time.time()
-    wf_id = f"wf_inst_{req.instance_id}"
-    workflow.id = wf_id
-    workflow.created_at = now
-    workflow.updated_at = now
-
-    _workflows[wf_id] = workflow
-    _executors[wf_id] = _make_executor()
-    _runs[wf_id] = {}
-    get_db().save_workflow(workflow)
-
-    logger.info(f"从模板实例化工作流: {template_id} -> {wf_id}")
-    return {
-        "id": wf_id,
-        "template_id": template_id,
-        "name": workflow.name,
-        "message": "工作流实例化成功",
-    }
-
 
 # ============================================================
 # 工作流编排
@@ -1335,7 +1360,10 @@ async def execute_chain(req: ChainExecuteRequest):
 async def execute_parallel(req: ParallelExecuteRequest):
     """并行执行多个工作流。"""
     from app.core.workflow.orchestrator import get_orchestrator
-    orchestrator = get_orchestrator()
+    # 传入带 Checkpoint 持久化的执行器作为默认执行器:
+    # get_orchestrator() 不传参时内部会新建 WorkflowExecutor(None),其 checkpoint
+    # 是空路径 no-op 模式,编排运行不落断点、无法 resume,与 /run 行为不一致。
+    orchestrator = get_orchestrator(_executors.get(req.workflow_ids[0]) if req.workflow_ids else None)
 
     results = await orchestrator.execute_parallel(
         workflow_ids=req.workflow_ids,
@@ -1354,7 +1382,8 @@ async def execute_parallel(req: ParallelExecuteRequest):
 async def execute_with_dependencies(req: ChainExecuteRequest):
     """按依赖关系执行工作流。"""
     from app.core.workflow.orchestrator import get_orchestrator
-    orchestrator = get_orchestrator()
+    # 同 /orchestrate/parallel:传入带 Checkpoint 持久化的执行器作为默认执行器
+    orchestrator = get_orchestrator(_executors.get(req.workflow_ids[0]) if req.workflow_ids else None)
 
     results = await orchestrator.execute_with_dependencies(
         workflow_ids=req.workflow_ids,
@@ -1381,11 +1410,13 @@ async def add_dependency(req: DependencyRequest):
 async def get_orchestration_status():
     """获取编排器状态。"""
     from app.core.workflow.orchestrator import get_orchestrator
+    from app.core.workflow import executor as _executor_mod
     orchestrator = get_orchestrator()
     return {
         "registered_executors": list(orchestrator._executors.keys()),
         "dependencies": orchestrator._dependencies,
-        "active_runs": len(orchestrator._running_runs),
+        # 在飞运行真正的源头是 executor 模块级 _active_runs(run() 写入、结束 pop)
+        "active_runs": len(_executor_mod._active_runs),
     }
 
 
@@ -1420,12 +1451,18 @@ async def resume_workflow_run(workflow_id: str, run_id: str):
         raise HTTPException(400, "该运行没有可恢复的检查点")
 
     executor = _ensure_executor(workflow_id)
+    # 必须显式传 agent:续跑的工作流里未执行的 Agent 节点要靠它调用 LLM,
+    # 不传会报"Agent 未初始化"(与同步 /run 路径同样的修复)。
     run = await executor.run(
         workflow=wf,
         inputs={},  # 输入已保存在 checkpoint 中
         run_id=run_id,
         skip_nodes=skippable,
+        agent=_get_agent(),
     )
+    # 与其他运行路径一致:登记到内存并落库,前端刷新后才能看到续跑结果
+    _runs.setdefault(workflow_id, {})[run_id] = run
+    get_db().save_run(run)
     return {
         "run_id": run.run_id,
         "status": run.status,
@@ -1435,13 +1472,50 @@ async def resume_workflow_run(workflow_id: str, run_id: str):
     }
 
 
+@router.post("/{workflow_id}/runs/{run_id}/cancel")
+async def cancel_workflow_run(workflow_id: str, run_id: str):
+    """取消正在运行的工作流。
+
+    置位取消标记后,run() 会在下一个层/节点边界中断;已成功节点保留 checkpoint,
+    可随后调用 /resume 从断点继续。若运行已结束则只同步落库状态。
+    """
+    executor = _ensure_executor(workflow_id)
+    ok = await executor.cancel(run_id)
+
+    # 同步内存与落库中的运行状态。
+    # 流式运行期间 run 只在 executor._active_runs 里(_runs 要等运行结束才登记),
+    # 所以返回的状态要优先从活跃表取,否则 cancel 成功也返回 status:None。
+    from app.core.workflow import executor as _executor_mod
+    run = _executor_mod._active_runs.get(run_id) or _runs.get(workflow_id, {}).get(run_id)
+    if run is not None and run.status == "running":
+        run.status = "cancelled"
+        run.finished_at = run.finished_at or time.time()
+        get_db().save_run(run)
+
+    return {
+        "cancelled": ok,
+        "run_id": run_id,
+        "status": run.status if run else None,
+    }
+
+
 # ============================================================
 # SAGA 补偿管理
 # ============================================================
 
 @router.get("/saga/status/{run_id}")
 async def get_saga_status(run_id: str):
-    """获取 SAGA 补偿状态。"""
+    """获取 SAGA 补偿状态。
+
+    真实状态在 executor 运行期间的实例级 _saga_mgr 里,运行结束时由 run() 的
+    finally 写快照到 executor._run_saga_status;全局 CompensationRegistry 只是
+    预留的跨工作流注册表、从不被执行器写入,旧实现直接查它恒返回空状态。
+    """
+    from app.core.workflow import executor as _executor_mod
+    snapshot = _executor_mod._run_saga_status.get(run_id)
+    if snapshot is not None:
+        return snapshot
+    # 运行尚未结束(或从未跑过):回落全局注册表
     from app.core.workflow.saga import get_compensation_registry
     registry = get_compensation_registry()
     saga = registry.get_or_create(run_id)

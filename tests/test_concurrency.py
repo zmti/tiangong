@@ -95,11 +95,17 @@ async def test_concurrent_checkpoint_cleanup():
         # 并发清理
         results = await asyncio.gather(*[cm.cleanup_expired(ttl_days=7) for _ in range(5)])
         
-        # 验证清理结果一致
+        # 验证并发安全: 返回 dict(checkpoints/versions/vacuum), 各并发结果字段一致非负。
+        # 注: save 写入的 created_at/updated_at 是"当前时间", 不在 7 天 TTL 内,
+        # 故此处 5 条不会被删(返回 0), 本用例只验证并发调用 cleanup 的安全性与一致性。
         for result in results:
-            assert result >= 0, f"清理结果应为非负数，实际 {result}"
-        
-        print(f"[OK] 并发清理测试成功，清理次数: {results[0]}")
+            assert isinstance(result, dict), f"清理结果应为 dict，实际 {type(result)}"
+            assert result.get("checkpoints", 0) >= 0, f"主表计数应为非负，实际 {result}"
+            assert result.get("versions", 0) >= 0, f"版本表计数应为非负，实际 {result}"
+        # 5 个并发调用看到一致的结果(数据都在 7 天内, 均应删 0 条)
+        assert all(r.get("checkpoints", 0) == 0 for r in results), f"7天内数据不应被删, 实际 {results}"
+
+        print(f"[OK] 并发清理测试成功，各结果: {results[0]}")
 
 
 @pytest.mark.asyncio

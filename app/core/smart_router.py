@@ -62,6 +62,60 @@ def _get_routing_stats() -> dict:
     }
 
 
+# ── 通用词(停止词) ──────────────────────────────────────────────
+# 这些词几乎出现在每个工具的描述里("根据描述生成…""分析当前…""读取文件内容…")。
+# 一旦进入关键词索引,任何含这些词的日常问句都会被判为命中,进而把付费的图像/视频
+# 生成工具塞进候选集 —— 实测"根据当前知识库,分析智能体"仅因"根据"二字命中
+# generate_video 的描述就被路由进来,模型随即真的去生成视频/作画(大错容 + 真实消耗)。
+# 这里在分词源头过滤掉它们;多字词(如"生成视频""读取文件")不受影响,精度反而更高。
+_GENERIC_TOKENS = frozenset({
+    "根据", "当前", "描述", "内容", "信息", "支持", "可以", "使用", "进行",
+    "相关", "提供", "获取", "指定", "其他", "全部", "所有", "自动", "快速",
+    "简单", "注意", "说明", "结果", "返回", "执行", "输入", "输出", "文本",
+    "字符", "格式", "类型", "对象", "字段", "数据", "一个", "这个", "什么",
+    "如何", "怎么", "需要", "能够", "用于", "通过", "以及", "或者", "并且",
+    "时间", "状态", "名称", "参数", "功能", "工具", "系统", "默认", "例如",
+    "生成", "分析", "处理", "查询", "显示", "添加", "删除", "修改", "设置",
+    "创建", "读取", "写入", "编辑", "保存", "打开", "关闭", "运行", "启动",
+})
+
+# ── 付费/重资源媒体生成工具 ──────────────────────────────────────
+# 这两类工具一旦被调用就要真金白银出图/出视频,且 security 层已不再强制确认
+# (security.py: generate_image/generate_video 不再强制确认)。因此只有当请求里
+# 出现明确的多模态生成意图时才允许进入候选集,否则一律剔除。
+_MEDIA_TOOLS = frozenset({"generate_image", "generate_video"})
+
+_MEDIA_INTENT_RE = re.compile(
+    r"(图片|图像|图像|插图|配图|海报|封面|照片|画图|作画|绘图|画一|画张|画个|"
+    r"视频|动画|短片|动图|gif|出图|生成图|"
+    r"\bimage\b|\bpicture\b|\bphoto\b|\bdraw\b|\bpaint\b|\bposter\b|"
+    r"\bvideo\b|\banimation\b|\bclip\b|\bmovie\b)",
+    re.IGNORECASE,
+)
+
+
+def _has_media_intent(query: str) -> bool:
+    """请求是否包含明确的多模态生成意图。"""
+    return bool(query) and _MEDIA_INTENT_RE.search(query) is not None
+
+
+def _filter_media_tools(query: str, names: list[str]) -> list[str]:
+    """无明确图像/视频生成意图时,剔除付费媒体生成工具。"""
+    if _has_media_intent(query):
+        return names
+    return [n for n in names if n not in _MEDIA_TOOLS]
+
+
+def filter_paid_media_tools(query: str, names: list[str]) -> list[str]:
+    """公开入口:无明确图像/视频生成意图时剔除付费媒体生成工具。
+
+    供 agent 内核在"路由失败回退全量工具集"的场景下调用 —— 那种情况下
+    _active_tools 为 None,模型会看到注册表里的全部工具,容易顺手调用
+    generate_image/generate_video(真实扣费 + 长时间等待 + 答非所问)。
+    """
+    return _filter_media_tools(query, names)
+
+
 # ── 关键词路由(第一级,最快) ─────────────────────────────────────
 _KEYWORD_INDEX: dict[str, list[str]] = {}
 
@@ -120,7 +174,9 @@ def _smart_tokenize(text: str) -> list[str]:
     for verb in common_verbs:
         if verb in text and verb not in tokens:
             tokens.append(verb)
-    return tokens
+    # 4. 过滤通用词:它们在几乎所有工具描述里都出现,保留会造成大量误命中
+    #    (多字词如"生成视频/读取文件"不受影响,只滤掉无区分度的裸词)
+    return [t for t in tokens if t not in _GENERIC_TOKENS]
 
 
 # ── 置信度评分 ────────────────────────────────────────────────────
@@ -241,9 +297,12 @@ async def select_tools_enhanced(
         scored.sort(key=lambda x: x[0], reverse=True)
         if scored:
             names = [n for _, n in scored[:max_tools]]
-            avg_conf = sum(s for s, _ in scored[:max_tools]) / min(len(names), max_tools)
-            _record_routing_success(user_input, names, avg_conf)
-            return names, avg_conf, f"keyword_match(命中{len(keyword_hits)}词)"
+            # 无明确多模态生成意图时剔除付费图像/视频工具(防止模型顺手就出图出视频)
+            names = _filter_media_tools(user_input, names)
+            if names:
+                avg_conf = sum(s for s, _ in scored[:max_tools]) / min(len(names), max_tools)
+                _record_routing_success(user_input, names, avg_conf)
+                return names, avg_conf, f"keyword_match(命中{len(keyword_hits)}词)"
 
     # 2. 第二级:embedding 语义匹配
     query_vec = _get_embedding(user_input)
@@ -277,15 +336,18 @@ async def select_tools_enhanced(
             scored.sort(key=lambda x: x[0], reverse=True)
             if scored:
                 names = [n for _, n in scored[:max_tools]]
-                avg_conf = sum(s for s, _ in scored[:max_tools]) / min(len(names), max_tools)
-                _record_routing_success(user_input, names, avg_conf)
-                return names, avg_conf, f"embedding_match(相似度阈值{min_confidence})"
+                names = _filter_media_tools(user_input, names)
+                if names:
+                    avg_conf = sum(s for s, _ in scored[:max_tools]) / min(len(names), max_tools)
+                    _record_routing_success(user_input, names, avg_conf)
+                    return names, avg_conf, f"embedding_match(相似度阈值{min_confidence})"
         except Exception:
             logger.warning("工具路由 embedding 级失败", exc_info=True)
 
     # 3. 第三级:LLM 路由(兜底)
     try:
         names = await select_tools(llm, user_input, registry, max_tools)
+        names = _filter_media_tools(user_input, names or [])
         if names:
             _record_routing_success(user_input, names, 0.5)
             return names, 0.5, "llm_fallback"
@@ -293,10 +355,12 @@ async def select_tools_enhanced(
         logger.warning("工具路由 LLM 级失败", exc_info=True)
 
     # 4. 全部失败:回退全量(但限制数量,并优先保留常用核心工具)
+    # 注意:此处刻意**不**放 generate_image/generate_video —— 旧实现把它们排在前两位,
+    # 于是任何路由失败的问句都会把付费媒体工具交给模型,模型又常常顺手调用一次。
     priority = [
-        "generate_image", "generate_video", "web_search", "rag_search",
-        "read_document", "write_file", "edit_file", "search_files",
-        "list_directory", "run_code", "query_sqlite", "fetch_webpage",
+        "web_search", "rag_search", "read_document", "write_file",
+        "edit_file", "search_files", "list_directory", "run_code",
+        "query_sqlite", "fetch_webpage",
     ]
     fallback: list[str] = []
     for n in priority:
@@ -309,6 +373,8 @@ async def select_tools_enhanced(
                 break
             if t.name not in SYSTEM_TOOLS and t.enabled and t.name not in fallback:
                 fallback.append(t.name)
+    # 兜底路径同样剔除付费媒体工具:路由全挂时更不能让模型随手去出图出视频
+    fallback = _filter_media_tools(user_input, fallback)
     if fallback:
         _record_routing_failure(user_input, "all_levels_failed")
         return fallback[:max_tools], 0.0, "fallback_full"

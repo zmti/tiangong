@@ -152,7 +152,7 @@ class UnifiedMemoryManager:
             embed_client = get_embedding_client()
             if embed_client:
                 query_vec = embed_client.embed([content])[0]
-                all_memories = self._store.list(limit=100)
+                all_memories = self._store.list_sync(limit=100)
                 similar = []
                 for mem in all_memories:
                     if mem.get("vector"):
@@ -187,7 +187,7 @@ class UnifiedMemoryManager:
         
         with self._lock:
             # 获取所有记忆
-            memories = self._store.list(limit=1000)
+            memories = self._store.list_sync(limit=1000)
             total = len(memories)
             to_evict = []
             
@@ -297,7 +297,7 @@ class UnifiedMemoryManager:
     def stats(self) -> dict:
         """获取记忆系统统计。"""
         total = self._store.count()
-        expired = len([m for m in self._store.list(limit=1000) 
+        expired = len([m for m in self._store.list_sync(limit=1000) 
                       if self.should_evict(m.get("created_at", 0), m.get("updated_at", 0), m.get("hit_count", 0))])
         return {
             "total_memories": total,

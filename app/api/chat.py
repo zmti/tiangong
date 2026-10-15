@@ -46,6 +46,46 @@ def _store():
         return session_store
 
 
+def _merge_thinking_events(events: list) -> str:
+    """把 thinking 事件流合并成落库文本(2026-10-01 思考碎片化修复)。
+
+    流式模式下 _ThinkingSplitter 按上游 delta 逐段产出 thinking 事件
+    (agnes-3.0-flash 会把一句话切成单字/子词碎片)。此前用 "\\n\\n".join
+    把每个碎片当独立段落 → 落库 meta.thinking 变成 "用\\n\\n户\\n\\n想..."
+    的碎片墙,历史回放的思考区不可读。
+
+    规则:连续的无标记碎片(没有 phase/reasoning 字段)是**同一段思考的
+    连续片段**,按原文直接拼接;带 phase(verify/noise/cost/prepare)或
+    reasoning=True 的事件是**独立整块**,作为单独段落,段落间才用 \\n\\n。
+    """
+    paras: list = []
+    buf: list = []
+
+    def _flush() -> None:
+        if buf:
+            t = "".join(buf).strip()
+            if t:
+                paras.append(t)
+            buf.clear()
+
+    for e in events:
+        c = e.get("content") or ""
+        if not c:
+            continue
+        if e.get("phase") == "prepare":
+            # "准备中: 模型 xxx" 之类的进度状态行,不是思考内容,不落库
+            continue
+        if e.get("phase") or e.get("reasoning"):
+            _flush()
+            t = c.strip()
+            if t:
+                paras.append(t)
+        else:
+            buf.append(c)
+    _flush()
+    return "\n\n".join(paras)
+
+
 def _strip_thinking(text: str) -> str:
     """Strip thinking, tool_call, system, plan and other LLM-internal XML tags."""
     # 先剥离成对的 XML 块(thinking/tool_call/system/plan/phase 等)
@@ -116,6 +156,7 @@ async def _prepare_attachments(req: ChatRequest, message: str) -> tuple[str, lis
     """
     if not req.attachments:
         return message, []
+    import os
     from app.memory.attachments import attachment_store
     from app.core.multimodal import build_image_url_part, image_to_data_url, is_image_mime
 
@@ -138,6 +179,33 @@ async def _prepare_attachments(req: ChatRequest, message: str) -> tuple[str, lis
                 injected.append(f"[音频已转文字: {name}]\n{text}")
             else:
                 injected.append(text)
+            continue
+        # Office/PDF/CSV 等结构化文档:用项目已有的文档解析器把二进制转成
+        # LLM 可读文本再注入(此前这类附件在 utf-8 严格解码 zip/pdf 二进制时
+        # 失败 → 被静默丢弃,LLM 完全看不到文件内容)。
+        ext = os.path.splitext(name)[1].lower()
+        office_like = ext in (".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".csv") or \
+            mime in ("application/pdf",
+                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                     "application/vnd.openxmlformats-officedocument.spreadsheetml.template",
+                     "application/vnd.ms-excel",
+                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                     "application/msword",
+                     "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                     "application/vnd.ms-powerpoint",
+                     "text/csv")
+        if office_like:
+            from app.tools.document_tool import extract_bytes
+
+            parsed = extract_bytes(name, content)
+            if parsed.get("ok") and parsed.get("text"):
+                detail = parsed.get("detail") or {}
+                meta = ", ".join(f"{k}={v}" for k, v in detail.items() if k not in ("type",))
+                injected.append(f"[文档已解析: {name} ({parsed.get('type')}{', ' + meta if meta else ''})]\n```\n{parsed['text']}\n```")
+            else:
+                # 解析库缺失/文件损坏:降级为文件名提示,避免 LLM 误以为拿到空内容
+                reason = parsed.get("error") or "无法提取文本"
+                injected.append(f"[附件: {name}] ⚠ 文档解析失败({reason})。请尝试上传更小或更标准的文件,或改用纯文本。")
             continue
         # 其余按文本注入
         text_got = attachment_store.read_content(req.session_id, att_id)
@@ -238,6 +306,14 @@ async def _stream_with_heartbeat(agent_iter, interval: int = 15):
         if pending_hb is not None:
             pending_hb.cancel()
         prod_task.cancel()
+
+
+async def _persist_project_path(session_id: str, path: str) -> None:
+    """把会话绑定的项目路径落库(fire-and-forget 友好的独立协程)。"""
+    try:
+        await get_session_store().set_project_path(session_id, path)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _build_agent(req: ChatRequest) -> Agent:
@@ -388,7 +464,10 @@ async def _resume_sse(req: "ChatResumeRequest", gen):
                 try:
                     meta = {}
                     _pair_re = re.compile(r'<思考[\u4e00-\u9fa5]{0,4}>([\s\S]*?)</思考[\u4e00-\u9fa5]{0,4}>')
-                    _texts = [e.get("content", "") for e in thinking_events if e.get("content")]
+                    _texts = []
+                    _merged = _merge_thinking_events(thinking_events)
+                    if _merged:
+                        _texts.append(_merged)
                     for _m in _pair_re.finditer(answer_text):
                         if _m.group(1).strip():
                             _texts.append(_m.group(1).strip())
@@ -433,7 +512,13 @@ async def chat_resume(req: ChatResumeRequest):
     不会杀掉它,结果照常落库,用户刷新即可看到 —— 与 /v1/chat/stream 语义一致。
     stream=False 时保持旧的一次性 JSON 返回。
     """
-    agent = _build_agent(ChatRequest(message=" ", session_id=req.session_id, project_path=req.project_path))
+    eff_path = req.project_path
+    if not eff_path:
+        try:
+            eff_path = await get_session_store().get_project_path(req.session_id)
+        except Exception:  # noqa: BLE001
+            eff_path = ""
+    agent = _build_agent(ChatRequest(message=" ", session_id=req.session_id, project_path=eff_path))
     try:
         gen = await agent.resume(req.run_id, resume_value=req.resume_value, stream=req.stream)
         if isinstance(gen, types.AsyncGeneratorType):
@@ -500,6 +585,16 @@ async def chat_resume(req: ChatResumeRequest):
 @router.post("/chat/stream")
 async def chat_stream(req: ChatRequest) -> StreamingResponse:
     import logging as _log
+    # 项目路径:请求携带的优先;为空则回退到会话持久化的路径,
+    # 修复"会话项目路径失效"——旧会话/清缓存/非 GUI 创建的会话不再静默退回后端启动目录。
+    if not req.project_path:
+        try:
+            req.project_path = await get_session_store().get_project_path(req.session_id)
+        except Exception:  # noqa: BLE001
+            req.project_path = ""
+    else:
+        # 把前端传来的项目路径落库,供后续请求回退使用
+        asyncio.create_task(_persist_project_path(req.session_id, req.project_path))
     _log.getLogger("chat").info("chat_stream project_path=%s session=%s", req.project_path, req.session_id)
     # 新一轮开始:清掉上一轮遗留的取消标记,避免误杀本次任务
     _CANCEL_REQUESTED.discard(req.session_id)
@@ -519,6 +614,11 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
         full_answer: list[str] = []
         thinking_events: list[dict] = []
         guardrail_overwrite: Optional[dict] = None
+        # 后端整段下发的"最终答案"(如事实校验 verify 节点的内联重写)。
+        # 这类答案不走 token 流,若不接管落库,库里存的就是被替换/被截断前的旧正文
+        # —— 实证 run 9fc46416:流式累积 6005 字(半截),verify 重写后的 4088 字
+        # 完整答案只发给了前端,从未落库。
+        final_answer_override: Optional[str] = None
         assistant_msg_id: Optional[str] = None
         token_count = 0
         _done_model = ""
@@ -657,7 +757,9 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
         heartbeat_task = None
         agent_task = None
         try:
-            await _store().add_message(req.session_id, "user", content=req.message)
+            # 把附件 ID 随 user 消息落库:历史重载时前端据此重新渲染附件卡片
+            _user_meta = {"attachments": list(req.attachments)} if req.attachments else None
+            await _store().add_message(req.session_id, "user", content=req.message, meta=_user_meta)
 
             # 启动独立后台 agent 任务(不绑定 SSE 连接生命周期)
             agent_task = asyncio.create_task(_bg_agent_run())
@@ -718,6 +820,13 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 elif evt_type == "guardrail_overwrite":
                     guardrail_overwrite = event
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                elif evt_type == "answer":
+                    # 整段最终答案(verify 重写 / 非流式补生成):接管落库正文,
+                    # 否则库里存的是 token 累积的旧正文(可能是截断版)。
+                    _c = event.get("content")
+                    if isinstance(_c, str) and _c.strip():
+                        final_answer_override = _c
                     yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
                 elif evt_type == "tool":
                     # 持久化工具步骤。此前流式路径从未保存 role=tool 消息,
@@ -786,17 +895,27 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
             _RUNNING_TASKS.pop(req.session_id, None)
             # 最终保存 assistant 回复
             answer_to_store = "".join(full_answer)
+            if final_answer_override is not None:
+                answer_to_store = final_answer_override
+            # 安全护栏的替换文本优先级最高(覆盖 verify 重写与 token 累积)
             if guardrail_overwrite is not None:
                 answer_to_store = guardrail_overwrite.get("content", "")
             if answer_to_store:
                 meta = {}
                 # 过滤 prepare 阶段的状态行("准备中: 模型 xxx")——是进度提示不是思考内容
-                thinking_texts = [e.get("content", "") for e in thinking_events
-                                  if e.get("content") and e.get("phase") != "prepare"]
+                # (过滤逻辑已并入 _merge_thinking_events;流式碎片按原文拼接,不插分隔符)
+                thinking_texts = []
+                _merged = _merge_thinking_events(thinking_events)
+                if _merged:
+                    thinking_texts.append(_merged)
                 # 中文思考标签:agnes 等模型的思考不走向 thinking 事件,而是随 token 流
                 # 以 <思考要点>...</思考要点> 混在答案里。提取进 meta.thinking,
                 # 历史回放才能还原思考区(否则 meta 里只有一条"准备中: 模型 xxx")。
-                _pair_re = re.compile(r'<思考[\u4e00-\u9fa5]{0,4}>([\s\S]*?)</思考[\u4e00-\u9fa5]{0,4}>')
+                # 同时认英文 <thinking> 与中文 <思考要点>:旧正则只认中文,而本仓 CoT
+                # 注入要求的正是 <thinking> 标签 → 落库 meta.thinking 一律为空,
+                # 历史回放时思考区永远空白(实证:近 15 条 assistant 消息 13 条为空)。
+                _TAG = r'(?:思考[\u4e00-\u9fa5]{0,4}|thinking)'
+                _pair_re = re.compile(r'<%s>([\s\S]*?)</%s>' % (_TAG, _TAG), re.IGNORECASE)
                 for _m in _pair_re.finditer(answer_to_store):
                     _t = _m.group(1).strip()
                     if _t:
@@ -805,7 +924,7 @@ async def chat_stream(req: ChatRequest) -> StreamingResponse:
                 # 成对正则匹配不到 → 思考内容全部丢失("思考内容没了"的根因之一)。
                 # 把成对块摘掉后,若还剩孤立的 <思考...> 开标签,其后的剩余部分整体视为思考。
                 _rest = _pair_re.sub('', answer_to_store)
-                _m2 = re.search(r'<思考[\u4e00-\u9fa5]{0,4}>([\s\S]*)$', _rest)
+                _m2 = re.search(r'<%s>([\s\S]*)$' % _TAG, _rest, re.IGNORECASE)
                 if _m2 and _m2.group(1).strip():
                     thinking_texts.append(_m2.group(1).strip())
                 if thinking_texts:
@@ -912,13 +1031,41 @@ async def list_sessions() -> dict:
     return {"sessions": sessions, "total": len(sessions)}
 
 
+class SessionEnsureRequest(BaseModel):
+    session_id: str = Field(..., description="要创建的会话 ID")
+    title: Optional[str] = Field(None, description="可选标题")
+
+
+@router.post("/chat/sessions/ensure")
+async def ensure_session(req: SessionEnsureRequest) -> dict:
+    """确保会话记录存在(新建会话时调用)。
+
+    此前会话只在"第一条消息落库"时才被创建(由 add_message 内部的 _ensure_session
+    触发)。结果:点「新建会话」后若还没发消息就刷新应用,这个会话在后端根本不存在
+    —— 侧边栏里没有它,刷新后直接丢失。这里提供一个幂等的创建入口,让新会话
+    一建立就落库,立即出现在列表并能扛住刷新。
+    """
+    sid = (req.session_id or "").strip()
+    if not sid:
+        raise HTTPException(400, "session_id 不能为空")
+    import logging as _log
+    try:
+        await _store().get_or_create(sid)
+        if req.title:
+            await _store().rename(sid, req.title[:100])
+        return {"success": True, "session_id": sid, "created": True}
+    except Exception as e:  # noqa: BLE001
+        _log.getLogger(__name__).warning("确保会话存在失败: %s", e)
+        raise HTTPException(500, f"创建会话失败: {e}")
+
+
 @router.get("/memory")
 async def list_memories(limit: int = Query(50, ge=1, le=500)) -> dict:
     """列出长期记忆。"""
     from app.memory.ltm import get_memory_store
 
     store = get_memory_store()
-    return {"memories": store.list(limit=limit), "stats": store.stats()}
+    return {"memories": await store.list(limit=limit), "stats": await store.stats()}
 
 
 @router.post("/memory/clear")

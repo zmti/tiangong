@@ -25,6 +25,12 @@ _DB_LOCK = asyncio.Lock()
 
 
 class CheckpointManager:
+    # 终态集合: 这些状态的 run 已不再推进, 可被 TTL 清理。
+    # 注意必须含 'interrupted' —— 启动清扫(_sweep_orphan_runs)会把上一进程崩溃
+    # 遗留的 running run 改写为 interrupted, 若清理集合漏掉它, 这些孤儿 checkpoint
+    # 永远留在主表/版本表, 只增不减(本次会话卡死/膨胀的根因之一)。
+    _TERMINAL_STATUSES = ("done", "failed", "cancelled", "interrupted")
+
     def __init__(self, db_path: Optional[str] = None, backend: Optional[StorageBackend] = None):
         """初始化 CheckpointManager
         
@@ -405,31 +411,68 @@ class CheckpointManager:
                 self._backend.delete("checkpoint_versions", "1 = 1")
             return 1
 
-    async def cleanup_expired(self, ttl_days: float = 7.0) -> int:
-        """清理超过 TTL 的已完成/已取消 checkpoint。
+    async def cleanup_expired(self, ttl_days: float = 7.0) -> dict:
+        """清理超过 TTL 的已结束 checkpoint(主表 + 版本表), 并 VACUUM 回收空页。
 
-        只清理 status 为 done/failed/cancelled 且 updated_at 超过 ttl_days 天的记录。
-        正在运行的运行不会被清理。
+        - 主表 checkpoints: 删 status 为终态(done/failed/cancelled/interrupted)
+          且 updated_at 超 ttl_days 的行。正在 running 的绝不清理。
+        - 版本表 checkpoint_versions: 按自身 created_at < cutoff 直接删。
+          版本表是膨胀大头(每行一份完整 state 快照), 旧实现用
+          run_id IN(主表终态且过期) 关联删, 会漏掉主表已删/非终态的孤儿版本;
+          且主表终态集合漏了 'interrupted'(启动清扫把孤儿 running 改写成的状态,
+          否则永远清不掉)。这里直接按版本自身时间戳删, 跨 run 统一老化、不漏删。
+
+        返回 {"checkpoints": 删主表行数, "versions": 删版本行数, "vacuum": 是否 VACUUM 成功}。
         """
         import time as _time
+
         cutoff = _time.time() - ttl_days * 86400
+        statuses = ",".join("?" for _ in self._TERMINAL_STATUSES)
         async with _DB_LOCK:
-            # 先查出过期记录
-            rows = self._backend.execute(
-                "SELECT run_id FROM checkpoints WHERE "
-                "status IN ('done', 'failed', 'cancelled') AND updated_at < ?",
-                (cutoff,),
-                fetch=True,
+            # 主表: 先 count 要删的行数(用于统计/返回值), 再删
+            removed_main = self._backend.count(
+                "checkpoints",
+                f"status IN ({statuses}) AND updated_at < ?",
+                (*self._TERMINAL_STATUSES, cutoff),
             )
-            if not rows:
-                return 0
-            run_ids = [r["run_id"] for r in rows]
-            self._backend.delete("checkpoints", "status IN ('done', 'failed', 'cancelled') AND updated_at < ?", (cutoff,))
-            if run_ids:
-                placeholders = ",".join("?" * len(run_ids))
-                self._backend.delete(
-                    "checkpoint_versions",
-                    f"run_id IN ({placeholders})",
-                    tuple(run_ids),
-                )
-            return len(run_ids)
+            self._backend.delete(
+                "checkpoints",
+                f"status IN ({statuses}) AND updated_at < ?",
+                (*self._TERMINAL_STATUSES, cutoff),
+            )
+            # 版本表: 按自身时间戳直接删过期版本(含孤儿), 不漏删
+            removed_versions = self._backend.count(
+                "checkpoint_versions", "created_at < ?", (cutoff,)
+            )
+            self._backend.delete("checkpoint_versions", "created_at < ?", (cutoff,))
+        # VACUUM 回收空页: 删掉的数据若不 VACUUM, SQLite 文件不收缩,
+        # 下次读写仍付整库代价。临时文件落有空间的盘(见下), 避免 C 盘满时失败。
+        vacuumed = self._vacuum_locked()
+        return {"checkpoints": removed_main, "versions": removed_versions, "vacuum": vacuumed}
+
+    def _vacuum_locked(self) -> bool:
+        """执行 VACUUM 回收空页, 返回是否成功。
+
+        SQLite 删数据后不 VACUUM, 文件不收缩, 下次读写仍付整库代价。VACUUM 需
+        独占、重写整个库文件(写回原文件, 数据在 E 盘 data/, 空间充足)。
+        backend.connect() 已对连接设 PRAGMA temp_store=MEMORY, VACUUM 的排序/聚合
+        临时文件走内存, 不依赖 C 盘 TEMP —— 因此 C 盘近满也不会让 VACUUM 失败。
+
+        不支持 connect 的后端(Postgres/Redis)直接跳过 VACUUM(数据删除已生效,
+        仅文件收缩做不了), 记日志返回 False。任何异常都不让清理报错。
+        """
+        backend = self._backend
+        if not hasattr(backend, "connect") or not hasattr(backend, "close"):
+            return False
+        try:
+            conn = backend.connect()
+            try:
+                conn.execute("PRAGMA busy_timeout=30000")
+                conn.execute("VACUUM")
+                conn.commit()
+            finally:
+                backend.close(conn)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("checkpoint VACUUM 失败(数据已删, 文件需停后端后手动收缩): %s", exc)
+            return False

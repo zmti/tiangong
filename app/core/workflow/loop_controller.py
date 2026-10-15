@@ -60,6 +60,7 @@ class LoopController:
         node_results: dict[str, Any],
         execute_node_func: Callable,
         save_checkpoint_func: Optional[Callable] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
     ):
         """
         Args:
@@ -69,6 +70,8 @@ class LoopController:
             node_results: 已执行节点结果
             execute_node_func: 执行单个节点的异步函数
             save_checkpoint_func: 保存检查点的异步函数
+            cancel_check: 外部取消检查(如 run.cancelled)。循环每轮都会调用,
+                置位即停止迭代,避免工作流级取消后循环空转整个 iterable。
         """
         self.config = loop_config
         self.workflow_nodes = workflow_nodes
@@ -76,6 +79,7 @@ class LoopController:
         self.node_results = node_results
         self.execute_node = execute_node_func
         self.save_checkpoint = save_checkpoint_func
+        self.cancel_check = cancel_check
 
         # 解析循环控制类型
         loop_type_str = loop_config.get("type", "foreach")
@@ -100,7 +104,18 @@ class LoopController:
 
     @property
     def cancelled(self) -> bool:
-        return self._cancelled
+        return self._is_cancelled()
+
+    def _is_cancelled(self) -> bool:
+        """综合判断取消:自身 cancel() 或外部 cancel_check(如 run.cancelled)。"""
+        if self._cancelled:
+            return True
+        if self.cancel_check is not None:
+            try:
+                return bool(self.cancel_check())
+            except Exception:
+                return False
+        return False
 
     async def execute(self, evaluator: DynamicEdgeEvaluator) -> dict:
         """执行循环。
@@ -126,7 +141,7 @@ class LoopController:
         batch_count = (total + self.batch_size - 1) // self.batch_size
 
         for i in range(0, total, self.batch_size):
-            if self._cancelled:
+            if self._is_cancelled():
                 break
 
             batch = self.iterable[i:i + self.batch_size]
@@ -156,7 +171,7 @@ class LoopController:
             "iterations": len(self._results),
             "total": total,
             "results": self._results,
-            "success": not self._cancelled,
+            "success": not self._is_cancelled(),
         }
 
     async def _execute_while(self, evaluator: DynamicEdgeEvaluator) -> dict:
@@ -164,7 +179,7 @@ class LoopController:
         max_iter = min(self.max_iterations, 1000)
 
         for i in range(max_iter):
-            if self._cancelled:
+            if self._is_cancelled():
                 break
 
             # 先评估条件
@@ -191,7 +206,7 @@ class LoopController:
             "iterations": len(self._results),
             "condition": self.while_condition,
             "results": self._results,
-            "success": not self._cancelled,
+            "success": not self._is_cancelled(),
         }
 
     async def _execute_do_until(self, evaluator: DynamicEdgeEvaluator) -> dict:
@@ -199,7 +214,7 @@ class LoopController:
         max_iter = min(self.max_iterations, 1000)
 
         for i in range(max_iter):
-            if self._cancelled:
+            if self._is_cancelled():
                 break
 
             # 先执行循环体
@@ -225,15 +240,21 @@ class LoopController:
             "iterations": len(self._results),
             "condition": self.until_condition,
             "results": self._results,
-            "success": not self._cancelled,
+            "success": not self._is_cancelled(),
         }
 
     async def _execute_body(self) -> dict:
         """执行循环体(子图)。
 
-        每轮结果会回写到 variables / node_results,使 while/until 条件能够
+        每轮结果会回写到 node_results / variables,使 while/until 条件能够
         观测到循环体本轮产生的值(否则条件读到的是循环开始前的旧快照,
         循环永远无法自然终止,只能靠 max_iterations 兜底)。
+
+        关键:variables 的回写必须按执行器约定归一化(取 output/answer/result
+        字段)。旧实现直接 `self.variables.update(results)`,把
+        {"status": "success", "output": ...} 原始 dict 塞进 run.variables,
+        覆盖掉 _execute_node 已写好的归一化值,导致模板 {{node.output}} 与
+        条件表达式读到整包结果而非 output 内容。
         """
         if not self.subgraph_ids:
             # 没有子图,返回当前迭代值
@@ -248,9 +269,10 @@ class LoopController:
             result = await self.execute_node(node)
             results[node_id] = result
 
-        # 回写:让下一轮的条件评估能看到本轮产出
+        # 回写:让下一轮的条件评估能看到本轮产出。
+        # node_results 保留原始结果;_execute_node 已把归一化输出写进
+        # run.variables(与 controller 共享同一引用),这里不再覆盖 variables。
         self.node_results.update(results)
-        self.variables.update(results)
 
         return results
 

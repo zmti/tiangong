@@ -23,3 +23,7 @@ xlrd>=2.0.1
 python-pptx>=0.6.23
 charset-normalizer>=3.3
 edge-tts>=6.1.0  # TTS 文字转语音
+
+# 可选: 结构化存储切 PostgreSQL(STORAGE_BACKEND=postgresql)需安装;
+# 未安装/连接不可达时 get_storage_backend 自动回退 SQLite, 不影响主流程。
+psycopg[binary]>=3.1  # optional: Postgres 存储后端

@@ -359,50 +359,51 @@
   stroke-width: 2;
 }
 
-/* 节点类型配色 - 渐变效果 */
+/* 节点类型配色 - 类型底色(有效 rgba 填充; SVG fill 不支持 CSS 渐变, 故用实色微透明)
+   旧版误用 linear-gradient() 作为 fill, 被浏览器忽略 → 所有节点回退成同一底色, 类型区分丢失。 */
 .wf-svg .node-type-start .node-rect {
   stroke: var(--ok);
-  fill: linear-gradient(135deg, rgba(22, 163, 74, 0.08), rgba(22, 163, 74, 0.02));
+  fill: rgba(22, 163, 74, 0.12);
 }
 
 .wf-svg .node-type-end .node-rect {
   stroke: var(--warn);
-  fill: linear-gradient(135deg, rgba(217, 119, 6, 0.08), rgba(217, 119, 6, 0.02));
+  fill: rgba(217, 119, 6, 0.12);
 }
 
 .wf-svg .node-type-agent .node-rect {
   stroke: var(--primary);
-  fill: linear-gradient(135deg, rgba(124, 92, 252, 0.1), rgba(124, 92, 252, 0.02));
+  fill: rgba(124, 92, 252, 0.14);
 }
 
 .wf-svg .node-type-tool .node-rect {
   stroke: var(--accent);
-  fill: linear-gradient(135deg, rgba(56, 189, 248, 0.1), rgba(56, 189, 248, 0.02));
+  fill: rgba(56, 189, 248, 0.14);
 }
 
 .wf-svg .node-type-condition .node-rect {
   stroke: #8b5cf6;
-  fill: linear-gradient(135deg, rgba(139, 92, 246, 0.1), rgba(139, 92, 246, 0.02));
+  fill: rgba(139, 92, 246, 0.14);
 }
 
 .wf-svg .node-type-loop .node-rect {
   stroke: #f97316;
-  fill: linear-gradient(135deg, rgba(249, 115, 22, 0.1), rgba(249, 115, 22, 0.02));
+  fill: rgba(249, 115, 22, 0.14);
 }
 
 .wf-svg .node-type-http .node-rect {
   stroke: #14b8a6;
-  fill: linear-gradient(135deg, rgba(20, 184, 166, 0.1), rgba(20, 184, 166, 0.02));
+  fill: rgba(20, 184, 166, 0.14);
 }
 
 .wf-svg .node-type-script .node-rect {
   stroke: #eab308;
-  fill: linear-gradient(135deg, rgba(234, 179, 8, 0.1), rgba(234, 179, 8, 0.02));
+  fill: rgba(234, 179, 8, 0.14);
 }
 
 .wf-svg .node-type-sleep .node-rect {
   stroke: #64748b;
-  fill: linear-gradient(135deg, rgba(100, 116, 139, 0.1), rgba(100, 116, 139, 0.02));
+  fill: rgba(100, 116, 139, 0.14);
 }
 
 /* 节点内部元素 */
@@ -460,6 +461,14 @@
   opacity: 1;
   fill: var(--muted);
 }
+
+/* 运行历史回放: 依据最近一次运行结果着色状态点(status-* 由 _applyRunToCanvas 写入) */
+.wf-node-group.status-success .node-status-dot { opacity: 1; fill: var(--ok); }
+.wf-node-group.status-failed  .node-status-dot { opacity: 1; fill: var(--err); }
+.wf-node-group.status-running  .node-status-dot { opacity: 1; fill: var(--info); animation: statusDotPulse 1.2s ease-in-out infinite; }
+.wf-node-group.status-skipped .node-status-dot { opacity: 1; fill: var(--muted); }
+.wf-node-group.status-cancelled .node-status-dot { opacity: 1; fill: var(--warn); }
+/* status-idle / pending: 维持默认 opacity:0,不显示状态点 */
 
 @keyframes statusDotPulse {
   0%, 100% { r: 4; opacity: 1; }
@@ -780,6 +789,25 @@
   background: linear-gradient(135deg, var(--primary-soft), transparent);
 }
 
+.wf-run-header-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.wf-resume-run-btn {
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--primary-ink, #fff);
+  background: var(--primary, #7c5cfc);
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: filter 0.15s;
+}
+.wf-resume-run-btn:hover { filter: brightness(1.08); }
+
 .wf-run-detail-tabs {
   display: flex;
   gap: 4px;
@@ -852,6 +880,24 @@
 
 .wf-state-table tr:hover td {
   background: var(--bg-hover);
+}
+
+/* 节点执行结果单元格: 单行截断 + 悬浮提示完整内容,保证"输出"列排版不破表 */
+.wf-result-cell {
+  vertical-align: top;
+  max-width: 280px;
+}
+.wf-result-text {
+  display: inline-block;
+  max-width: 264px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  vertical-align: top;
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+  color: var(--text-2, #9aa4b2);
+  cursor: default;
 }
 
 .wf-output-pre {

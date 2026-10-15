@@ -33,34 +33,125 @@ async def list_tools() -> dict:
 
 @router.get("/mcp/servers")
 async def list_mcp_servers() -> dict:
-    """列出已配置的 MCP 服务器及其工具。"""
-    from app.core.mcp_client import get_mcp_manager
+    """列出全部已配置 MCP 服务器(含被禁用的)及其连接/工具状态。
+
+    桌面端「MCP 服务器管理」据此渲染列表:禁用的显示灰态,连接的显示工具数。
+    """
+    from app.core.mcp_client import get_mcp_manager, list_mcp_servers_configured
     from app.core.mcp_stdio import MCPStdioClient
 
     manager = get_mcp_manager()
-    servers = []
-    for name, client in manager._clients.items():  # noqa: SLF001
-        tools = getattr(client, "_tools_cache", []) or []
-        servers.append({
-            "name": name,
-            "type": "stdio" if isinstance(client, MCPStdioClient) else "http",
-            "connected": bool(getattr(client, "_connected", False)),
-            "tools_count": len(tools),
-            "tools": [t.get("name", "") for t in tools if isinstance(t, dict)],
-        })
-    return {"servers": servers, "count": len(servers)}
+    configured = list_mcp_servers_configured()
+    # 对每个已连接服务器补全工具清单(带描述)
+    # 2026-10-04: 之前只给工具名, 桌面端卡片里 MCP 工具"没有描述"。
+    # 现在给 {name, description} 对, 前端可展示每个工具的作用。
+    for item in configured:
+        client = manager.get_client(item["name"])
+        if client is not None:
+            tools = getattr(client, "_tools_cache", []) or []
+            item["tools"] = [
+                {
+                    "name": t.get("name", ""),
+                    "description": (t.get("description") or "").strip(),
+                }
+                for t in tools
+                if isinstance(t, dict) and t.get("name")
+            ]
+            item["type"] = "stdio" if isinstance(client, MCPStdioClient) else item.get("type", "http")
+    return {"servers": configured, "count": len(configured)}
+
+
+class MCPServerUpsert(BaseModel):
+    name: str
+    type: str = "http"            # http | stdio
+    url: str = ""                 # http 版
+    api_key: str = ""
+    timeout: float = 30.0
+    command: str = ""             # stdio 版
+    args: list | None = None
+    env: dict | None = None
+    enabled: bool = True
+
+
+async def _refresh_mcp_tools() -> dict:
+    """unregister → init(按 enabled 标志连接)→ register,让本地工具集与配置一致。
+
+    2026-10-04 起默认走**增量刷新**:只重连配置有变化的服务器,未变化的保留现有
+    连接——「MCP 保存/增删/启停」不再每次把所有 stdio 服务器重新 initialize
+    (实测全量 ~50s → 增量 ~2s)。增量路径异常时自动回落全量,保持与旧行为一致
+    (全量失败也仅记 warning 不抛,避免一次坏配置卡死保存)。
+    """
+    from app.core.mcp_client import (
+        init_mcp_from_config,
+        refresh_mcp_tools_incremental,
+    )
+    from app.tools.mcp_tool import register_mcp_tools, unregister_mcp_tools
+
+    try:
+        return await refresh_mcp_tools_incremental()
+    except Exception as exc:  # noqa: BLE001
+        import logging
+        logging.getLogger("api.mcp").warning("增量刷新 MCP 失败,回落全量: %s", exc)
+        unregister_mcp_tools()
+        init_result = await init_mcp_from_config()
+        registered = register_mcp_tools()
+        return {"init": init_result, "registered": registered, "fallback": "full"}
+
+
+@router.post("/mcp/servers")
+async def upsert_mcp_server(req: MCPServerUpsert) -> dict:
+    """新增/编辑一个 MCP 服务器(写 mcp_servers.json 并热重载工具)。"""
+    from app.core.mcp_client import upsert_mcp_server as _upsert
+
+    config: dict = {"type": req.type, "enabled": req.enabled, "timeout": req.timeout}
+    if req.type == "stdio":
+        if not req.command:
+            raise HTTPException(status_code=400, detail="stdio 服务器缺少 command")
+        config["command"] = req.command
+        config["args"] = req.args or []
+        config["env"] = req.env or {}
+    else:
+        if not req.url:
+            raise HTTPException(status_code=400, detail="http 服务器缺少 url")
+        config["url"] = req.url
+        if req.api_key:
+            config["api_key"] = req.api_key
+    try:
+        entry = _upsert(req.name, config)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    result = await _refresh_mcp_tools()
+    return {"ok": True, "name": req.name, "config": entry, **result}
+
+
+@router.delete("/mcp/servers/{name}")
+async def delete_mcp_server(name: str) -> dict:
+    """卸载一个 MCP 服务器(从 mcp_servers.json 移除并热重载工具)。"""
+    from app.core.mcp_client import remove_mcp_server as _remove
+
+    ok = _remove(name)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"未找到 MCP 服务器: {name}")
+    result = await _refresh_mcp_tools()
+    return {"ok": True, "name": name, "removed": True, **result}
+
+
+@router.post("/mcp/servers/{name}/toggle")
+async def toggle_mcp_server(name: str, enabled: bool = True) -> dict:
+    """启用/禁用一个已配置 MCP 服务器(写 enabled 标志并热重载工具)。"""
+    from app.core.mcp_client import set_mcp_server_enabled as _set
+
+    ok = _set(name, enabled)
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"未找到 MCP 服务器: {name}")
+    result = await _refresh_mcp_tools()
+    return {"ok": True, "name": name, "enabled": enabled, **result}
 
 
 @router.post("/mcp/refresh")
 async def refresh_mcp() -> dict:
     """从配置重新加载并注册 MCP 工具。"""
-    from app.core.mcp_client import init_mcp_from_config
-    from app.tools.mcp_tool import register_mcp_tools, unregister_mcp_tools
-
-    unregister_mcp_tools()
-    init_result = await init_mcp_from_config()
-    registered = register_mcp_tools()
-    return {"init": init_result, "registered": registered}
+    return await _refresh_mcp_tools()
 
 
 class ProviderUpsert(BaseModel):

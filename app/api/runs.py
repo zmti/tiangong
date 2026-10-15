@@ -89,8 +89,14 @@ async def delete_run(run_id: str) -> dict:
 
 @router.post("/cleanup")
 async def cleanup_runs() -> dict:
-    """清理过期 checkpoint(超过 checkpoint_ttl_days 天的已完成/已取消记录)。"""
+    """清理过期 checkpoint(超过 checkpoint_ttl_days 天的终态记录, 含孤儿版本, 并 VACUUM 收缩文件)。"""
     from app.config import settings as _cfg
     ttl = int(getattr(_cfg, "checkpoint_ttl_days", 7) or 7)
     removed = await _manager().cleanup_expired(ttl_days=ttl)
-    return {"removed": removed, "ttl_days": ttl}
+    return {
+        "removed": removed,
+        "removed_checkpoints": removed.get("checkpoints", 0),
+        "removed_versions": removed.get("versions", 0),
+        "vacuum": removed.get("vacuum", False),
+        "ttl_days": ttl,
+    }

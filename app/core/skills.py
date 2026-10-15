@@ -1050,6 +1050,30 @@ def load_skills_from_directory(skills_dir: str) -> int:
     return count
 
 
+def refresh_skills_from_directory(skills_dir: str) -> dict:
+    """热重载第三方技能目录:先清掉之前从目录加载的技能,再全量重新加载。
+
+    与 load_skills_from_directory 的区别:后者只"追加/覆盖"(register 按名覆盖),
+    目录里**删掉/改名**的旧技能仍残留在 registry 里。本函数做"全量同步"——
+    凡是非内置的技能一律先 unregister,再按当前目录内容重建,
+    使 registry 与目录内容严格一致。供 POST /v1/skills/refresh 热更新调用,
+    第三方改动技能文件后无需重启后端。
+
+    Returns:
+        {"loaded": 加载数, "removed": 本次清掉的技能名, "current": 重载后的第三方技能名}
+    """
+    registry = get_skill_registry()
+    builtin_names = {s.name for s in _builtin_skills}
+    # 1. 清掉非内置(即此前从第三方目录加载)的技能
+    removed = [name for name in list(registry._skills) if name not in builtin_names]
+    for name in removed:
+        registry.unregister(name)
+    # 2. 按当前目录全量重载
+    loaded = load_skills_from_directory(skills_dir)
+    kept = [name for name in registry._skills if name not in builtin_names]
+    return {"loaded": loaded, "removed": removed, "current": kept}
+
+
 def get_skill_registry() -> SkillRegistry:
     global _skill_registry
     if _skill_registry is None:

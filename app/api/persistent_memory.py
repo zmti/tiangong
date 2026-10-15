@@ -34,7 +34,7 @@ async def list_memories(
     memories = store.recall("", user_id=user_id, memory_types=types, top_k=top_k * 5)
     ltm_store = get_memory_store()
     # 按租户过滤记忆列表
-    all_mem = ltm_store.list(limit=top_k, tenant_id=tenant)
+    all_mem = await ltm_store.list(limit=top_k, tenant_id=tenant)
     return {"memories": all_mem, "total": len(all_mem)}
 
 
@@ -85,7 +85,7 @@ async def memory_stats(user_id: str = Query("default")) -> dict:
 
     tenant = get_tenant()
     store = get_memory_store()
-    stats = store.stats()
+    stats = await store.stats()
     # 确保统计结果包含当前租户
     stats["tenant_id"] = tenant or "default"
     return stats

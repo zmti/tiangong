@@ -1535,11 +1535,16 @@ App.Settings.renderSkills = async function () {
   const box = document.getElementById('skillsAdmin');
   if (!box) return;
 
-  // 「刷新」按钮:先绑定(避免容器被清空后丢失事件)
+  // 「刷新」「安装」按钮:先绑定(避免容器被清空后丢失事件)
   const refreshBtn = document.getElementById('refreshSkillsBtn');
   if (refreshBtn && !refreshBtn._bound) {
     refreshBtn._bound = true;
     refreshBtn.addEventListener('click', () => App.Settings.loadSkills());
+  }
+  const installBtn = document.getElementById('installSkillBtn');
+  if (installBtn && !installBtn._bound) {
+    installBtn._bound = true;
+    installBtn.addEventListener('click', () => App.Settings._openSkillInstallForm());
   }
 
   box.textContent = '';
@@ -1563,8 +1568,8 @@ App.Settings.renderSkills = async function () {
     nameEl.className = 'prov-card-name';
     nameEl.textContent = s.name;
     const tag = document.createElement('span');
-    tag.className = 'prov-card-tag custom';
-    tag.textContent = `${s.steps} 步` + (s.params && s.params.length ? ` · ${s.params.length} 参数` : '');
+    tag.className = 'prov-card-tag' + (s.builtin ? ' builtin' : ' custom');
+    tag.textContent = (s.builtin ? '内置 · ' : '第三方 · ') + `${s.steps} 步` + (s.params && s.params.length ? ` · ${s.params.length} 参数` : '');
     left.append(nameEl, tag);
 
     const actions = document.createElement('div');
@@ -1603,6 +1608,28 @@ App.Settings.renderSkills = async function () {
     detailBtn.textContent = '详情';
     detailBtn.addEventListener('click', () => App.Settings._openSkillDetail(s.name));
     actions.append(toggle, detailBtn);
+    // 卸载(仅第三方技能;内置技能 s.builtin=true 时不显示)
+    if (s.builtin !== true) {
+      const delBtn = document.createElement('button');
+      delBtn.className = 'prov-action danger';
+      delBtn.textContent = '卸载';
+      delBtn.title = '从技能目录删除该技能';
+      delBtn.addEventListener('click', async () => {
+        if (!window.confirm(`卸载技能「${s.name}」？`)) return;
+        try {
+          const res = await App.apiJSON(`/v1/skills/${encodeURIComponent(s.name)}`, { method: 'DELETE' });
+          if (res && res.success) {
+            if (App.toast) App.toast('已卸载技能', 'ok');
+            App.Settings.loadSkills();
+          } else {
+            if (App.toast) App.toast('卸载失败:' + (res && (res.detail || res.status)), 'err');
+          }
+        } catch (e) {
+          if (App.toast) App.toast('卸载失败:' + e.message, 'err');
+        }
+      });
+      actions.appendChild(delBtn);
+    }
     header.append(left, actions);
     card.appendChild(header);
 
@@ -1616,6 +1643,115 @@ App.Settings.renderSkills = async function () {
     }
     box.appendChild(card);
   });
+};
+
+// 技能安装:填一个技能定义(散字段或粘贴整个 JSON),写盘并热重载
+App.Settings._openSkillInstallForm = function () {
+  const prev = document.getElementById('skillInstallModal');
+  if (prev) prev.remove();
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal';
+  overlay.id = 'skillInstallModal';
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+
+  const content = document.createElement('div');
+  content.className = 'modal-content prov-form';
+
+  const title = document.createElement('h3');
+  title.className = 'modal-title';
+  title.textContent = '安装技能';
+
+  const nameIn = document.createElement('input');
+  nameIn.type = 'text';
+  nameIn.className = 'setting-input';
+  nameIn.placeholder = '技能名(如 git_health_check)';
+
+  const descIn = document.createElement('input');
+  descIn.type = 'text';
+  descIn.className = 'setting-input';
+  descIn.placeholder = '描述(告诉 LLM 何时该用)';
+
+  // 二选一:散字段(步骤) 或 粘贴整段 JSON
+  const stepsIn = document.createElement('textarea');
+  stepsIn.rows = 4;
+  stepsIn.className = 'setting-textarea';
+  stepsIn.placeholder = '步骤 JSON 数组,如:\n[{"type":"tool","tool":"git_status","args":{},"label":"查看状态"}]';
+
+  const jsonIn = document.createElement('textarea');
+  jsonIn.rows = 6;
+  jsonIn.className = 'setting-textarea';
+  jsonIn.placeholder = '或直接粘贴整个技能定义 JSON(优先级最高)';
+
+  const status = document.createElement('div');
+  status.className = 'prov-status muted';
+  status.textContent = '填散字段,或直接粘贴 JSON 定义体(二选一,JSON 优先)';
+
+  const hint = document.createElement('p');
+  hint.className = 'gen-note';
+  hint.textContent = '内置技能名不可被覆盖;安装后自动热重载,无需重启后端。';
+
+  const saveBtn = document.createElement('button');
+  saveBtn.type = 'button';
+  saveBtn.className = 'primary';
+  saveBtn.textContent = '安装';
+  const cancelBtn = document.createElement('button');
+  cancelBtn.type = 'button';
+  cancelBtn.textContent = '取消';
+  cancelBtn.addEventListener('click', () => overlay.remove());
+
+  saveBtn.addEventListener('click', async () => {
+    const name = nameIn.value.trim();
+    if (!name) { status.textContent = '请填写技能名'; status.className = 'prov-status err'; return; }
+    const rawText = jsonIn.value.trim();
+    let body;
+    if (rawText) {
+      try { body = JSON.parse(rawText); }
+      catch (e) { status.textContent = 'JSON 解析失败:' + e.message; status.className = 'prov-status err'; return; }
+      body = { name, description: descIn.value.trim(), raw: body };
+    } else {
+      let steps = [];
+      const stepsText = stepsIn.value.trim();
+      if (stepsText) {
+        try { steps = JSON.parse(stepsText); }
+        catch (e) { status.textContent = '步骤 JSON 解析失败:' + e.message; status.className = 'prov-status err'; return; }
+      }
+      body = { name, description: descIn.value.trim(), steps };
+    }
+    try {
+      const res = await App.apiJSON('/v1/skills/install', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (res && res.success) {
+        if (App.toast) App.toast('已安装技能 ' + name, 'ok');
+        overlay.remove();
+        App.Settings.loadSkills();
+      } else {
+        status.textContent = '安装失败:' + (res && (res.detail || res.status));
+        status.className = 'prov-status err';
+      }
+    } catch (e) {
+      status.textContent = '安装失败:' + e.message;
+      status.className = 'prov-status err';
+    }
+  });
+
+  const ops = document.createElement('div');
+  ops.className = 'prov-form-ops';
+  ops.append(saveBtn, cancelBtn);
+
+  const mk = (lbl, el) => {
+    const l = document.createElement('label');
+    const s = document.createElement('span');
+    s.textContent = lbl;
+    l.append(s, el);
+    return l;
+  };
+  content.append(title, hint, mk('名称', nameIn), mk('描述', descIn),
+    mk('步骤 JSON', stepsIn), mk('整段 JSON(优先)', jsonIn), status, ops);
+  overlay.appendChild(content);
+  document.body.appendChild(overlay);
 };
 
 // 技能详情:展开步骤与参数(以居中弹窗展示,不再追加到设置面板底部)
@@ -1707,6 +1843,332 @@ App.Settings._openSkillDetail = async function (name) {
     loading.textContent = '加载失败:' + e.message;
     loading.className = 'prov-status err';
   }
+};
+
+/* ---------- MCP 服务器管理(/v1/mcp/servers/*) ---------- */
+
+App.Settings._mcpServers = [];
+
+App.Settings.loadMcpServers = async function () {
+  try {
+    const res = await App.apiJSON('/v1/mcp/servers');
+    if (res && res.success) App.Settings._mcpServers = res.data?.servers || [];
+  } catch (_) { /* 后端旧版无此接口时忽略 */ }
+  App.Settings.renderMcpServers();
+};
+
+App.Settings.renderMcpServers = async function () {
+  const box = document.getElementById('mcpAdmin');
+  if (!box) return;
+
+  // 「新增服务器」「刷新」按钮:先绑定(避免容器被清空后丢失事件)
+  const addBtn = document.getElementById('addMcpServerBtn');
+  if (addBtn && !addBtn._bound) {
+    addBtn._bound = true;
+    addBtn.addEventListener('click', () => App.Settings._openMcpForm(null));
+  }
+  const refreshMcpBtn = document.getElementById('refreshMcpBtn');
+  if (refreshMcpBtn && !refreshMcpBtn._bound) {
+    refreshMcpBtn._bound = true;
+    refreshMcpBtn.addEventListener('click', () => App.Settings.loadMcpServers());
+  }
+
+  box.textContent = '';
+  const list = App.Settings._mcpServers || [];
+  if (!list.length) {
+    const empty = document.createElement('div');
+    empty.className = 'prov-card-empty';
+    empty.textContent = '暂无 MCP 服务器,点击「＋ 新增服务器」接入外部工具';
+    box.appendChild(empty);
+    return;
+  }
+  list.forEach((srv) => {
+    const card = document.createElement('div');
+    card.className = 'prov-card' + (srv.connected ? '' : ' disabled');
+
+    const header = document.createElement('div');
+    header.className = 'prov-card-header';
+    const left = document.createElement('div');
+    left.className = 'prov-card-left';
+    const nameEl = document.createElement('span');
+    nameEl.className = 'prov-card-name';
+    nameEl.textContent = srv.name;
+    const tag = document.createElement('span');
+    tag.className = 'prov-card-tag' + (srv.connected ? ' builtin' : ' custom');
+    tag.textContent = (srv.type || 'http') + ' · ' + (srv.connected
+      ? `已连接 · ${srv.tools_count || 0} 工具`
+      : (srv.enabled === false ? '已禁用' : '未连接'));
+    left.append(nameEl, tag);
+
+    const actions = document.createElement('div');
+    actions.className = 'prov-card-actions';
+    // 启用开关
+    const toggle = document.createElement('label');
+    toggle.className = 'rule-toggle';
+    const sw = document.createElement('input');
+    sw.type = 'checkbox';
+    sw.checked = srv.enabled !== false;
+    sw.title = sw.checked ? '已启用' : '已禁用';
+    sw.addEventListener('change', async () => {
+      try {
+        const res = await App.apiJSON(
+          `/v1/mcp/servers/${encodeURIComponent(srv.name)}/toggle`,
+          { method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled: sw.checked }) });
+        if (res && res.success) {
+          srv.enabled = sw.checked;
+          if (App.toast) App.toast(sw.checked ? '已启用 MCP 服务器' : '已禁用 MCP 服务器', 'ok');
+          App.Settings.loadMcpServers();
+        } else { sw.checked = !sw.checked; if (App.toast) App.toast('操作失败:' + (res && (res.detail || res.status)), 'err'); }
+      } catch (e) { sw.checked = !sw.checked; if (App.toast) App.toast('操作失败:' + e.message, 'err'); }
+    });
+    const track = document.createElement('span');
+    track.className = 'track';
+    toggle.append(sw, track);
+    // 编辑
+    const editBtn = document.createElement('button');
+    editBtn.className = 'prov-action';
+    editBtn.textContent = '编辑';
+    editBtn.addEventListener('click', () => App.Settings._openMcpForm(srv));
+    // 卸载
+    const delBtn = document.createElement('button');
+    delBtn.className = 'prov-action danger';
+    delBtn.textContent = '卸载';
+    delBtn.title = '从 MCP 配置移除该服务器';
+    delBtn.addEventListener('click', async () => {
+      if (!window.confirm(`卸载 MCP 服务器「${srv.name}」？`)) return;
+      try {
+        const res = await App.apiJSON(`/v1/mcp/servers/${encodeURIComponent(srv.name)}`, { method: 'DELETE' });
+        if (res && res.success) {
+          if (App.toast) App.toast('已卸载 MCP 服务器', 'ok');
+          App.Settings.loadMcpServers();
+        } else {
+          if (App.toast) App.toast('卸载失败:' + (res && (res.detail || res.status)), 'err');
+        }
+      } catch (e) { if (App.toast) App.toast('卸载失败:' + e.message, 'err'); }
+    });
+    actions.append(toggle, editBtn, delBtn);
+    header.append(left, actions);
+    card.appendChild(header);
+
+    // 工具清单(带描述,可展开/收缩)。srv.tools 项可能是 {name,description}(新后端)或字符串(旧后端),均兼容。
+    if (srv.tools && srv.tools.length) {
+      const wrap = document.createElement('div');
+      wrap.className = 'mcp-tools-list';
+      wrap.style.wordBreak = 'break-word';
+
+      // 可点击的标题 = 展开/收缩切换(默认收起)
+      const title = document.createElement('div');
+      title.className = 'mcp-tools-title mcp-tools-toggle';
+      title.title = '点击展开/收缩工具清单';
+      const arrow = document.createElement('span');
+      arrow.className = 'mcp-tools-arrow';
+      arrow.textContent = '▸';
+      const label = document.createElement('span');
+      label.textContent = `工具 · ${srv.tools.length}`;
+      title.append(label, arrow);
+      title.addEventListener('click', () => {
+        const open = wrap.classList.toggle('expanded');
+        arrow.textContent = open ? '▾' : '▸';
+        title.setAttribute('aria-expanded', open ? 'true' : 'false');
+      });
+      wrap.appendChild(title);
+
+      // 工具行放在可滚动 body 里,收起时 max-height:0
+      const body = document.createElement('div');
+      body.className = 'mcp-tools-body';
+      for (const t of srv.tools) {
+        const isObj = t && typeof t === 'object';
+        const name = isObj ? t.name : t;
+        const desc = isObj ? (t.description || '') : '';
+        const row = document.createElement('div');
+        row.className = 'mcp-tool-row';
+        const nm = document.createElement('span');
+        nm.className = 'mcp-tool-name';
+        nm.textContent = String(name || '');
+        row.appendChild(nm);
+        if (desc) {
+          const dEl = document.createElement('span');
+          dEl.className = 'mcp-tool-desc';
+          dEl.textContent = desc;
+          row.appendChild(dEl);
+        }
+        body.appendChild(row);
+      }
+      wrap.appendChild(body);
+      card.appendChild(wrap);
+    }
+    // 未连接(或被禁用)时,把后端透传的连接失败原因提示给用户
+    if (!srv.connected && srv.error) {
+      const errEl = document.createElement('div');
+      errEl.className = 'prov-card-desc';
+      errEl.style.color = 'var(--err, #d0432f)';
+      errEl.style.wordBreak = 'break-word';
+      errEl.textContent = (srv.enabled === false ? '已禁用 · ' : '连接失败 · ') + srv.error;
+      card.appendChild(errEl);
+    }
+    box.appendChild(card);
+  });
+};
+
+// MCP 服务器 新增/编辑 表单(http 或 stdio)
+App.Settings._openMcpForm = function (srv) {
+  const prev = document.getElementById('mcpFormModal');
+  if (prev) prev.remove();
+
+  const cfg = (srv && srv.config) || {};
+  const isEdit = !!srv;
+  const defType = (srv && srv.type) || cfg.type || 'http';
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal';
+  overlay.id = 'mcpFormModal';
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+
+  const content = document.createElement('div');
+  content.className = 'modal-content prov-form';
+
+  const title = document.createElement('h3');
+  title.className = 'modal-title';
+  title.textContent = isEdit ? `编辑 MCP 服务器 · ${srv.name}` : '新增 MCP 服务器';
+
+  const mkField = (lbl, el) => {
+    const l = document.createElement('label');
+    const s = document.createElement('span');
+    s.textContent = lbl;
+    l.append(s, el);
+    return l;
+  };
+
+  const nameIn = document.createElement('input');
+  nameIn.type = 'text';
+  nameIn.className = 'setting-input';
+  nameIn.placeholder = '服务器名(唯一,如 toutiao / windows-mcp)';
+  nameIn.value = isEdit ? srv.name : '';
+  if (isEdit) nameIn.disabled = true; // 改名 = 删旧建新,避免映射错乱
+
+  const typeSel = document.createElement('select');
+  typeSel.className = 'setting-input';
+  ['http', 'stdio'].forEach((t) => {
+    const o = document.createElement('option'); o.value = t; o.textContent = t; typeSel.appendChild(o);
+  });
+  typeSel.value = defType;
+
+  // http 字段
+  const urlIn = document.createElement('input');
+  urlIn.type = 'text'; urlIn.className = 'setting-input';
+  urlIn.placeholder = 'http://host:port/mcp';
+  urlIn.value = cfg.url || '';
+  const apiKeyIn = document.createElement('input');
+  apiKeyIn.type = 'text'; apiKeyIn.className = 'setting-input';
+  apiKeyIn.placeholder = '可选 Bearer Key';
+  apiKeyIn.value = cfg.api_key || '';
+
+  // stdio 字段
+  const cmdIn = document.createElement('input');
+  cmdIn.type = 'text'; cmdIn.className = 'setting-input';
+  cmdIn.placeholder = 'command,如 uvx.exe / npx';
+  cmdIn.value = cfg.command || '';
+  const argsIn = document.createElement('input');
+  argsIn.type = 'text'; argsIn.className = 'setting-input';
+  argsIn.placeholder = 'args(空格分隔),如 windows-mcp serve';
+  argsIn.value = Array.isArray(cfg.args) ? cfg.args.join(' ') : '';
+  const envIn = document.createElement('input');
+  envIn.type = 'text'; envIn.className = 'setting-input';
+  envIn.placeholder = 'env(KEY=VAL 空格分隔,可空)';
+  envIn.value = (cfg.env && Object.keys(cfg.env).length)
+    ? Object.entries(cfg.env).map(([k, v]) => `${k}=${v}`).join(' ') : '';
+
+  const timeoutIn = document.createElement('input');
+  timeoutIn.type = 'number'; timeoutIn.className = 'setting-input';
+  timeoutIn.placeholder = '30';
+  timeoutIn.value = cfg.timeout != null ? cfg.timeout : 30;
+
+  const status = document.createElement('div');
+  status.className = 'prov-status muted';
+
+  // http/stdio 字段组切换
+  const httpFields = [
+    document.createElement('div'), urlIn, apiKeyIn,
+  ];
+  const stdioFields = [cmdIn, argsIn, envIn];
+  const httpWrap = document.createElement('div');
+  httpWrap.append(mkField('URL', urlIn), mkField('API Key(可选)', apiKeyIn));
+  const stdioWrap = document.createElement('div');
+  stdioWrap.append(mkField('命令', cmdIn), mkField('参数(空格分隔)', argsIn), mkField('环境变量(空格分隔)', envIn));
+  const syncType = () => {
+    const isHttp = typeSel.value === 'http';
+    httpWrap.style.display = isHttp ? '' : 'none';
+    stdioWrap.style.display = isHttp ? 'none' : '';
+  };
+  typeSel.addEventListener('change', syncType);
+
+  const saveBtn = document.createElement('button');
+  saveBtn.type = 'button'; saveBtn.className = 'primary';
+  saveBtn.textContent = isEdit ? '保存' : '添加';
+  const cancelBtn = document.createElement('button');
+  cancelBtn.type = 'button'; cancelBtn.textContent = '取消';
+  cancelBtn.addEventListener('click', () => overlay.remove());
+
+  saveBtn.addEventListener('click', async () => {
+    const name = nameIn.value.trim();
+    if (!name) { status.textContent = '请填写服务器名'; status.className = 'prov-status err'; return; }
+    const timeout = parseFloat(timeoutIn.value) || 30;
+    const body = { name, type: typeSel.value, timeout, enabled: srv ? (srv.enabled !== false) : true };
+    if (typeSel.value === 'stdio') {
+      body.command = cmdIn.value.trim();
+      if (!body.command) { status.textContent = 'stdio 服务器需要命令'; status.className = 'prov-status err'; return; }
+      body.args = argsIn.value.trim() ? argsIn.value.trim().split(/\s+/) : [];
+      const envObj = {};
+      (envIn.value.trim() || '').split(/\s+/).filter(Boolean).forEach((kv) => {
+        const i = kv.indexOf('='); envObj[i > 0 ? kv.slice(0, i) : kv] = i > 0 ? kv.slice(i + 1) : '';
+      });
+      body.env = envObj;
+    } else {
+      let url = urlIn.value.trim();
+      if (url && !/^https?:\/\//i.test(url)) url = 'http://' + url;
+      body.url = url;
+      if (apiKeyIn.value.trim()) body.api_key = apiKeyIn.value.trim();
+      if (!body.url) { status.textContent = 'http 服务器需要 URL'; status.className = 'prov-status err'; return; }
+    }
+    saveBtn.disabled = true; saveBtn.textContent = '保存中…';
+    try {
+      const res = await App.apiJSON('/v1/mcp/servers', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      if (res && res.success) {
+        if (App.toast) App.toast(isEdit ? '已保存 MCP 服务器' : '已添加 MCP 服务器', 'ok');
+        overlay.remove();
+        App.Settings.loadMcpServers();
+      } else {
+        status.textContent = '保存失败:' + (res && (res.detail || res.status));
+        status.className = 'prov-status err';
+        saveBtn.disabled = false; saveBtn.textContent = isEdit ? '保存' : '添加';
+      }
+    } catch (e) {
+      status.textContent = '保存失败:' + e.message;
+      status.className = 'prov-status err';
+      saveBtn.disabled = false; saveBtn.textContent = isEdit ? '保存' : '添加';
+    }
+  });
+
+  const ops = document.createElement('div');
+  ops.className = 'prov-form-ops';
+  ops.append(saveBtn, cancelBtn);
+
+  content.append(
+    title,
+    mkField('名称', nameIn),
+    mkField('类型', typeSel),
+    httpWrap,
+    stdioWrap,
+    mkField('超时(秒)', timeoutIn),
+    status,
+    ops,
+  );
+  syncType();
+  overlay.appendChild(content);
+  document.body.appendChild(overlay);
 };
 
 /* 初始化 — 等待 App.els 就绪后再执行 */

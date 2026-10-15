@@ -39,6 +39,8 @@ TOOL_CATEGORIES: dict[str, str] = {
     # ---- 网络 ----
     "fetch_webpage": "网络",
     "extract_text": "网络",
+    "call_http_api": "网络",
+    "http_request": "网络",
     # ---- 浏览器 ----
     "browser_open": "浏览器",
     "browser_screenshot": "浏览器",
@@ -56,6 +58,8 @@ TOOL_CATEGORIES: dict[str, str] = {
     # ---- 图像 / 视频 ----
     "generate_image": "图像生成",
     "generate_video": "图像生成",
+    "enhance_video": "图像生成",
+    "stitch_videos": "图像生成",
     # ---- 图表 ----
     "generate_chart": "图表",
     "generate_bar_chart": "图表",

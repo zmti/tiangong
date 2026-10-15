@@ -116,8 +116,23 @@ def _check_multimodal_features():
         logger.warning("多模态功能检查失败(不影响主服务): %s", e)
 
 
+# 后台任务引用:防止 MCP 初始化 task 在事件循环里被 GC(需保留到它注册完工具)
+_mcp_init_task: Optional[asyncio.Task] = None
+# 启动 checkpoint GC 后台任务引用(需在 _shutdown 取消, 避免悬空协程)
+_ckpt_gc_task: Optional[asyncio.Task] = None
+
+
 async def _init_mcp():
-    """初始化 MCP 连接并把远程工具注册进 Agent 工具集"""
+    """初始化 MCP 连接并把远程工具注册进 Agent 工具集。
+
+    ⚠️ 本函数会被 _startup 以「后台 create_task」方式调度,而**不是**直接 await。
+    原因:MCP 初始化可能很慢——stdio 服务如 windows-mcp(uvx) 首次握手 30s+,
+    npx 类服务(如 github/playwright)首次要下载包。若同步 await 会阻塞 lifespan
+    startup,FastAPI 进不了 yield、/health 迟迟不响应 → 桌面端 main.js 的
+    waitForBackend(25s) 判活失败就反复 spawn 新后端,雪崩成无限死循环
+    (2026-10-01 后端起不来的事故根因)。改为后台后:FastAPI 立即 serve、
+    /health 立即 200;MCP 工具在后台注册完前 Agent 暂用不到(可接受)。
+    """
     try:
         from app.core.mcp_client import init_mcp_from_config
         from app.tools.mcp_tool import register_mcp_tools
@@ -195,6 +210,37 @@ def _init_memory_ttl():
         logger.warning("记忆管理器初始化失败(不影响主服务): %s", e)
 
 
+async def _init_checkpoint_gc(delay: float = 15.0) -> None:
+    """启动后自动跑一次过期 checkpoint 清理(主表终态 + 孤儿版本 + VACUUM)。
+
+    checkpoint_versions 每行一份完整 state 快照, 跨 run 无 TTL 会无限膨胀
+    (实测 182MB), 拖慢所有 checkpoint 读写(表现为运行卡顿/会话卡死)。
+    此前 cleanup_expired 只有手动端点调用、从无人调度 -> 版本表只增不减。
+    这里在启动后延迟 delay 秒(让后端完全起来、/health 可响应)后台跑一次,
+    每次重启都会回收过期数据; 手动触发仍可用 POST /v1/runs/cleanup。
+
+    放后台 create_task 而非在 _startup 里 await: VACUUM 需独占重写库文件,
+    若阻塞 lifespan 会让 /health 迟迟不响应 -> 桌面端反复 spawn 后端死循环。
+    全程 try/except, 清理失败不影响主服务启动。
+    """
+    try:
+        await asyncio.sleep(delay)
+        from app.config import settings as _cfg
+        from app.runtime.checkpoint import CheckpointManager
+        ttl = int(getattr(_cfg, "checkpoint_ttl_days", 7) or 7)
+        cm = CheckpointManager()
+        res = await cm.cleanup_expired(ttl_days=ttl)
+        logger.info(
+            "启动 checkpoint GC: 删主表 %d / 版本表 %d, VACUUM=%s (ttl=%dd)",
+            res.get("checkpoints", 0), res.get("versions", 0),
+            res.get("vacuum"), ttl,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        logger.warning("启动 checkpoint GC 失败(不影响主服务): %s", e)
+
+
 def _init_audit_log():
     """启动审计日志后台刷新"""
     try:
@@ -214,6 +260,32 @@ async def _init_tool_route_cache():
         logger.info("工具路由缓存已初始化")
     except Exception as e:
         logger.warning("工具路由缓存初始化失败(不影响主服务): %s", e)
+
+
+def _init_third_party_skills():
+    """加载第三方技能定义(YAML/JSON 工具编排)进 SkillRegistry。
+
+    第三方把技能定义文件丢进 settings.skill_third_party_dir(默认 <data_dir>/skills),
+    重启后端即被注册,Agent 的 list_skills / run_skill 工具直接可见、可调用。
+    这是第三方声明式技能的入口——之前 load_skills_from_directory 全仓零调用,
+    第三方技能根本进不来。
+    """
+    if not settings.agent_skill_marketplace_enabled:
+        return
+    try:
+        from app.core.skills import load_skills_from_directory
+        import yaml  # noqa: F401  确保 yaml 可用(load_skills_from_directory 内部用)
+        skill_dir = settings.skill_third_party_dir or os.path.join(settings.resolved_data_dir, "skills")
+        if not os.path.isdir(skill_dir):
+            logger.info("第三方技能目录不存在,跳过: %s", skill_dir)
+            return
+        n = load_skills_from_directory(skill_dir)
+        if n:
+            logger.info("已加载 %d 个第三方技能(目录: %s)", n, skill_dir)
+        else:
+            logger.info("第三方技能目录为空: %s", skill_dir)
+    except Exception as e:
+        logger.warning("第三方技能加载失败(不影响主服务): %s", e)
 
 
 async def _init_workflow_schedules():
@@ -344,6 +416,7 @@ async def _startup():
     """应用启动时统一初始化所有组件"""
     # 同步初始化
     _init_registry()
+    _init_third_party_skills()  # 第三方声明式技能(YAML/JSON)进 SkillRegistry,list_skills/run_skill 可见
     _check_embedding_backend()
     _check_multimodal_features()
     _sweep_orphan_runs()  # 必须在其他组件之前:清扫上一进程崩溃遗留的 running 孤儿
@@ -356,7 +429,12 @@ async def _startup():
     _init_audit_log()
 
     # 异步初始化
-    await _init_mcp()
+    # MCP 放后台跑:stdio/npx 服务连接可能很慢(30s~120s),若在此 await 会阻塞
+    # lifespan → /health 不响应 → 桌面端反复 spawn 后端成死循环。后台后 FastAPI
+    # 立即 serve,MCP 工具异步注册(注册完前 Agent 暂用不到,可接受)。见 _init_mcp docstring。
+    global _mcp_init_task, _ckpt_gc_task
+    _mcp_init_task = asyncio.create_task(_init_mcp())
+    _ckpt_gc_task = asyncio.create_task(_init_checkpoint_gc())  # 启动后延迟回收过期 checkpoint
     await _init_long_running()
     await _init_tool_route_cache()
     await _init_workflow_schedules()
@@ -364,6 +442,23 @@ async def _startup():
 
 async def _shutdown():
     """应用关闭时优雅停止所有组件"""
+    # 取消仍在后台跑的 MCP 初始化 task(若尚未注册完,关闭时丢弃,不留悬空协程)
+    global _mcp_init_task, _ckpt_gc_task
+    if _mcp_init_task is not None and not _mcp_init_task.done():
+        _mcp_init_task.cancel()
+        try:
+            await _mcp_init_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+    _mcp_init_task = None
+    # 取消启动 checkpoint GC(若 15s 延迟内就关闭,避免悬空协程)
+    if _ckpt_gc_task is not None and not _ckpt_gc_task.done():
+        _ckpt_gc_task.cancel()
+        try:
+            await _ckpt_gc_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+    _ckpt_gc_task = None
     await _stop_webhook_queue()
     _stop_session_archiver()
     await _stop_long_running()

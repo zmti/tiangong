@@ -49,12 +49,20 @@ class PersistentMemoryStore:
             settings.resolved_data_dir, "persistent_memory.db"
         )
         self._lock = threading.RLock()
+        self._backend = None  # 由 _init_db 填充
         self._init_db()
 
     def _init_db(self) -> None:
-        """初始化持久化记忆表。"""
+        """初始化持久化记忆表。
+
+        表建在**独立**的 persistent_memory.db。必须保存该 backend,
+        后续 read/write 都走它 —— 旧实现读写走 self._store._backend
+        (LTM 的 memory.db), 那里没有 persistent_memories 表, 导致
+        "no such table" → /v1/persistent-memory 500。
+        """
         from app.core.storage_backend import get_storage_backend
-        backend = get_storage_backend(db_path=self._db_path)
+        self._backend = get_storage_backend(db_path=self._db_path)
+        backend = self._backend
         schema = {
             "persistent_memories": [
                 {"name": "id", "type": "TEXT", "constraints": "PRIMARY KEY"},
@@ -91,7 +99,7 @@ class PersistentMemoryStore:
         mid = uuid.uuid4().hex
         now = time.time()
         with self._lock:
-            self._store._backend.upsert(
+            self._backend.upsert(
                 "persistent_memories",
                 {
                     "id": mid,
@@ -132,7 +140,7 @@ class PersistentMemoryStore:
             params.extend(memory_types)
 
         with self._lock:
-            rows = self._store._backend.select(
+            rows = self._backend.select(
                 "persistent_memories",
                 " AND ".join(conditions),
                 tuple(params),
@@ -191,7 +199,7 @@ class PersistentMemoryStore:
         from app.rag.store import cosine_similarity
 
         with self._lock:
-            rows = self._store._backend.select(
+            rows = self._backend.select(
                 "persistent_memories",
                 "user_id = ?",
                 (user_id,),
@@ -232,21 +240,21 @@ class PersistentMemoryStore:
                     other = m2 if base["id"] == m1["id"] else m1
                     # 更新关联
                     related = json.loads(
-                        self._store._backend.select_one(
+                        self._backend.select_one(
                             "persistent_memories", "id = ?", (base["id"],),
                         ) or {}
                     ).get("related_ids", "[]")
                     new_related = json.loads(related)
                     if other["id"] not in new_related:
                         new_related.append(other["id"])
-                    self._store._backend.update(
+                    self._backend.update(
                         "persistent_memories",
                         {"related_ids": json.dumps(new_related, ensure_ascii=False)},
                         "id = ?",
                         (base["id"],),
                     )
                     # 标记为已合并(删除)
-                    self._store._backend.delete("persistent_memories", "id = ?", (other["id"],))
+                    self._backend.delete("persistent_memories", "id = ?", (other["id"],))
                     used.add(j)
                     merged += 1
 

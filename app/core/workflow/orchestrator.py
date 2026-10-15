@@ -27,7 +27,10 @@ class WorkflowOrchestrator:
         self._executors: dict[str, WorkflowExecutor] = {}
         self._dependencies: dict[str, list[str]] = {}
         self._callbacks: dict[str, list[Callable]] = {}
-        self._running_runs: dict[str, WorkflowRun] = {}
+        # 在飞任务登记表:execute_parallel 把每个工作流的 run 包成 Task 存这里,
+        # 供 _wait_dependencies 阻塞等待。在飞 run 的权威源是 executor 模块级
+        # _active_runs(run() 开始写入、结束 pop), 由 cancel_run / /orchestrate/status 使用。
+        self._run_tasks: dict[str, "asyncio.Future"] = {}
 
     def register_executor(self, workflow_id: str, executor: WorkflowExecutor) -> None:
         """注册工作流执行器。"""
@@ -118,8 +121,10 @@ class WorkflowOrchestrator:
         semaphore = asyncio.Semaphore(max_concurrency)
 
         async def _run_with_semaphore(wf_id: str) -> tuple[str, dict]:
+            # 先等依赖完成(不占并发槽): 依赖若也需并发槽才执行, 占着槽等会死锁,
+            # 故依赖等待必须在取槽之前。仅对本批在飞任务(登记在 _run_tasks)的依赖生效。
+            await self._wait_dependencies(wf_id)
             async with semaphore:
-                await self._wait_dependencies(wf_id)
                 executor = self._executors.get(wf_id) or self._default_executor
                 run = await executor.run(
                     workflow=self._load_workflow(wf_id),
@@ -127,22 +132,31 @@ class WorkflowOrchestrator:
                     session_id=session_id,
                 )
                 await self._trigger_callbacks(wf_id, run)
-                return wf_id, {
-                    "run_id": run.run_id,
-                    "status": run.status,
-                    "output": run.output,
-                    "duration": run.duration,
-                }
+            return wf_id, {
+                "run_id": run.run_id,
+                "status": run.status,
+                "output": run.output,
+                "duration": run.duration,
+            }
 
-        tasks = [_run_with_semaphore(wf_id) for wf_id in workflow_ids]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # 先为每个工作流建真正的 Task 句柄并登记, 供 _wait_dependencies 阻塞等待
+        # (旧实现依赖 _running_runs, 该表从不写入, 依赖等待形同虚设)
+        tasks: dict[str, "asyncio.Task"] = {}
+        for wf_id in workflow_ids:
+            tasks[wf_id] = asyncio.create_task(_run_with_semaphore(wf_id))
+            self._run_tasks[wf_id] = tasks[wf_id]
+        try:
+            results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        finally:
+            for wf_id in workflow_ids:
+                self._run_tasks.pop(wf_id, None)
 
         output = {}
-        for result in results:
+        for wf_id, result in zip(workflow_ids, results):
             if isinstance(result, Exception):
-                logger.error(f"并行工作流执行失败: {result}")
+                logger.error(f"并行工作流 {wf_id} 执行失败: {result}")
             else:
-                wf_id, wf_result = result
+                _, wf_result = result
                 output[wf_id] = wf_result
 
         return output
@@ -193,13 +207,19 @@ class WorkflowOrchestrator:
         return results
 
     async def _wait_dependencies(self, workflow_id: str) -> None:
-        """等待依赖的工作流完成。"""
+        """等待依赖的工作流完成。
+
+        仅对本次 execute_parallel 并行启动、且已登记到 _run_tasks 的依赖任务生效
+        (阻塞等待其 Task 完成); 顺序执行或外部依赖不在 _run_tasks 里, 直接放行。
+        旧实现查的是从不写入的 _running_runs, 依赖等待实际是 no-op。
+        """
         deps = self._dependencies.get(workflow_id, [])
         for dep_id in deps:
-            if dep_id in self._running_runs:
-                run = self._running_runs[dep_id]
-                while run.status in ("running",):
-                    await asyncio.sleep(0.1)
+            if dep_id == workflow_id:
+                continue  # 自依赖无意义
+            task = self._run_tasks.get(dep_id)
+            if task is not None and not task.done():
+                await task
 
     async def _trigger_callbacks(self, workflow_id: str, run: WorkflowRun) -> None:
         """触发完成回调。"""
@@ -254,10 +274,15 @@ class WorkflowOrchestrator:
         return _load_workflow(workflow_id)
 
     def cancel_run(self, run_id: str) -> bool:
-        """取消正在运行的工作流。"""
-        for wf_id, run in self._running_runs.items():
-            if run.run_id == run_id:
-                run.cancel()
+        """取消正在运行的工作流。
+
+        在飞的 run 由 executor 模块级 _active_runs 持有(run() 开始写入、结束 pop)。
+        命中即置取消标记, 使 run() 在层间/节点级检查时中断。
+        """
+        from app.core.workflow import executor as _executor_mod
+        for active_run in list(_executor_mod._active_runs.values()):
+            if active_run.run_id == run_id:
+                active_run.cancel()
                 return True
         return False
 

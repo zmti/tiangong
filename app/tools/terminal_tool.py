@@ -158,7 +158,14 @@ def _run_command(command: str, cwd: str, timeout: int) -> dict:
             timed_out = False
         except subprocess.TimeoutExpired:
             _kill_tree(proc)
-            out, err = proc.communicate()
+            # 杀进程树后管道写端关闭,正常会很快 EOF;这里带 10s 兜底,
+            # 取回"已产出的部分 stdout/stderr",避免孙进程残留持有写端句柄时
+            # 第二次 communicate() 无保护地永久阻塞(历史 bug:超时命令把整个
+            # Agent 卡死)。仍超时则放弃剩余数据,绝不无限等。
+            try:
+                out, err = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                out, err = b"", b""
             timed_out = True
     except Exception as e:  # noqa: BLE001
         return {"success": False, "error": f"启动命令失败: {e}", "duration_s": round(time.time() - start, 2)}
@@ -177,7 +184,8 @@ def _run_command(command: str, cwd: str, timeout: int) -> dict:
         "truncated": truncated,
     }
     if timed_out:
-        result["error"] = f"命令执行超时({timeout}s),已终止进程树"
+        partial = "已带回超时前产出的部分输出(见 stdout/stderr)" if (out or err) else "超时前无输出"
+        result["error"] = f"命令执行超时({timeout}s),已终止进程树,{partial}"
     return result
 
 

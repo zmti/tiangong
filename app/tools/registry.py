@@ -328,6 +328,7 @@ def get_registry() -> ToolRegistry:
         from app.tools import image_tool  # noqa: F401  # 注册 generate_image 工具
         from app.tools import video_tool  # noqa: F401  # 注册 generate_video 工具
         from app.tools import video_enhance_tool  # noqa: F401  # 注册 enhance_video 工具(配音/字幕/水印)
+        from app.tools import video_stitch_tool  # noqa: F401  # 注册 stitch_videos 工具(多段视频拼接成一条)
         from app.tools import web_tool  # noqa: F401  # 注册网页抓取工具
         from app.tools import db_tool  # noqa: F401  # 注册数据库查询工具
         from app.tools import mcp_tool  # noqa: F401  # MCP 工具支持
@@ -368,6 +369,7 @@ def get_registry() -> ToolRegistry:
         from app.tools import computer_use  # noqa: F401  # 注册 Computer Use 视觉驾驶工具
         from app.tools import workflow_tool  # noqa: F401  # 注册工作流工具(run_workflow/list_workflows/get_workflow)
         from app.tools import web_test_tool  # noqa: F401  # 注册 H5/网页自动测试工具(web_auto_test)
+        from app.tools import http_tool  # noqa: F401  # 注册通用 HTTP API 调用工具(call_http_api/http_request)
         from app.agents import handoff_tool  # noqa: F401  # 注册角色委派/团队工具(list_roles/handoff_to_role)
         from app.rag import documents  # noqa: F401  # 注册 rag_search 工具
         from app.core import reasoning_engine  # noqa: F401  # 注册 chain_of_thought 推理工具

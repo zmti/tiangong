@@ -530,15 +530,27 @@ App.Session.enterRename = function (s, btn) {
 
   // IME 输入法状态追踪:比 e.isComposing 更可靠
   let composing = false;
+  let _pendingBlur = false; // blur 时仍在选词则挂起,等 compositionend 收词后再保存
   input.addEventListener('compositionstart', () => { composing = true; });
-  input.addEventListener('compositionend', () => { composing = false; });
+  input.addEventListener('compositionend', () => {
+    composing = false;
+    // 选词刚结束、且此前因选词推迟过"失焦保存" → 现在基于最终确认的值保存
+    if (_pendingBlur) { _pendingBlur = false; finish(true); }
+  });
   input.addEventListener('keydown', (e) => {
     if (composing || e.isComposing || e.keyCode === 229) return;
     e.stopPropagation();
     if (e.key === 'Enter') { e.preventDefault(); finish(true); }
     else if (e.key === 'Escape') { finish(false); }
   });
-  input.addEventListener('blur', () => finish(true));
+  // 失焦即保存;但中文输入法"选词进行中"(composing)时若直接保存,会把未确认
+  // 的拼音中间态(如 "shou")当成标题存下来——这是"会话名莫名其妙变成一串拼音"
+  // 的根源(键盘路径有 composing 守护,blur 路径却漏了)。故 blur 时若仍在选词,
+  // 先挂起,等 compositionend 收词后再保存最终确认值。
+  input.addEventListener('blur', () => {
+    if (composing) { _pendingBlur = true; return; }
+    finish(true);
+  });
 };
 
 /* 重命名会话 */
@@ -614,6 +626,17 @@ App.Session.newSession = async function () {
   }
   App.sessionId = 'desktop-' + Date.now().toString(36);
   App.Session.saveSessionId(App.sessionId);
+  // 【修复】新建的会话此前只在"发出第一条消息"时才由后端 add_message 顺带建行:
+  // 于是没发消息就刷新应用,该会话在后端根本不存在 —— 侧边栏里看不到,刷新即丢失。
+  // 这里在建立的同时调 ensure 接口落库,让它立刻出现在列表并能扛住刷新。
+  try {
+    await App.apiJSON('/v1/chat/sessions/ensure', {
+      method: 'POST',
+      body: JSON.stringify({ session_id: App.sessionId }),
+    });
+  } catch (e) {
+    console.warn('[Session] 新建会话落库失败(不影响使用):', e);
+  }
   // 【修复】新建会话同样要重置项目:否则会沿用上一个会话的项目(project_path 指错目录)。
   // 新会话无绑定时继承 default_project,并落到本会话。
   if (App.Project && App.Project.switchToNewSession) App.Project.switchToNewSession(App.sessionId);
@@ -810,6 +833,13 @@ App.Session.select = async function (id) {
           footer.appendChild(act);
           footer.appendChild(timeEl);
           content.appendChild(footer);
+          // 历史回放:该 user 消息发送时携带的附件(meta.attachments 由后端落库)
+          // 重新挂成卡片,否则切走/刷新再回来附件就"不见了"(发送当轮靠 renderToBubble 挂,
+          // 历史重载此前只渲染文本、没把卡片带回来)。卡片插在 footer 之前。
+          const _attIds = m.meta && Array.isArray(m.meta.attachments) ? m.meta.attachments : [];
+          if (_attIds.length && App.Attach && App.Attach.renderToBubble) {
+            App.Attach.renderToBubble(content, _attIds, id);
+          }
           div.appendChild(avatar);
           div.appendChild(content);
           pushIdx(div);

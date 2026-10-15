@@ -13,6 +13,21 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Optional
 
+
+def _to_jsonable(v: Any) -> Any:
+    """把工作流变量值转成可 JSON 序列化的形式。
+
+    原先对非基础类型直接 str(v),会产出 Python repr(如 "{'x': 1}"),
+    前端 JSON.stringify 后变成不可解析的字符串。这里优先用 json 归一,
+    失败再退回 str,保证"输出结果"Tab 里的 variables 可读且可解析。
+    """
+    if isinstance(v, (str, int, float, bool, type(None))):
+        return v
+    try:
+        return json.loads(json.dumps(v, default=str, ensure_ascii=False))
+    except (TypeError, ValueError):
+        return str(v)
+
 logger = logging.getLogger(__name__)
 
 
@@ -366,8 +381,7 @@ class WorkflowRun:
             "status": self.status,
             "session_id": self.session_id,
             "context": self.context,
-            "variables": {k: str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v
-                         for k, v in self.variables.items()},
+            "variables": {k: _to_jsonable(v) for k, v in self.variables.items()},
             "node_states": self.node_states,
             "history": self.history,
             "error": self.error,

@@ -2736,6 +2736,77 @@ body.side-open #sidePanel {
 }
 .attach-chip-del:hover { color: var(--err); }
 
+/* 附件类型卡片(取代旧 attach-chip):图片缩略图 / 文件图标 + 打开/移除 */
+.attach-card {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 24px 5px 6px;
+  min-width: 150px;
+  max-width: 260px;
+  border-radius: var(--radius-md);
+  background: var(--bg-soft);
+  border: 1px solid var(--primary-border);
+  cursor: default;
+}
+.attach-card-img { padding-left: 6px; }
+.attach-thumb {
+  width: 38px; height: 38px;
+  object-fit: cover;
+  border-radius: 4px;
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+  background: #fff;
+}
+.attach-card-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.attach-card-name {
+  color: var(--text);
+  font-weight: 600;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  max-width: 200px;
+}
+.attach-card-sub {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  max-width: 200px;
+}
+.attach-card-open {
+  position: absolute;
+  top: 4px; right: 4px;
+  height: 18px;
+  padding: 0 7px;
+  font-size: 11px; line-height: 1;
+  color: var(--primary);
+  background: var(--primary-soft);
+  border: 1px solid var(--primary-border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+.attach-card-open:hover { background: var(--primary); color: #fff; }
+.attach-card-del {
+  position: absolute;
+  bottom: 4px; right: 4px;
+  width: 18px; height: 18px;
+  padding: 0;
+  font-size: 13px; line-height: 1;
+  color: var(--muted);
+  background: transparent; border: none;
+  border-radius: 50%;
+  cursor: pointer;
+}
+.attach-card-del:hover { color: var(--err); background: var(--err-soft); }
+
+/* 已发送附件卡在用户气泡内的容器:多卡水平换行 */
+.attach-bubble-cards {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+.attach-bubble-cards .attach-card { min-width: 130px; }
+
 /* ---- 确认栏---- */
 .confirm-bar {
   position: fixed;
@@ -3672,6 +3743,11 @@ body.exec-panel-open .exec-panel {
   background: var(--bg-elev);
   overflow: hidden;
 }
+/* MCP 未连接/被禁用的服务器:整体灰化,与已连接卡片区分 */
+.prov-card.disabled {
+  opacity: 0.6;
+  border-style: dashed;
+}
 .prov-card-header {
   display: flex;
   align-items: center;
@@ -3846,6 +3922,60 @@ body.exec-panel-open .exec-panel {
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
+}
+/* MCP 工具清单: 可展开/收缩, 每个工具一行 = 名称 + 描述(2026-10-04 起后端已回传 description) */
+.mcp-tools-list {
+  padding: 10px 16px 8px;
+  font-size: 12px;
+}
+.mcp-tools-title {
+  font-weight: 600;
+  color: var(--muted);
+  margin-bottom: 6px;
+  font-size: 11px;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.mcp-tools-toggle { cursor: pointer; user-select: none; }
+.mcp-tools-toggle:hover { color: var(--primary, var(--muted)); }
+.mcp-tools-arrow {
+  font-size: 10px;
+  line-height: 1;
+  transition: transform 0.15s ease;
+}
+/* body 默认收起, 展开时给固定滚动区 */
+.mcp-tools-body {
+  max-height: 0;
+  overflow: hidden;
+  transition: max-height 0.25s ease;
+}
+.mcp-tools-list.expanded .mcp-tools-body {
+  max-height: 220px;
+  overflow-y: auto;
+  margin-top: 2px;
+}
+.mcp-tool-row {
+  display: flex;
+  gap: 8px;
+  padding: 4px 0;
+  border-top: 1px dashed var(--border);
+  line-height: 1.45;
+}
+.mcp-tool-row:first-of-type { border-top: none; }
+.mcp-tool-name {
+  flex: 0 0 auto;
+  font-family: var(--mono, ui-monospace, monospace);
+  font-weight: 600;
+  color: var(--primary, var(--text));
+  word-break: break-all;
+}
+.mcp-tool-desc {
+  flex: 1 1 auto;
+  color: var(--text-secondary);
+  word-break: break-word;
 }
 .prov-form-title {
   display: flex;

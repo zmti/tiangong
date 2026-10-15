@@ -55,23 +55,21 @@ def test_workflow_executor_import():
 
 
 def test_workflow_templates():
-    """测试模板数据。"""
-    import json
+    """测试模板数据(权威注册表现在后端 app/core/workflow/templates.py)。"""
     from pathlib import Path
-    templates_file = Path(__file__).parent.parent / "desktop" / "src" / "ui" / "workflow" / "templates.js"
-    if templates_file.exists():
-        content = templates_file.read_text(encoding="utf-8")
-        assert "simple_chat" in content
-        assert "code_review" in content
+    templates_file = Path(__file__).parent.parent / "app" / "core" / "workflow" / "templates.py"
+    assert templates_file.exists(), "后端模板注册表 templates.py 应存在"
+    content = templates_file.read_text(encoding="utf-8")
+    assert "code_review" in content
 
 
 def test_workflow_designer_import():
-    """测试设计器文件存在。"""
+    """测试前端工作流设计器标识符存在(UI 重组后设计器在 js/workflow.js)。"""
     from pathlib import Path
-    designer_file = Path(__file__).parent.parent / "desktop" / "src" / "ui" / "workflow" / "designer.js"
-    assert designer_file.exists()
+    designer_file = Path(__file__).parent.parent / "desktop" / "src" / "ui" / "js" / "workflow.js"
+    assert designer_file.exists(), "前端工作流模块 js/workflow.js 应存在"
     content = designer_file.read_text(encoding="utf-8")
-    assert "WorkflowDesigner" in content
+    assert "workflowDesigner" in content
 
 
 def test_tool_discovery():

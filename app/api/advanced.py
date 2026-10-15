@@ -73,6 +73,8 @@ async def embedding_cache_invalidate() -> dict:
 async def list_skills(enabled_only: bool = Query(True)) -> dict:
     reg = get_skill_registry()
     skills = reg.list(enabled_only=enabled_only)
+    from app.core.skills import _builtin_skills
+    builtin_names = {b.name for b in _builtin_skills}
     return {
         "skills": [
             {
@@ -81,6 +83,8 @@ async def list_skills(enabled_only: bool = Query(True)) -> dict:
                 "steps": len(s.steps),
                 "params": [p.name for p in s.params],
                 "enabled": s.enabled,
+                # 桌面端据此判断能否「卸载」:内置技能只能启停,第三方技能可装卸
+                "builtin": s.name in builtin_names,
             }
             for s in skills
         ],
@@ -118,6 +122,101 @@ async def toggle_skill(skill_name: str, enabled: bool = True) -> dict:
         raise HTTPException(status_code=404, detail=f"未找到技能: {skill_name}")
     skill.enabled = enabled
     return {"name": skill_name, "enabled": enabled}
+
+
+@router.post("/skills/refresh")
+async def refresh_skills() -> dict:
+    """热重载第三方技能目录(全量同步),无需重启后端。
+
+    第三方往 settings.skill_third_party_dir(默认 <data_dir>/skills)增/改/删
+    技能定义文件(YAML/JSON)后,调本接口即可让 SkillRegistry 与目录内容一致:
+    - 新增/改动的技能 → 重新注册;
+    - 目录里已删除/改名的旧技能 → 从 registry 移除(只动非内置技能,
+      5 个内置技能 deploy_to_staging 等永不被误删)。
+    """
+    from app.core.skills import refresh_skills_from_directory
+    skill_dir = settings.skill_third_party_dir or os.path.join(settings.resolved_data_dir, "skills")
+    os.makedirs(skill_dir, exist_ok=True)
+    result = refresh_skills_from_directory(skill_dir)
+    return {"skills_dir": skill_dir, **result}
+
+
+def _skills_dir() -> str:
+    d = settings.skill_third_party_dir or os.path.join(settings.resolved_data_dir, "skills")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _is_builtin_skill(name: str) -> bool:
+    from app.core.skills import _builtin_skills
+    return any(s.name == name for s in _builtin_skills)
+
+
+def _skill_file(name: str) -> str:
+    return os.path.join(_skills_dir(), f"{name}.json")
+
+
+class SkillInstallRequest(BaseModel):
+    name: str
+    description: str = ""
+    steps: list = Field(default_factory=list, description="步骤编排,如 [{type,tool,args,label}]")
+    params: list = Field(default_factory=list, description="参数定义")
+    timeout: float = 120.0
+    enabled: bool = True
+    raw: dict | None = Field(default=None, description="可选:整个技能定义体(优先级高于上述散字段)")
+
+
+@router.post("/skills/install")
+async def install_skill(req: SkillInstallRequest) -> dict:
+    """安装一个第三方技能:写 data/skills/<name>.json 并热重载。
+
+    内置技能名(5 个 deploy_to_staging 等)不可被第三方文件覆盖,直接 409。
+    """
+    if not req.name or not str(req.name).strip():
+        raise HTTPException(status_code=400, detail="技能名不能为空")
+    name = str(req.name).strip()
+    if _is_builtin_skill(name):
+        raise HTTPException(status_code=409, detail=f"内置技能 {name} 不可被安装/覆盖")
+
+    definition = req.raw or {
+        "name": name,
+        "description": req.description,
+        "steps": req.steps,
+        "params": req.params,
+        "timeout": req.timeout,
+        "enabled": req.enabled,
+    }
+    definition["name"] = name  # 文件名与技能名一致,避免歧义
+
+    path = _skill_file(name)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(definition, f, ensure_ascii=False, indent=2)
+
+    from app.core.skills import refresh_skills_from_directory
+    result = refresh_skills_from_directory(_skills_dir())
+    return {"ok": True, "name": name, "path": path, **result}
+
+
+@router.delete("/skills/{skill_name}")
+async def uninstall_skill(skill_name: str) -> dict:
+    """卸载一个第三方技能:删 data/skills/<skill_name>.json 并热重载。
+
+    内置技能不可卸载(返回 409),只清 registry 里对应的第三方注册。
+    """
+    if _is_builtin_skill(skill_name):
+        raise HTTPException(status_code=409, detail=f"内置技能 {skill_name} 不可卸载")
+
+    path = _skill_file(skill_name)
+    existed = os.path.isfile(path)
+    if existed:
+        os.remove(path)
+
+    from app.core.skills import refresh_skills_from_directory
+    result = refresh_skills_from_directory(_skills_dir())
+    # 保险:registry 里若还残留同名(如文件被外部删过但注册还在),直接摘掉
+    reg = get_skill_registry()
+    reg.unregister(skill_name)
+    return {"ok": True, "name": skill_name, "file_removed": existed, **result}
 
 
 # ---- A/B 评估 ----

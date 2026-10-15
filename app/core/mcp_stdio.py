@@ -199,6 +199,17 @@ class MCPStdioClient:
                 return t
         return None
 
+    # ---- 接口兼容:与 HTTP 版 MCPClient 保持一致 ----
+    # MCPManager.connect_all() 会对所有客户端统一调 list_prompts/list_resources,
+    # stdio 版客户端尚未实现 prompts/resources 能力,这里返回空列表兜底,
+    # 否则 AttributeError 会中断整个 MCP 初始化(见 2026-10-01 windows-mcp 无法使用的事故)。
+
+    async def list_prompts(self) -> list:
+        return []
+
+    async def list_resources(self) -> list:
+        return []
+
     def to_openai_schemas(self) -> list[dict]:
         schemas = []
         for tool in self._tools_cache:

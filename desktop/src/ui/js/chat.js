@@ -271,7 +271,15 @@ App.Chat.doSend = async function (text, opts = {}) {
   App.clearImageGenerating();  // 清除上一轮可能残留的"生成中"卡片
   if (App.Confirmation) App.Confirmation.clear();
   App.removeTyping();
-  if (!opts.skipAppendUser) App.appendUserMessage(text);
+  // 快照本次要发送的附件 ID:挂进用户气泡"显示在会话中"(此刻 currentIds 尚未被 finally reset)
+  const _attachIds = (App.Attach && App.Attach.currentIds && App.Attach.currentIds.size)
+    ? Array.from(App.Attach.currentIds) : [];
+  let _userWrap = null;
+  if (!opts.skipAppendUser) _userWrap = App.appendUserMessage(text);
+  // 把发送的附件卡片(图片缩略图/文件图标+打开)挂进用户气泡,附件不止停在输入框
+  if (_attachIds.length && _userWrap && App.Attach && App.Attach.renderToBubble) {
+    App.Attach.renderToBubble(_userWrap._content || _userWrap, _attachIds, App.sessionId);
+  }
   // 打字指示器延迟显示:等第一个 token 到达再显示,避免无响应时 indicator 闪烁
   // 【关键修复】将 setStreaming(true) 移至 try 块内，确保任何初始化异常都能触发 finally 重置
   _startGroup();  // 开始工具分组
@@ -283,6 +291,11 @@ App.Chat.doSend = async function (text, opts = {}) {
   // 每轮重置思考卡/答案锚点,避免上一轮残留导致本轮 thinking 错位
   App._thinkingWrap = null;
   App._answerWrap = null;
+  // ⚠️ 必须一并重置 _currentBotMsg:thinking 事件分支用 `!App._currentBotMsg`
+  // 判断"要不要新建气泡",而 token 分支用的是局部 answerDiv(每轮全新)。
+  // 上一轮结束后此值仍指向旧气泡 → 新一轮的思考块(先于首个 token 到达)
+  // 会全部挂进上一轮的气泡里(实证 14:27 提问的思考显示在 14:24 的旧气泡顶部)。
+  App._currentBotMsg = null;
   /* 修复"再次发送后状态错乱/不能停止/不知可否发送": 引入发送代次(stamp)。
      旧实现中, 当新 doSend abort 旧流时, 旧流的 reader.read() 抛 AbortError,
      其 finally 会异步执行 setStreaming(false) + 强制 sendBtn.disabled=false,
@@ -795,6 +808,11 @@ App.Chat.doSend = async function (text, opts = {}) {
       } catch (_) { /* 无 JSON 体 */ }
       throw new Error(detail || `HTTP ${res.status}`);
     }
+    // 请求已成功、SSE 连接已建立 → 附件已随 patchBody 发出去,此刻清掉 composer 待发区:
+    // 否则卡片要等整条流跑完(可能数分钟)才在 finally 里被 reset,体感"发完还挂着"。
+    // 用户气泡里已有渲染好的卡片(renderToBubble 用发送前快照,不依赖 currentIds),
+    // 历史回放也靠 meta.attachments 重建,清 composer 都不影响。
+    if (App.Attach && App.Attach.reset) App.Attach.reset();
 
     const reader = res.body.getReader();
     const decoder = new TextDecoder();

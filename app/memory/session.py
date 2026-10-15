@@ -131,6 +131,7 @@ class SessionStore:
                 {"name": "updated_at", "type": "REAL", "constraints": "NOT NULL"},
                 {"name": "title", "type": "TEXT", "constraints": ""},
                 {"name": "category", "type": "TEXT", "constraints": "DEFAULT '未分类'"},
+                {"name": "project_path", "type": "TEXT", "constraints": "DEFAULT ''"},
             ],
         }
         self._backend.init_db(schema)
@@ -138,6 +139,8 @@ class SessionStore:
         self._migrate_add_tenant_column()
         # 迁移:为旧数据库补填 category 列
         self._migrate_add_category_column()
+        # 迁移:为旧数据库补填 project_path 列(会话绑定的项目工作目录)
+        self._migrate_add_project_path_column()
 
     def _migrate_add_tenant_column(self) -> None:
         """迁移:为旧表补加 tenant_id 列(如果不存在)。"""
@@ -153,6 +156,20 @@ class SessionStore:
         try:
             self._backend.execute(
                 "ALTER TABLE sessions ADD COLUMN category TEXT NOT NULL DEFAULT '未分类'"
+            )
+        except Exception:
+            pass  # 列已存在
+
+    def _migrate_add_project_path_column(self) -> None:
+        """迁移:为旧表补加 project_path 列(如果不存在)。
+
+        该列记录会话绑定的项目工作目录。此前项目路径仅由前端 localStorage
+        绑定 + 每请求附带传递,后端从不持久化,导致旧会话/清缓存/非 GUI 创建的
+        会话拿到空串,工具在错误的目录(后端启动目录)下执行。
+        """
+        try:
+            self._backend.execute(
+                "ALTER TABLE sessions ADD COLUMN project_path TEXT NOT NULL DEFAULT ''"
             )
         except Exception:
             pass  # 列已存在
@@ -398,6 +415,42 @@ class SessionStore:
                 "id = ?",
                 (session_id,)
             )
+
+    async def set_project_path(self, session_id: str, project_path: str, tenant_id: Optional[str] = None) -> None:
+        """持久化会话绑定的项目工作目录。
+
+        前端每请求附带 project_path;此处把它落库,这样即便前端 localStorage 绑定
+        丢失(旧会话/清缓存/API 建会话)或请求未携带,工具执行时仍可 fallback 到
+        该会话上次记录的项目路径,而不是静默退回后端启动目录。
+        """
+        tid = await self._resolve_tid(tenant_id)
+        async with self._lock:
+            self._ensure_session(session_id, tid)
+            self._backend.update(
+                "sessions",
+                {
+                    "project_path": project_path or "",
+                    "updated_at": time.time(),
+                },
+                "id = ? AND tenant_id = ?",
+                (session_id, tid),
+            )
+
+    async def get_project_path(self, session_id: str, tenant_id: Optional[str] = None) -> str:
+        """读取会话持久化的项目工作目录(无则返回空串)。"""
+        tid = await self._resolve_tid(tenant_id)
+        try:
+            rows = self._backend.select(
+                "sessions",
+                "id = ? AND tenant_id = ?",
+                (session_id, tid),
+                limit=1,
+            )
+        except Exception:  # noqa: BLE001
+            return ""
+        if not rows:
+            return ""
+        return (rows[0].get("project_path") or "")
 
     async def session_title(self, session_id: str) -> str:
         """返回会话的权威标题(会话列表与会话详情共用同一套解析)。
